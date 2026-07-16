@@ -1,0 +1,35 @@
+{
+  "_comment": "Реестр MySQL-кластеров. Редактируйте вручную или через скрипт manage_cluster.sh",
+  "_schema": {
+    "name":        "уникальное машинное имя (латиница, без пробелов)",
+    "label":       "отображаемое название (например: Кемерово)",
+    "description": "произвольное описание",
+    "primary_ip":  "IP primary-сервера",
+    "replica_ip":  "IP replica-сервера (пусто если нет)",
+    "mysql_exporter_password": "пароль пользователя exporter в MySQL",
+    "enabled":     "true/false — включить/отключить мониторинг",
+    "tags":        "произвольные метки для группировки"
+  },
+  "clusters": [
+    {
+      "name":                    "kemerovo",
+      "label":                   "Кемерово",
+      "description":             "Основная БД торговой площадки Кемерово",
+      "primary_ip":              "10.1.0.1",
+      "replica_ip":              "10.1.0.2",
+      "mysql_exporter_password": "ExporterPass_kmr!",
+      "enabled":                 true,
+      "tags":                    ["siberia", "production"]
+    },
+    {
+      "name":                    "novosibirsk",
+      "label":                   "Новосибирск",
+      "description":             "Основная БД торговой площадки Новосибирск",
+      "primary_ip":              "10.2.0.1",
+      "replica_ip":              "10.2.0.2",
+      "mysql_exporter_password": "ExporterPass_nsk!",
+      "enabled":                 true,
+      "tags":                    ["siberia", "production"]
+    }
+  ]
+}

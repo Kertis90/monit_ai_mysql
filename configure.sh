@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  configure.sh — Интерактивная настройка всего стека
+#  ЗАПУСКАТЬ ПЕРВЫМ. Создаёт config.env со всеми параметрами.
+#
+#  Использование:
+#    chmod +x configure.sh
+#    ./configure.sh
+# =============================================================================
+set -euo pipefail
+
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${SCRIPT_DIR}/config.env"
+
+echo ""
+echo -e "${BOLD}${BLUE}╔════════════════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}${BLUE}║   MySQL AI Monitoring — Мастер настройки           ║${NC}"
+echo -e "${BOLD}${BLUE}╚════════════════════════════════════════════════════╝${NC}"
+echo ""
+
+# Загрузить существующие значения если конфиг уже есть
+if [[ -f "$CONFIG_FILE" ]]; then
+    echo -e "${YELLOW}Найден существующий config.env — значения будут предложены как defaults${NC}"
+    source "$CONFIG_FILE"
+    echo ""
+fi
+
+ask() { # prompt varname default [secret]
+    local prompt="$1" var="$2" default="${3:-}" secret="${4:-}"
+    local current="${!var:-$default}"
+    local display="$current"
+    [[ -n "$secret" && -n "$current" ]] && display="${current:0:6}***"
+
+    if [[ -n "$secret" ]]; then
+        read -rsp "  ${prompt} [${display}]: " input
+        echo ""
+    else
+        read -rp "  ${prompt} [${display}]: " input
+    fi
+    if [[ -n "$input" ]]; then
+        eval "$var=\"\$input\""
+    else
+        eval "$var=\"\$current\""
+    fi
+}
+
+echo -e "${CYAN}── 1. Сервер мониторинга ─────────────────────────────${NC}"
+DETECTED_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "10.0.0.100")
+ask "IP этого сервера (Prometheus/Grafana/Agent)" MONITORING_IP "$DETECTED_IP"
+
+echo ""
+echo -e "${CYAN}── 2. Удалённая LLM (OpenAI-совместимый API) ─────────${NC}"
+echo -e "  ${YELLOW}Пример: https://llm.mycompany.ru/v1${NC}"
+ask "LLM Base URL" LLM_BASE_URL "https://your-llm-server.com/v1"
+ask "LLM API токен (Bearer)" LLM_API_KEY "" secret
+ask "Название модели" LLM_MODEL "gpt-4o-mini"
+ask "Max tokens" LLM_MAX_TOKENS "2048"
+ask "Temperature" LLM_TEMPERATURE "0.3"
+
+echo ""
+echo -e "${CYAN}── 3. Grafana ────────────────────────────────────────${NC}"
+ask "Пароль admin для Grafana" GRAFANA_ADMIN_PASSWORD "ChangeMe123!" secret
+
+echo ""
+echo -e "${CYAN}── 4. Email-уведомления (Alertmanager) ───────────────${NC}"
+echo -e "  ${YELLOW}Enter — пропустить (алерты пойдут только в AI-агент)${NC}"
+ask "Email получателя алертов" ALERT_EMAIL_TO ""
+if [[ -n "${ALERT_EMAIL_TO}" ]]; then
+    ask "Email отправителя" ALERT_EMAIL_FROM "alertmanager@$(hostname -d 2>/dev/null || echo 'company.com')"
+    ask "SMTP сервер (host:port)" ALERT_SMTP_HOST "smtp.company.com:587"
+    ask "SMTP логин" ALERT_SMTP_USER "$ALERT_EMAIL_FROM"
+    ask "SMTP пароль" ALERT_SMTP_PASSWORD "" secret
+else
+    ALERT_EMAIL_FROM=""; ALERT_SMTP_HOST=""; ALERT_SMTP_USER=""; ALERT_SMTP_PASSWORD=""
+fi
+
+echo ""
+echo -e "${CYAN}── 5. Порты и версии (Enter — по умолчанию) ──────────${NC}"
+ask "Порт AI-агента" AGENT_PORT "5001"
+ask "Prometheus retention" PROMETHEUS_RETENTION "30d"
+
+# Версии — фиксированные, но настраиваемые
+PROMETHEUS_VERSION="${PROMETHEUS_VERSION:-2.52.0}"
+NODE_EXPORTER_VERSION="${NODE_EXPORTER_VERSION:-1.8.2}"
+MYSQLD_EXPORTER_VERSION="${MYSQLD_EXPORTER_VERSION:-0.15.1}"
+ALERTMANAGER_VERSION="${ALERTMANAGER_VERSION:-0.27.0}"
+
+# ── Запись конфига ────────────────────────────────────────────────────────────
+cat > "$CONFIG_FILE" << EOF
+# =============================================================================
+#  MySQL AI Monitoring — конфигурация
+#  Сгенерировано configure.sh $(date '+%Y-%m-%d %H:%M:%S')
+#  Для изменения: ./configure.sh (повторный запуск) или правьте вручную
+# =============================================================================
+
+# Сервер мониторинга
+MONITORING_IP="${MONITORING_IP}"
+
+# Удалённая LLM (OpenAI-совместимый API: /chat/completions)
+LLM_BASE_URL="${LLM_BASE_URL}"
+LLM_API_KEY="${LLM_API_KEY}"
+LLM_MODEL="${LLM_MODEL}"
+LLM_MAX_TOKENS=${LLM_MAX_TOKENS}
+LLM_TEMPERATURE=${LLM_TEMPERATURE}
+
+# Grafana
+GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD}"
+
+# Alertmanager email (пусто = отключено)
+ALERT_EMAIL_TO="${ALERT_EMAIL_TO}"
+ALERT_EMAIL_FROM="${ALERT_EMAIL_FROM}"
+ALERT_SMTP_HOST="${ALERT_SMTP_HOST}"
+ALERT_SMTP_USER="${ALERT_SMTP_USER}"
+ALERT_SMTP_PASSWORD="${ALERT_SMTP_PASSWORD}"
+
+# Порты
+AGENT_PORT=${AGENT_PORT}
+
+# Prometheus
+PROMETHEUS_VERSION="${PROMETHEUS_VERSION}"
+PROMETHEUS_RETENTION="${PROMETHEUS_RETENTION}"
+
+# Версии экспортёров
+NODE_EXPORTER_VERSION="${NODE_EXPORTER_VERSION}"
+MYSQLD_EXPORTER_VERSION="${MYSQLD_EXPORTER_VERSION}"
+ALERTMANAGER_VERSION="${ALERTMANAGER_VERSION}"
+EOF
+
+chmod 600 "$CONFIG_FILE"
+
+echo ""
+echo -e "${GREEN}✓ Конфигурация сохранена: ${CONFIG_FILE}${NC}"
+echo ""
+
+# ── Тест LLM соединения ───────────────────────────────────────────────────────
+echo -e "${CYAN}── Проверка соединения с LLM ─────────────────────────${NC}"
+AUTH="${LLM_API_KEY}"
+[[ "$AUTH" != Bearer\ * ]] && AUTH="Bearer ${AUTH}"
+
+HTTP_CODE=$(curl -s -o /tmp/llm_test.json -w "%{http_code}" \
+    -X POST "${LLM_BASE_URL}/chat/completions" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: ${AUTH}" \
+    -d "{\"model\":\"${LLM_MODEL}\",\"max_tokens\":20,\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}" \
+    --max-time 20 2>/dev/null || echo "000")
+
+if [[ "$HTTP_CODE" == "200" ]]; then
+    echo -e "  ${GREEN}✓ LLM отвечает (HTTP 200)${NC}"
+elif [[ "$HTTP_CODE" == "000" ]]; then
+    echo -e "  ${YELLOW}! Не удалось подключиться к ${LLM_BASE_URL}${NC}"
+    echo -e "  ${YELLOW}  Проверьте URL и сетевую доступность. Установку можно продолжить.${NC}"
+else
+    echo -e "  ${YELLOW}! LLM вернул HTTP ${HTTP_CODE}${NC}"
+    head -c 300 /tmp/llm_test.json 2>/dev/null && echo ""
+    echo -e "  ${YELLOW}  Проверьте токен и название модели. Установку можно продолжить.${NC}"
+fi
+rm -f /tmp/llm_test.json
+
+echo ""
+echo -e "${BOLD}Следующие шаги:${NC}"
+echo ""
+echo "  1. Добавьте кластеры:            ./manage_cluster.sh add"
+echo "  2. Установите мониторинг:        sudo ./scripts/install_monitoring.sh"
+echo "  3. Установите AI-агента:         sudo ./scripts/install_agent.sh"
+echo "  4. Установите экспортёры:        ./manage_cluster.sh install-exporters <name>"
+echo "  5. Примените конфигурацию:       sudo ./manage_cluster.sh apply"
+echo "  6. Проверьте:                    ./scripts/verify.sh"
+echo ""
+echo "  Или всё сразу (кроме экспортёров): sudo ./scripts/install_all.sh"
+echo ""

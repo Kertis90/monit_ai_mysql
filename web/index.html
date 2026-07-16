@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MySQL AI Agent — центр мониторинга</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header>
+  <div class="conn-dot" id="conn-dot" title="Состояние WebSocket"></div>
+  <h1>MySQL AI Agent</h1>
+  <span class="hbadge" id="clusters-badge">…</span>
+  <span class="hbadge" id="ws-badge">подключение…</span>
+  <div class="spacer"></div>
+  <span class="hint">Enter — отправить · Shift+Enter — новая строка</span>
+</header>
+
+<div class="layout">
+
+  <!-- ═══ Сайдбар: кластеры ═══ -->
+  <aside class="sidebar">
+    <div class="side-title">Кластеры</div>
+    <div class="cluster-list" id="cluster-list">
+      <div class="muted pad">Загрузка…</div>
+    </div>
+    <div class="side-footer">
+      <button class="ghost-btn" onclick="App.refreshClusters()">↻ Обновить</button>
+    </div>
+  </aside>
+
+  <!-- ═══ Основная область ═══ -->
+  <main class="main">
+    <nav class="tabs">
+      <div class="tab active" data-tab="chat"   onclick="App.showTab('chat')">💬 Чат</div>
+      <div class="tab"        data-tab="status" onclick="App.showTab('status')">📊 Статус</div>
+      <div class="tab"        data-tab="alerts" onclick="App.showTab('alerts')">🔔 Алерты <span class="alert-count" id="alert-count"></span></div>
+    </nav>
+
+    <!-- ── ЧАТ ── -->
+    <section id="tab-chat" class="tab-pane chat-pane">
+      <div class="messages" id="messages">
+        <div class="msg assistant">
+          <div class="msg-meta">AI Agent</div>
+          <div class="msg-body">Привет! Я DBA-ассистент. Спросите о любом кластере:
+
+  • «Как дела в Кемерово?»
+  • «Вчера в Новосибирске была просадка — почему?»
+  • «Какой кластер хуже всего себя чувствует?»
+  • «Есть ли лаг репликации где-нибудь?»</div>
+        </div>
+      </div>
+      <div class="input-area">
+        <div class="suggestions" id="suggestions"></div>
+        <div class="input-row">
+          <textarea id="input" rows="1"
+            placeholder="Спросите о состоянии БД…"></textarea>
+          <button class="send-btn" id="send-btn" title="Отправить">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+              <path d="M4 12l16-8-6 8 6 8-16-8z" fill="currentColor"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── СТАТУС ── -->
+    <section id="tab-status" class="tab-pane status-pane" hidden>
+      <div id="status-content"><div class="muted">Загрузка…</div></div>
+      <button class="ghost-btn" onclick="App.loadStatus()">↻ Обновить</button>
+    </section>
+
+    <!-- ── АЛЕРТЫ ── -->
+    <section id="tab-alerts" class="tab-pane alerts-pane" hidden>
+      <div id="alerts-content"><div class="muted">Загрузка…</div></div>
+      <button class="ghost-btn" onclick="App.loadAlerts()">↻ Обновить</button>
+    </section>
+  </main>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
