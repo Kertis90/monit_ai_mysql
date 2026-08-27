@@ -21,9 +21,14 @@ log_warn()    { echo -e "${YELLOW}[WARN]${NC}  $1"; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
 log_section() { echo -e "\n${BLUE}══ $1 ══${NC}"; }
 
-# Попытаться загрузить config.env если запускается напрямую
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-[[ -f "${SCRIPT_DIR}/../config.env" ]] && source "${SCRIPT_DIR}/../config.env"
+# Попытаться загрузить config.env если запускается напрямую из репозитория.
+# При запуске по SSH скрипт приходит в stdin (bash -s), BASH_SOURCE пуст —
+# это нормально, все параметры передаются через переменные окружения.
+SELF="${BASH_SOURCE[0]:-}"
+if [[ -n "$SELF" ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+    [[ -f "${SCRIPT_DIR}/../config.env" ]] && source "${SCRIPT_DIR}/../config.env"
+fi
 
 NODE_EXPORTER_VERSION="${NODE_EXPORTER_VERSION:-1.8.2}"
 MYSQLD_EXPORTER_VERSION="${MYSQLD_EXPORTER_VERSION:-0.15.1}"
@@ -31,7 +36,7 @@ MYSQL_EXPORTER_PASSWORD="${MYSQL_EXPORTER_PASSWORD:-ExporterPass123!}"
 
 if [[ $EUID -ne 0 ]]; then
     log_error "Нужны права root. Запустите через sudo:"
-    echo "    sudo -E bash ${BASH_SOURCE[0]}"
+    echo "    sudo -E bash ${SELF:-install_exporters.sh}"
     echo "  или с сервера мониторинга: ./manage_cluster.sh install-exporters <name>"
     exit 1
 fi
