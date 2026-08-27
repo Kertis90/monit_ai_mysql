@@ -113,7 +113,7 @@ mysql-ai-monitoring/
 | Сеть | Сервер мониторинга должен достигать: портов 9100/9104 всех MySQL-серверов, вашего LLM API, github.com (для скачивания бинарей) |
 | LLM | Любой OpenAI-совместимый API: эндпоинт `POST {BASE_URL}/chat/completions`, поддержка `"stream": true` (SSE), авторизация `Authorization: Bearer <token>` |
 | MySQL | 5.7+ / 8.0+, доступ root для создания пользователя `exporter` (или создать вручную) |
-| SSH | Для авто-установки экспортёров: доступ root по SSH с сервера мониторинга на MySQL-серверы (не обязательно — можно ставить вручную) |
+| SSH | Для авто-установки экспортёров: с сервера мониторинга SSH-доступ по ключу на MySQL-серверы под вашей учётной записью (`SSH_USER` из `config.env`), и для неё — `sudo` без пароля на этих серверах. Не обязательно — можно ставить вручную |
 
 ---
 
@@ -136,6 +136,8 @@ chmod +x configure.sh manage_cluster.sh scripts/*.sh
 - Название модели
 - Пароль Grafana
 - Email для алертов (Enter — пропустить, тогда алерты идут только в AI-агента)
+- **SSH-учётку для MySQL-серверов** (`SSH_USER`/`SSH_PORT`/`SSH_KEY`) — под ней
+  ставятся экспортёры, команды выполняются через `sudo`
 
 В конце мастер **проверит соединение с LLM** тестовым запросом.
 
@@ -172,19 +174,43 @@ sudo ./scripts/install_all.sh
 
 ### Шаг 3. Установить экспортёры на MySQL-серверах
 
-**Вариант А — автоматически по SSH** (нужен root-доступ по ключу):
+Установка идёт по SSH под учётной записью из `config.env` (`SSH_USER`, спрашивается
+в `./configure.sh`), а команды на MySQL-серверах выполняются через `sudo`.
+Root-логин по SSH не нужен.
+
+**Подготовка — один раз на каждом MySQL-сервере** (под root):
+
+```bash
+# 1. Пустить ключ учётки мониторинга (выполняется с сервера мониторинга)
+ssh-copy-id dbadmin@10.1.0.1
+
+# 2. Разрешить этой учётке sudo без пароля (на MySQL-сервере)
+echo 'dbadmin ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/mysql_monit
+chmod 440 /etc/sudoers.d/mysql_monit
+visudo -c                      # проверка синтаксиса
+```
+
+**Вариант А — автоматически по SSH:**
 
 ```bash
 ./manage_cluster.sh install-exporters kemerovo
 ./manage_cluster.sh install-exporters novosibirsk
+
+# разовое переопределение учётки/порта/ключа:
+./manage_cluster.sh install-exporters omsk --user other_admin --port 2222 --key ~/.ssh/omsk_rsa
 ```
+
+Перед установкой скрипт проверяет на каждом хосте SSH-доступ и `sudo -n true`,
+и при неудаче печатает нужную строку для `/etc/sudoers.d/`. Проверка идёт сразу
+по primary и replica, чтобы кластер не остался наполовину настроенным.
 
 **Вариант Б — вручную** на каждом сервере (primary и replica):
 
 ```bash
-scp scripts/install_exporters.sh root@10.1.0.1:/root/
-ssh root@10.1.0.1
-MYSQL_EXPORTER_PASSWORD='ваш_пароль_из_clusters.json' bash /root/install_exporters.sh
+scp scripts/install_exporters.sh dbadmin@10.1.0.1:/tmp/
+ssh dbadmin@10.1.0.1
+sudo env MYSQL_EXPORTER_PASSWORD='ваш_пароль_из_clusters.json' \
+     bash /tmp/install_exporters.sh
 ```
 
 Скрипт: откроет порты 9100/9104, поставит node_exporter + mysqld_exporter,
@@ -221,7 +247,8 @@ Prometheus-таргеты (покажет какие DOWN), и сделает **
 ./manage_cluster.sh disable kemerovo           # приостановить мониторинг
 ./manage_cluster.sh enable kemerovo            # возобновить
 ./manage_cluster.sh remove kemerovo            # удалить из реестра
-./manage_cluster.sh install-exporters omsk     # поставить экспортёры по SSH
+./manage_cluster.sh install-exporters omsk     # экспортёры по SSH (SSH_USER + sudo)
+./manage_cluster.sh install-exporters omsk --user dbadmin   # другая учётка разово
 
 sudo ./manage_cluster.sh apply                 # ⚠ ПОСЛЕ ЛЮБЫХ ИЗМЕНЕНИЙ
 ```

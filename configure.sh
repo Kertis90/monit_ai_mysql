@@ -78,7 +78,16 @@ else
 fi
 
 echo ""
-echo -e "${CYAN}── 5. Порты и версии (Enter — по умолчанию) ──────────${NC}"
+echo -e "${CYAN}── 5. SSH-доступ к MySQL-серверам ────────────────────${NC}"
+echo -e "  ${YELLOW}Учётная запись, под которой ставятся экспортёры.${NC}"
+echo -e "  ${YELLOW}Команды выполняются через sudo, поэтому на MySQL-серверах нужно:${NC}"
+echo -e "  ${YELLOW}  echo '<user> ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/mysql_monit${NC}"
+ask "SSH-пользователь" SSH_USER "${USER:-$(id -un)}"
+ask "SSH-порт" SSH_PORT "22"
+ask "Путь к SSH-ключу (Enter — ключ по умолчанию/агент)" SSH_KEY ""
+
+echo ""
+echo -e "${CYAN}── 6. Порты и версии (Enter — по умолчанию) ──────────${NC}"
 ask "Порт AI-агента" AGENT_PORT "5001"
 ask "Prometheus retention" PROMETHEUS_RETENTION "30d"
 
@@ -115,6 +124,13 @@ ALERT_EMAIL_FROM="${ALERT_EMAIL_FROM}"
 ALERT_SMTP_HOST="${ALERT_SMTP_HOST}"
 ALERT_SMTP_USER="${ALERT_SMTP_USER}"
 ALERT_SMTP_PASSWORD="${ALERT_SMTP_PASSWORD}"
+
+# SSH-доступ к MySQL-серверам (установка экспортёров)
+# Команды на удалённых серверах выполняются как: sudo -n <команда>
+# Требуется NOPASSWD-правило в /etc/sudoers.d/ на каждом MySQL-сервере.
+SSH_USER="${SSH_USER}"
+SSH_PORT=${SSH_PORT}
+SSH_KEY="${SSH_KEY}"
 
 # Порты
 AGENT_PORT=${AGENT_PORT}
@@ -166,6 +182,7 @@ echo "  1. Добавьте кластеры:            ./manage_cluster.sh add
 echo "  2. Установите мониторинг:        sudo ./scripts/install_monitoring.sh"
 echo "  3. Установите AI-агента:         sudo ./scripts/install_agent.sh"
 echo "  4. Установите экспортёры:        ./manage_cluster.sh install-exporters <name>"
+echo "     (SSH под '${SSH_USER}', команды через sudo — проверьте NOPASSWD на MySQL-серверах)"
 echo "  5. Примените конфигурацию:       sudo ./manage_cluster.sh apply"
 echo "  6. Проверьте:                    ./scripts/verify.sh"
 echo ""

@@ -11,6 +11,12 @@
 #    show    <name>                — показать детали кластера
 #    apply                         — применить реестр → пересоздать конфиги Prometheus
 #    install-exporters <name>      — установить экспортёры на серверах кластера
+#                                    [--user U] [--port N] [--key PATH]
+#
+#  Установка экспортёров идёт по SSH под учётной записью SSH_USER из config.env
+#  (переопределяется флагом --user), команды на удалённом сервере выполняются
+#  через sudo -n. На каждом MySQL-сервере нужно NOPASSWD-правило:
+#    echo 'SSH_USER ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/mysql_monit
 #
 #  Примеры:
 #    ./manage_cluster.sh list
@@ -18,6 +24,7 @@
 #    ./manage_cluster.sh remove kemerovo
 #    ./manage_cluster.sh apply
 #    ./manage_cluster.sh install-exporters novosibirsk
+#    ./manage_cluster.sh install-exporters novosibirsk --user dbadmin --port 2222
 # =============================================================================
 set -euo pipefail
 
@@ -334,8 +341,46 @@ print(sum(1 for c in d['clusters'] if c.get('enabled',True)))
 }
 
 # ── КОМАНДА: install-exporters ────────────────────────────────────────────────
+
+# Безопасно закавычить значение для передачи в удалённый shell.
+# Одинарные кавычки внутри значения заменяются на '\'' — пароли экспортёра
+# из clusters.json могут содержать пробелы, $, ` и кавычки.
+shquote() {
+    local s=$1 out="'"
+    while [[ $s == *"'"* ]]; do
+        out+="${s%%\'*}'\\''"
+        s=${s#*\'}
+    done
+    printf "%s%s'" "$out" "$s"
+}
+
+# Подсказка по настройке sudo на удалённом сервере
+_sudo_hint() { # user host
+    echo ""
+    log_warn "На сервере $2 выполните под root:"
+    echo "    echo '$1 ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/mysql_monit"
+    echo "    chmod 440 /etc/sudoers.d/mysql_monit"
+    echo "    visudo -c        # проверка синтаксиса"
+    echo ""
+    echo "  Если в sudoers включён requiretty, добавьте туда же:"
+    echo "    Defaults:$1 !requiretty"
+    echo ""
+}
+
 cmd_install_exporters() {
-    local NAME="$1"
+    local NAME="$1"; shift || true
+
+    # Разовые переопределения из командной строки (приоритет над config.env)
+    local OPT_USER="" OPT_PORT="" OPT_KEY=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --user|-u) OPT_USER="${2:?'--user требует значение'}"; shift 2 ;;
+            --port|-p) OPT_PORT="${2:?'--port требует значение'}"; shift 2 ;;
+            --key|-i)  OPT_KEY="${2:?'--key требует значение'}";  shift 2 ;;
+            *) log_error "Неизвестный параметр: $1"; exit 1 ;;
+        esac
+    done
+
     cluster_exists "$NAME" || { log_error "Кластер '$NAME' не найден"; exit 1; }
 
     LABEL=$(cluster_field "$NAME" "label")
@@ -343,22 +388,71 @@ cmd_install_exporters() {
     REPL=$(cluster_field "$NAME" "replica_ip")
     PASS=$(cluster_field "$NAME" "mysql_exporter_password")
 
+    # Учётная запись: --user > config.env SSH_USER > текущий пользователь
+    local R_USER="${OPT_USER:-${SSH_USER:-$(id -un)}}"
+    local R_PORT="${OPT_PORT:-${SSH_PORT:-22}}"
+    local R_KEY="${OPT_KEY:-${SSH_KEY:-}}"
+
+    if [[ "$R_USER" == "root" ]]; then
+        log_warn "SSH_USER=root — обычно нужна непривилегированная учётка с sudo"
+    fi
+    if [[ -n "$R_KEY" && ! -f "$R_KEY" ]]; then
+        log_error "SSH-ключ не найден: ${R_KEY}"
+        exit 1
+    fi
+
+    local SSH_OPTS=(-o StrictHostKeyChecking=no -o BatchMode=yes
+                    -o ConnectTimeout=10 -p "$R_PORT")
+    [[ -n "$R_KEY" ]] && SSH_OPTS+=(-i "$R_KEY")
+
     log_section "Установка экспортёров для '${LABEL}'"
+    log_info "Учётная запись: ${R_USER}@<host>:${R_PORT}${R_KEY:+ (ключ: ${R_KEY})}"
+    log_info "Команды на серверах выполняются через sudo"
 
     EXPORTER_SCRIPT="${SCRIPT_DIR}/scripts/install_exporters.sh"
-    [[ -f "$EXPORTER_SCRIPT" ]] || { log_error "01_install_exporters.sh не найден"; exit 1; }
+    [[ -f "$EXPORTER_SCRIPT" ]] || { log_error "install_exporters.sh не найден"; exit 1; }
 
-    _install_on_host() {
-        local HOST="$1"
-        local ROLE="$2"
-        log_info "Подключаюсь к ${HOST} (${ROLE})..."
-        ssh -o StrictHostKeyChecking=no root@"$HOST" \
-            "PRIMARY_IP=$PRIM REPLICA_IP=$REPL MYSQL_EXPORTER_PASSWORD=$PASS \
-             MONITORING_IP=${MONITORING_IP:-10.0.0.100} \
-             NODE_EXPORTER_VERSION=${NODE_EXPORTER_VERSION:-1.8.2} \
-             MYSQLD_EXPORTER_VERSION=${MYSQLD_EXPORTER_VERSION:-0.15.1} \
-             bash -s" < "$EXPORTER_SCRIPT"
+    # Проверка: SSH доступен и sudo работает без пароля
+    _check_host() { # host role
+        local HOST="$1" ROLE="$2"
+        log_info "Проверка доступа ${R_USER}@${HOST} (${ROLE})..."
+
+        if ! ssh "${SSH_OPTS[@]}" "${R_USER}@${HOST}" true 2>/dev/null; then
+            log_error "SSH-подключение к ${R_USER}@${HOST}:${R_PORT} не удалось"
+            echo "  Проверьте: доступность хоста, порт, и что ключ добавлен в"
+            echo "  ~${R_USER}/.ssh/authorized_keys (ssh-copy-id ${R_USER}@${HOST})"
+            exit 1
+        fi
+
+        if ! ssh "${SSH_OPTS[@]}" "${R_USER}@${HOST}" 'sudo -n true' 2>/dev/null; then
+            log_error "sudo без пароля недоступен для '${R_USER}' на ${HOST}"
+            _sudo_hint "$R_USER" "$HOST"
+            exit 1
+        fi
+        log_info "  ✓ SSH + sudo -n доступны"
     }
+
+    _install_on_host() { # host role
+        local HOST="$1" ROLE="$2"
+        log_info "Установка на ${HOST} (${ROLE})..."
+
+        # env вместо VAR=... перед sudo: не требует setenv в sudoers.
+        # Скрипт передаётся в stdin, поэтому bash -s читает его как обычно.
+        ssh "${SSH_OPTS[@]}" "${R_USER}@${HOST}" \
+            "sudo -n env \
+               PRIMARY_IP=$(shquote "$PRIM") \
+               REPLICA_IP=$(shquote "$REPL") \
+               MYSQL_EXPORTER_PASSWORD=$(shquote "$PASS") \
+               MONITORING_IP=$(shquote "${MONITORING_IP:-10.0.0.100}") \
+               NODE_EXPORTER_VERSION=$(shquote "${NODE_EXPORTER_VERSION:-1.8.2}") \
+               MYSQLD_EXPORTER_VERSION=$(shquote "${MYSQLD_EXPORTER_VERSION:-0.15.1}") \
+               bash -s" < "$EXPORTER_SCRIPT"
+    }
+
+    # Сначала проверяем все хосты, потом ставим — чтобы не оставить
+    # кластер в полусобранном состоянии из-за забытого sudo на replica.
+    _check_host "$PRIM" "primary"
+    [[ -n "$REPL" ]] && _check_host "$REPL" "replica"
 
     _install_on_host "$PRIM" "primary"
     [[ -n "$REPL" ]] && _install_on_host "$REPL" "replica"
@@ -379,7 +473,7 @@ case "$CMD" in
     disable)            cmd_set_enabled "${1:?'Укажите name'}" "false" ;;
     show)               cmd_show "${1:?'Укажите name'}" ;;
     apply)              cmd_apply ;;
-    install-exporters)  cmd_install_exporters "${1:?'Укажите name'}" ;;
+    install-exporters)  cmd_install_exporters "${1:?'Укажите name'}" "${@:2}" ;;
     *)
         echo ""
         echo -e "${BOLD}  manage_cluster.sh — управление MySQL-кластерами${NC}"
@@ -392,13 +486,18 @@ case "$CMD" in
         echo "    disable <name>              — отключить мониторинг"
         echo "    show    <name>              — детали кластера"
         echo "    apply                       — применить реестр в Prometheus"
-        echo "    install-exporters <name>    — установить экспортёры по SSH"
+        echo "    install-exporters <name> [--user U] [--port N] [--key PATH]"
+        echo "                                — установить экспортёры по SSH (через sudo)"
         echo ""
         echo "  Примеры:"
         echo "    ./manage_cluster.sh list"
         echo "    ./manage_cluster.sh add"
         echo "    ./manage_cluster.sh install-exporters kemerovo"
+        echo "    ./manage_cluster.sh install-exporters kemerovo --user dbadmin"
         echo "    ./manage_cluster.sh apply"
+        echo ""
+        echo "  SSH-учётка по умолчанию берётся из config.env (SSH_USER/SSH_PORT/SSH_KEY),"
+        echo "  команды на MySQL-серверах выполняются через sudo -n (нужен NOPASSWD)."
         echo ""
         ;;
 esac

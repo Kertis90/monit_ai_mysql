@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  01_install_exporters.sh — Установка экспортёров на MySQL-сервере
-#  Вызывается напрямую или через: ./manage_cluster.sh install-exporters <name>
+#  install_exporters.sh — Установка экспортёров на MySQL-сервере
+#  Требует root. Способы запуска:
+#    с сервера мониторинга: ./manage_cluster.sh install-exporters <name>
+#      (подключается по SSH под SSH_USER и выполняет этот скрипт через sudo)
+#    локально на MySQL-сервере: sudo -E bash install_exporters.sh
 #
 #  Переменные окружения (устанавливаются manage_cluster.sh автоматически):
 #    MYSQL_EXPORTER_PASSWORD — пароль пользователя exporter
@@ -27,7 +30,9 @@ MYSQLD_EXPORTER_VERSION="${MYSQLD_EXPORTER_VERSION:-0.15.1}"
 MYSQL_EXPORTER_PASSWORD="${MYSQL_EXPORTER_PASSWORD:-ExporterPass123!}"
 
 if [[ $EUID -ne 0 ]]; then
-    log_error "Запустите от root (sudo)"
+    log_error "Нужны права root. Запустите через sudo:"
+    echo "    sudo -E bash ${BASH_SOURCE[0]}"
+    echo "  или с сервера мониторинга: ./manage_cluster.sh install-exporters <name>"
     exit 1
 fi
 
@@ -45,7 +50,9 @@ log_info "Порты 9100, 9104 открыты"
 # =============================================================================
 log_section "node_exporter v${NODE_EXPORTER_VERSION}"
 # =============================================================================
-if ! command -v node_exporter &>/dev/null; then
+# Проверяем файл, а не PATH: под sudo действует secure_path,
+# в котором /usr/local/bin может отсутствовать.
+if [[ ! -x /usr/local/bin/node_exporter ]]; then
     cd /tmp
     FILE="node_exporter-${NODE_EXPORTER_VERSION}.linux-amd64"
     curl -fsSL -o "${FILE}.tar.gz" \
@@ -106,7 +113,7 @@ fi
 # =============================================================================
 log_section "mysqld_exporter v${MYSQLD_EXPORTER_VERSION}"
 # =============================================================================
-if ! command -v mysqld_exporter &>/dev/null; then
+if [[ ! -x /usr/local/bin/mysqld_exporter ]]; then
     cd /tmp
     FILE="mysqld_exporter-${MYSQLD_EXPORTER_VERSION}.linux-amd64"
     curl -fsSL -o "${FILE}.tar.gz" \
