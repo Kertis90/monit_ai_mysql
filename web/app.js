@@ -22,9 +22,12 @@ const App = (() => {
 
   // ═══ WEBSOCKET ══════════════════════════════════════════════════
 
+  // WebSocket не учитывает <base>, поэтому адрес строим от document.baseURI —
+  // так он подхватывает префикс nginx (/ai-agent/ws) так же, как fetch ниже.
   function wsUrl() {
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    return `${proto}//${location.host}/ws`;
+    const u = new URL('ws', document.baseURI);
+    u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
+    return u.href;
   }
 
   function connect() {
@@ -188,7 +191,7 @@ const App = (() => {
 
   async function refreshClusters() {
     try {
-      const r = await fetch('/clusters');
+      const r = await fetch('clusters');
       const d = await r.json();
       state.clusters = d.clusters || [];
       $('clusters-badge').textContent = state.clusters.length + ' кластеров';
@@ -219,7 +222,7 @@ const App = (() => {
 
   async function refreshClusterBadges(name) {
     try {
-      const r = await fetch(`/clusters/${name}/status`);
+      const r = await fetch(`clusters/${name}/status`);
       const d = await r.json();
       const el = $('cb-' + name);
       if (!el) return;
@@ -287,7 +290,7 @@ const App = (() => {
     const el = $('status-content');
     el.innerHTML = '<div class="muted">Загрузка…</div>';
     try {
-      const r = await fetch('/status');
+      const r = await fetch('status');
       const d = await r.json();
       if (!d.clusters?.length) {
         el.innerHTML = '<div class="muted">Нет кластеров</div>';
@@ -360,7 +363,7 @@ const App = (() => {
     const el = $('alerts-content');
     el.innerHTML = '<div class="muted">Загрузка…</div>';
     try {
-      const r = await fetch('/alerts/history?limit=30');
+      const r = await fetch('alerts/history?limit=30');
       const d = await r.json();
 
       // Счётчик на вкладке

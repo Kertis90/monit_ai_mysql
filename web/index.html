@@ -4,7 +4,10 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>MySQL AI Agent — центр мониторинга</title>
-<link rel="stylesheet" href="/static/style.css">
+<!-- href подставляет agent.py из ROOT_PATH: "/" в корне, "/ai-agent/" за nginx.
+     Все ссылки ниже относительные и разрешаются от этого адреса. -->
+<base href="/">
+<link rel="stylesheet" href="static/style.css">
 </head>
 <body>
 
@@ -79,6 +82,6 @@
   </main>
 </div>
 
-<script src="/static/app.js"></script>
+<script src="static/app.js"></script>
 </body>
 </html>

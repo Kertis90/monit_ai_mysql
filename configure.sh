@@ -87,8 +87,41 @@ ask "SSH-порт" SSH_PORT "22"
 ask "Путь к SSH-ключу (Enter — ключ по умолчанию/агент)" SSH_KEY ""
 
 echo ""
-echo -e "${CYAN}── 6. Порты и версии (Enter — по умолчанию) ──────────${NC}"
+echo -e "${CYAN}── 6. Python-репозиторий (pip) ───────────────────────${NC}"
+echo -e "  ${YELLOW}Enter — публичный PyPI. Для внутреннего Nexus/Artifactory${NC}"
+echo -e "  ${YELLOW}укажите URL вида https://nexus.company.ru/repository/pypi/simple${NC}"
+ask "pip index-url" PIP_INDEX_URL ""
+if [[ -n "${PIP_INDEX_URL}" ]]; then
+    PIP_HOST_GUESS=$(printf '%s' "$PIP_INDEX_URL" | sed -E 's#^[a-z]+://##; s#^[^@]*@##; s#[:/].*$##')
+    echo -e "  ${YELLOW}extra-index-url — если во внутреннем репо есть не все пакеты${NC}"
+    ask "pip extra-index-url (Enter — не нужен)" PIP_EXTRA_INDEX_URL ""
+    echo -e "  ${YELLOW}trusted-host — для http или самоподписанного сертификата${NC}"
+    ask "pip trusted-host (Enter — не нужен)" PIP_TRUSTED_HOST "$PIP_HOST_GUESS"
+    echo -e "  ${YELLOW}CA-сертификат — если репозиторий за корпоративным TLS${NC}"
+    ask "Путь к CA-бандлу (Enter — системный)" PIP_CERT ""
+else
+    PIP_EXTRA_INDEX_URL=""; PIP_TRUSTED_HOST=""; PIP_CERT=""
+fi
+
+echo ""
+echo -e "${CYAN}── 7. Зеркала для скачивания ─────────────────────────${NC}"
+echo -e "  ${YELLOW}Подменяется только домен, путь достраивается как на оригинале:${NC}"
+echo -e "  ${YELLOW}  https://my.ru/proxy  →  https://my.ru/proxy/prometheus/node_exporter/...${NC}"
+ask "Зеркало GitHub (бинари экспортёров/Prometheus)" GITHUB_BASE_URL "https://github.com"
+echo -e "  ${YELLOW}  https://my.ru/graf   →  https://my.ru/graf/api/dashboards/1860/...${NC}"
+ask "Зеркало grafana.com (дашборды)" GRAFANA_COM_URL "https://grafana.com"
+
+# Убрать хвостовой слэш — пути везде добавляются со своим
+GITHUB_BASE_URL="${GITHUB_BASE_URL%/}"
+GRAFANA_COM_URL="${GRAFANA_COM_URL%/}"
+
+echo ""
+echo -e "${CYAN}── 8. Порты и версии (Enter — по умолчанию) ──────────${NC}"
 ask "Порт AI-агента" AGENT_PORT "5001"
+echo -e "  ${YELLOW}Подпуть за nginx (напр. /ai-agent). Enter — агент в корне сайта${NC}"
+ask "ROOT_PATH агента" ROOT_PATH ""
+ROOT_PATH="/${ROOT_PATH#/}"; ROOT_PATH="${ROOT_PATH%/}"
+[[ "$ROOT_PATH" == "/" ]] && ROOT_PATH=""
 ask "Prometheus retention" PROMETHEUS_RETENTION "30d"
 
 # Версии — фиксированные, но настраиваемые
@@ -132,8 +165,27 @@ SSH_USER="${SSH_USER}"
 SSH_PORT=${SSH_PORT}
 SSH_KEY="${SSH_KEY}"
 
+# Python-репозиторий для установки зависимостей агента
+# Пусто = публичный PyPI. Может содержать логин:пароль в URL,
+# поэтому config.env создаётся с правами 600.
+PIP_INDEX_URL="${PIP_INDEX_URL}"
+PIP_EXTRA_INDEX_URL="${PIP_EXTRA_INDEX_URL}"
+PIP_TRUSTED_HOST="${PIP_TRUSTED_HOST}"
+PIP_CERT="${PIP_CERT}"
+
+# Зеркала для скачивания. Подменяют только схему+домен(+префикс пути),
+# остальной путь скрипты достраивают сами.
+#   ${GITHUB_BASE_URL}/prometheus/node_exporter/releases/download/v<ver>/<file>
+#   ${GRAFANA_COM_URL}/api/dashboards/<id>/revisions/latest/download
+GITHUB_BASE_URL="${GITHUB_BASE_URL}"
+GRAFANA_COM_URL="${GRAFANA_COM_URL}"
+
 # Порты
 AGENT_PORT=${AGENT_PORT}
+
+# Подпуть за обратным прокси. Пусто = агент в корне.
+# Маршруты внутри агента остаются без префикса — его срезает nginx.
+ROOT_PATH="${ROOT_PATH}"
 
 # Prometheus
 PROMETHEUS_VERSION="${PROMETHEUS_VERSION}"
@@ -161,7 +213,7 @@ HTTP_CODE=$(curl -s -o /tmp/llm_test.json -w "%{http_code}" \
     -H "Content-Type: application/json" \
     -H "Authorization: ${AUTH}" \
     -d "{\"model\":\"${LLM_MODEL}\",\"max_tokens\":20,\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}" \
-    --max-time 20 2>/dev/null || echo "000")
+    --max-time 20 2>/dev/null || true)
 
 if [[ "$HTTP_CODE" == "200" ]]; then
     echo -e "  ${GREEN}✓ LLM отвечает (HTTP 200)${NC}"
@@ -174,6 +226,39 @@ else
     echo -e "  ${YELLOW}  Проверьте токен и название модели. Установку можно продолжить.${NC}"
 fi
 rm -f /tmp/llm_test.json
+
+# ── Тест pip-репозитория ──────────────────────────────────────────────────────
+if [[ -n "${PIP_INDEX_URL}" ]]; then
+    echo ""
+    echo -e "${CYAN}── Проверка pip-репозитория ──────────────────────────${NC}"
+    # Скрыть логин:пароль в выводе
+    PIP_SHOWN=$(printf '%s' "$PIP_INDEX_URL" | sed -E 's#(://[^:/@]+):[^@]*@#\1:***@#')
+
+    PIP_CURL=(curl -s -o /dev/null -w "%{http_code}" --max-time 15 -L)
+    if [[ -n "${PIP_CERT}" ]]; then
+        PIP_CURL+=(--cacert "${PIP_CERT}")
+    elif [[ -n "${PIP_TRUSTED_HOST}" ]]; then
+        PIP_CURL+=(-k)   # самоподписанный сертификат — как trusted-host у pip
+    fi
+
+    # curl сам печатает 000 при сбое соединения; без `|| true` ненулевой
+    # код возврата добавил бы вторую строку и сломал сравнение.
+    PIP_CODE=$("${PIP_CURL[@]}" "${PIP_INDEX_URL%/}/pip/" 2>/dev/null || true)
+
+    case "$PIP_CODE" in
+        200|301|302)
+            echo -e "  ${GREEN}✓ Репозиторий отвечает: ${PIP_SHOWN}${NC}" ;;
+        000)
+            echo -e "  ${YELLOW}! Нет соединения с ${PIP_SHOWN}${NC}"
+            echo -e "  ${YELLOW}  Проверьте URL, сеть и TLS. Установку можно продолжить.${NC}" ;;
+        401|403)
+            echo -e "  ${YELLOW}! HTTP ${PIP_CODE} — репозиторий доступен, но отклонил доступ${NC}"
+            echo -e "  ${YELLOW}  Укажите логин:пароль в URL: https://user:token@host/...${NC}" ;;
+        *)
+            echo -e "  ${YELLOW}! Репозиторий вернул HTTP ${PIP_CODE}${NC}"
+            echo -e "  ${YELLOW}  Убедитесь, что URL заканчивается на /simple${NC}" ;;
+    esac
+fi
 
 echo ""
 echo -e "${BOLD}Следующие шаги:${NC}"

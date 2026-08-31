@@ -18,6 +18,12 @@ CONFIG="${SCRIPT_DIR}/../config.env"
 source "$CONFIG"
 [[ $EUID -ne 0 ]] && { log_error "Нужен root (sudo)"; exit 1; }
 
+# Зеркала: подменяется только домен, путь достраивается как на оригинале
+GITHUB_BASE_URL="${GITHUB_BASE_URL:-https://github.com}"; GITHUB_BASE_URL="${GITHUB_BASE_URL%/}"
+GRAFANA_COM_URL="${GRAFANA_COM_URL:-https://grafana.com}"; GRAFANA_COM_URL="${GRAFANA_COM_URL%/}"
+[[ "$GITHUB_BASE_URL" != "https://github.com" ]] && log_info "Зеркало GitHub: ${GITHUB_BASE_URL}"
+[[ "$GRAFANA_COM_URL" != "https://grafana.com" ]] && log_info "Зеркало grafana.com: ${GRAFANA_COM_URL}"
+
 # =============================================================================
 log_section "1/4 Firewall"
 # =============================================================================
@@ -38,7 +44,7 @@ if ! command -v prometheus &>/dev/null; then
     cd /tmp
     F="prometheus-${PROMETHEUS_VERSION}.linux-amd64"
     curl -fsSL -o "${F}.tar.gz" \
-        "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/${F}.tar.gz"
+        "${GITHUB_BASE_URL}/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/${F}.tar.gz"
     tar xzf "${F}.tar.gz"
     mv "${F}/prometheus" "${F}/promtool" /usr/local/bin/
     cp -r "${F}/consoles" "${F}/console_libraries" /etc/prometheus/ 2>/dev/null || true
@@ -245,7 +251,7 @@ if ! command -v alertmanager &>/dev/null; then
     cd /tmp
     F="alertmanager-${ALERTMANAGER_VERSION}.linux-amd64"
     curl -fsSL -o "${F}.tar.gz" \
-        "https://github.com/prometheus/alertmanager/releases/download/v${ALERTMANAGER_VERSION}/${F}.tar.gz"
+        "${GITHUB_BASE_URL}/prometheus/alertmanager/releases/download/v${ALERTMANAGER_VERSION}/${F}.tar.gz"
     tar xzf "${F}.tar.gz" && mv "${F}/alertmanager" /usr/local/bin/
     rm -rf "${F}" "${F}.tar.gz"
     log_info "Alertmanager установлен"
@@ -375,15 +381,51 @@ sleep 4
 grafana-cli admin reset-admin-password "${GRAFANA_ADMIN_PASSWORD}" 2>/dev/null || true
 curl -sf http://localhost:3000/api/health >/dev/null && log_info "Grafana ✓" || log_error "Grafana не отвечает"
 
-# Импорт дашбордов
+# ── Импорт дашбордов ──────────────────────────────────────────────────────────
+# JSON скачивается с ${GRAFANA_COM_URL} и отправляется в Grafana целиком.
+# Передать один "dashboardId" нельзя: /api/dashboards/import ничего не качает
+# сам, а без блока inputs панели ссылаются на несуществующий ${DS_PROMETHEUS}.
 sleep 3
 for ID in 1860 7362 11323 7371; do
-    curl -sf -u "admin:${GRAFANA_ADMIN_PASSWORD}" \
-        -H "Content-Type: application/json" \
-        -d "{\"dashboardId\":${ID},\"folderId\":0,\"overwrite\":true}" \
-        "http://localhost:3000/api/dashboards/import" >/dev/null 2>&1 && \
-        log_info "Дашборд ${ID} импортирован" || \
+    DASH_JSON="/tmp/grafana_dash_${ID}.json"
+    DASH_URL="${GRAFANA_COM_URL}/api/dashboards/${ID}/revisions/latest/download"
+
+    if ! curl -fsSL --max-time 30 -o "$DASH_JSON" "$DASH_URL"; then
+        log_warn "Дашборд ${ID}: не скачался с ${GRAFANA_COM_URL}"
+        log_warn "  Импортируйте вручную: Dashboards → Import → ${ID}"
+        rm -f "$DASH_JSON"
+        continue
+    fi
+
+    if ! python3 - "$DASH_JSON" > "${DASH_JSON}.payload" << 'PY'
+import json, sys
+dashboard = json.load(open(sys.argv[1], encoding='utf-8'))
+# Datasource-плейсхолдеры дашборда привязываем к провижененному Prometheus
+inputs = [
+    {"name": i["name"], "type": i["type"],
+     "pluginId": i.get("pluginId", "prometheus"), "value": "Prometheus"}
+    for i in dashboard.get("__inputs", [])
+    if i.get("type") == "datasource"
+]
+json.dump({"dashboard": dashboard, "overwrite": True,
+           "folderId": 0, "inputs": inputs},
+          sys.stdout, ensure_ascii=False)
+PY
+    then
+        log_warn "Дашборд ${ID}: некорректный JSON — пропускаем"
+        rm -f "$DASH_JSON" "${DASH_JSON}.payload"
+        continue
+    fi
+
+    if curl -sf -u "admin:${GRAFANA_ADMIN_PASSWORD}" \
+            -H "Content-Type: application/json" \
+            -d "@${DASH_JSON}.payload" \
+            "http://localhost:3000/api/dashboards/import" >/dev/null; then
+        log_info "Дашборд ${ID} импортирован"
+    else
         log_warn "Дашборд ${ID} — импортируйте вручную (Dashboards → Import → ${ID})"
+    fi
+    rm -f "$DASH_JSON" "${DASH_JSON}.payload"
 done
 
 echo ""

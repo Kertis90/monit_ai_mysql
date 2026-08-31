@@ -34,6 +34,10 @@ NODE_EXPORTER_VERSION="${NODE_EXPORTER_VERSION:-1.8.2}"
 MYSQLD_EXPORTER_VERSION="${MYSQLD_EXPORTER_VERSION:-0.15.1}"
 MYSQL_EXPORTER_PASSWORD="${MYSQL_EXPORTER_PASSWORD:-ExporterPass123!}"
 
+# Зеркало GitHub: подменяется только домен, путь достраивается как на оригинале
+GITHUB_BASE_URL="${GITHUB_BASE_URL:-https://github.com}"
+GITHUB_BASE_URL="${GITHUB_BASE_URL%/}"
+
 if [[ $EUID -ne 0 ]]; then
     log_error "Нужны права root. Запустите через sudo:"
     echo "    sudo -E bash ${SELF:-install_exporters.sh}"
@@ -61,7 +65,7 @@ if [[ ! -x /usr/local/bin/node_exporter ]]; then
     cd /tmp
     FILE="node_exporter-${NODE_EXPORTER_VERSION}.linux-amd64"
     curl -fsSL -o "${FILE}.tar.gz" \
-        "https://github.com/prometheus/node_exporter/releases/download/v${NODE_EXPORTER_VERSION}/${FILE}.tar.gz"
+        "${GITHUB_BASE_URL}/prometheus/node_exporter/releases/download/v${NODE_EXPORTER_VERSION}/${FILE}.tar.gz"
     tar xzf "${FILE}.tar.gz"
     mv "${FILE}/node_exporter" /usr/local/bin/ && chmod +x /usr/local/bin/node_exporter
     rm -rf "${FILE}" "${FILE}.tar.gz"
@@ -122,7 +126,7 @@ if [[ ! -x /usr/local/bin/mysqld_exporter ]]; then
     cd /tmp
     FILE="mysqld_exporter-${MYSQLD_EXPORTER_VERSION}.linux-amd64"
     curl -fsSL -o "${FILE}.tar.gz" \
-        "https://github.com/prometheus/mysqld_exporter/releases/download/v${MYSQLD_EXPORTER_VERSION}/${FILE}.tar.gz"
+        "${GITHUB_BASE_URL}/prometheus/mysqld_exporter/releases/download/v${MYSQLD_EXPORTER_VERSION}/${FILE}.tar.gz"
     tar xzf "${FILE}.tar.gz"
     mv "${FILE}/mysqld_exporter" /usr/local/bin/ && chmod +x /usr/local/bin/mysqld_exporter
     rm -rf "${FILE}" "${FILE}.tar.gz"

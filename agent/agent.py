@@ -20,7 +20,7 @@ import httpx
 from pathlib import Path
 from typing import Optional, AsyncGenerator
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -39,6 +39,13 @@ AGENT_PORT      = int(os.environ.get("AGENT_PORT",  "5001"))
 REGISTRY_PATH   = os.environ.get("REGISTRY_PATH",   "/opt/ai-alert-agent/clusters.json")
 WEB_DIR         = os.environ.get("WEB_DIR",         "/opt/ai-alert-agent/web")
 
+# Префикс, под которым агент виден снаружи через nginx (например "/ai-agent").
+# Пусто = агент отдаётся в корне. Сами маршруты FastAPI остаются без префикса:
+# префикс срезает nginx (proxy_pass со слэшем на конце), а ROOT_PATH нужен лишь
+# чтобы страница знала, от какого адреса строить свои ссылки.
+ROOT_PATH       = "/" + os.environ.get("ROOT_PATH", "").strip().strip("/")
+ROOT_PATH       = "" if ROOT_PATH == "/" else ROOT_PATH
+
 AUTH_HEADER = LLM_API_KEY if LLM_API_KEY.startswith("Bearer ") else f"Bearer {LLM_API_KEY}"
 
 logging.basicConfig(
@@ -49,7 +56,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("agent")
 
-app = FastAPI(title="MySQL AI Agent v3", version="3.0.0")
+app = FastAPI(title="MySQL AI Agent v3", version="3.0.0", root_path=ROOT_PATH)
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
 
@@ -682,11 +689,17 @@ def config_info():
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/", response_class=HTMLResponse)
-def index():
+def index(request: Request):
     index_path = Path(WEB_DIR) / "index.html"
-    if index_path.exists():
-        return FileResponse(index_path)
-    return HTMLResponse("<h1>MySQL AI Agent</h1><p>web/index.html не найден</p>")
+    if not index_path.exists():
+        return HTMLResponse("<h1>MySQL AI Agent</h1><p>web/index.html не найден</p>")
+
+    # Все ссылки страницы относительные, поэтому базовый адрес подставляется
+    # здесь: под nginx на подпути это "/ai-agent/", в корне — "/".
+    prefix = (request.scope.get("root_path") or ROOT_PATH).rstrip("/")
+    html = index_path.read_text(encoding="utf-8")
+    html = html.replace('<base href="/">', f'<base href="{prefix}/">', 1)
+    return HTMLResponse(html)
 
 
 if Path(WEB_DIR).exists():

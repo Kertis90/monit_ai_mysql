@@ -408,6 +408,9 @@ cmd_install_exporters() {
     log_section "Установка экспортёров для '${LABEL}'"
     log_info "Учётная запись: ${R_USER}@<host>:${R_PORT}${R_KEY:+ (ключ: ${R_KEY})}"
     log_info "Команды на серверах выполняются через sudo"
+    if [[ -n "${GITHUB_BASE_URL:-}" && "${GITHUB_BASE_URL}" != "https://github.com" ]]; then
+        log_info "Зеркало GitHub: ${GITHUB_BASE_URL} (должно быть доступно с MySQL-серверов)"
+    fi
 
     EXPORTER_SCRIPT="${SCRIPT_DIR}/scripts/install_exporters.sh"
     [[ -f "$EXPORTER_SCRIPT" ]] || { log_error "install_exporters.sh не найден"; exit 1; }
@@ -446,6 +449,7 @@ cmd_install_exporters() {
                MONITORING_IP=$(shquote "${MONITORING_IP:-10.0.0.100}") \
                NODE_EXPORTER_VERSION=$(shquote "${NODE_EXPORTER_VERSION:-1.8.2}") \
                MYSQLD_EXPORTER_VERSION=$(shquote "${MYSQLD_EXPORTER_VERSION:-0.15.1}") \
+               GITHUB_BASE_URL=$(shquote "${GITHUB_BASE_URL:-https://github.com}") \
                bash -s" < "$EXPORTER_SCRIPT"
     }
 

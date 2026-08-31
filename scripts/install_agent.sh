@@ -43,8 +43,39 @@ log_info "Файлы скопированы в ${AGENT_DIR}"
 log_section "Python-зависимости (venv)"
 # =============================================================================
 python3 -m venv "${AGENT_DIR}/venv"
-"${AGENT_DIR}/venv/bin/pip" install --upgrade pip -q
-"${AGENT_DIR}/venv/bin/pip" install -q \
+
+# ── pip-репозиторий из config.env (пусто = публичный PyPI) ────────────────────
+PIP_ARGS=()
+if [[ -n "${PIP_INDEX_URL:-}" ]]; then
+    PIP_ARGS+=(--index-url "${PIP_INDEX_URL}")
+    [[ -n "${PIP_EXTRA_INDEX_URL:-}" ]] && PIP_ARGS+=(--extra-index-url "${PIP_EXTRA_INDEX_URL}")
+    [[ -n "${PIP_TRUSTED_HOST:-}"    ]] && PIP_ARGS+=(--trusted-host "${PIP_TRUSTED_HOST}")
+    [[ -n "${PIP_CERT:-}"            ]] && PIP_ARGS+=(--cert "${PIP_CERT}")
+
+    if [[ -n "${PIP_CERT:-}" && ! -f "${PIP_CERT}" ]]; then
+        log_error "CA-сертификат для pip не найден: ${PIP_CERT}"
+        exit 1
+    fi
+
+    # Закрепляем репозиторий в самом venv, чтобы последующие ручные
+    # pip install в нём тоже шли во внутренний репозиторий.
+    {
+        echo "[global]"
+        echo "index-url = ${PIP_INDEX_URL}"
+        [[ -n "${PIP_EXTRA_INDEX_URL:-}" ]] && echo "extra-index-url = ${PIP_EXTRA_INDEX_URL}"
+        [[ -n "${PIP_TRUSTED_HOST:-}"    ]] && echo "trusted-host = ${PIP_TRUSTED_HOST}"
+        [[ -n "${PIP_CERT:-}"            ]] && echo "cert = ${PIP_CERT}"
+    } > "${AGENT_DIR}/venv/pip.conf"
+    chmod 600 "${AGENT_DIR}/venv/pip.conf"
+
+    # URL может содержать логин:пароль — не печатаем его целиком
+    log_info "pip-репозиторий: $(printf '%s' "${PIP_INDEX_URL}" | sed -E 's#(://[^:/@]+):[^@]*@#\1:***@#')"
+else
+    log_info "pip-репозиторий: публичный PyPI"
+fi
+
+"${AGENT_DIR}/venv/bin/pip" install --upgrade pip -q "${PIP_ARGS[@]}"
+"${AGENT_DIR}/venv/bin/pip" install -q "${PIP_ARGS[@]}" \
     "fastapi==0.111.0" \
     "uvicorn[standard]==0.29.0" \
     "httpx==0.27.0" \
@@ -63,6 +94,7 @@ LLM_MAX_TOKENS=${LLM_MAX_TOKENS}
 LLM_TEMPERATURE=${LLM_TEMPERATURE}
 PROMETHEUS_URL=http://localhost:9090
 AGENT_PORT=${AGENT_PORT}
+ROOT_PATH=${ROOT_PATH:-}
 REGISTRY_PATH=${AGENT_DIR}/clusters.json
 WEB_DIR=${AGENT_DIR}/web
 EOF
