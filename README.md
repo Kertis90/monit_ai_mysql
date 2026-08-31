@@ -97,6 +97,12 @@ mysql-ai-monitoring/
 │   ├── style.css                 ← тёмная тема
 │   └── app.js                    ← WebSocket-клиент со стримингом и реконнектом
 │
+├── grafana/
+│   └── dashboards/
+│       └── mysql-clusters.json   ← дашборд под метки cluster/cluster_label/role,
+│                                    ставится провижинингом в папку
+│                                    «MySQL AI Monitoring»
+│
 └── docs/
     └── architecture.drawio       ← схема архитектуры: потоки данных, порты,
                                      протоколы. Открыть: app.diagrams.net
@@ -540,6 +546,38 @@ firewall-cmd --list-ports                             # 9100, 9104
 ```
 `mysql_up 0` = экспортёр не может подключиться к MySQL — проверьте пользователя
 `exporter` и пароль в `/etc/mysqld_exporter/.my.cnf`.
+
+**В Grafana дашборды пустые, хотя в Prometheus метрики есть**
+
+Сначала убедитесь, что данные действительно собираются:
+```bash
+curl -s 'http://localhost:9090/api/v1/label/job/values' | python3 -m json.tool
+# ожидаем: prometheus, mysql_<кластер>, node_<кластер>
+```
+
+Если job'ы на месте, а панели пустые — это несовпадение имён job. Community-дашборды
+(1860, 7362 и другие) фильтруют по `job="node"` / `job="mysql"`, а `apply` генерирует
+`job` вида `node_kemerovo` / `mysql_kemerovo`. Проверить:
+```bash
+curl -s 'http://localhost:9090/api/v1/query?query=up{job="node"}' \
+  | python3 -c "import json,sys; print(len(json.load(sys.stdin)['data']['result']))"
+# 0 -> дашборд ищет не тот job
+```
+
+Используйте дашборд **«MySQL кластеры — обзор»** (папка *MySQL AI Monitoring*) —
+он лежит в [grafana/dashboards/](grafana/dashboards/) и написан под метки этого
+проекта: селектор сверху переключает кластеры по метке `cluster`, в легендах
+человеческие названия из `cluster_label` и роль primary/replica. Ставится
+провижинингом, отдельного импорта не требует:
+```bash
+sudo ./scripts/install_monitoring.sh    # Prometheus/Grafana уже стоят — скрипт их пропустит
+```
+
+Community-дашборды при этом остаются: их можно донастроить, поправив переменную
+`$job` вверху дашборда, либо просто не использовать.
+
+**Панели пишут «Datasource not found» или `${DS_PROMETHEUS}`** — дашборд
+импортирован без привязки датасорса. Перезалейте: `sudo ./scripts/install_monitoring.sh`.
 
 **WebSocket рвётся за прокси** — увеличьте `proxy_read_timeout` (клиент шлёт
 ping каждые 25с, таймаут должен быть больше).

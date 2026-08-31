@@ -369,12 +369,40 @@ apiVersion: 1
 datasources:
   - name: Prometheus
     type: prometheus
+    uid: prometheus          # фиксированный uid — на него ссылаются наши дашборды
     access: proxy
     url: http://localhost:9090
     isDefault: true
     jsonData:
       timeInterval: "15s"
 EOF
+
+# ── Свои дашборды (провижининг из файлов) ─────────────────────────────────────
+# Community-дашборды ниже фильтруют по job="node"/"mysql", а этот проект
+# генерирует job вида node_<кластер>, поэтому нужен дашборд под свои метки.
+mkdir -p /etc/grafana/provisioning/dashboards /var/lib/grafana/dashboards
+cat > /etc/grafana/provisioning/dashboards/mysql_monit.yml << 'EOF'
+apiVersion: 1
+providers:
+  - name: mysql-ai-monitoring
+    orgId: 1
+    folder: MySQL AI Monitoring
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
+EOF
+
+if compgen -G "${SCRIPT_DIR}/../grafana/dashboards/*.json" > /dev/null; then
+    cp "${SCRIPT_DIR}"/../grafana/dashboards/*.json /var/lib/grafana/dashboards/
+    chown -R grafana:grafana /var/lib/grafana/dashboards 2>/dev/null || true
+    log_info "Свои дашборды скопированы: $(ls -1 "${SCRIPT_DIR}"/../grafana/dashboards/*.json | wc -l) шт."
+else
+    log_warn "Каталог grafana/dashboards пуст — свои дашборды не установлены"
+fi
 
 systemctl enable --now grafana-server
 sleep 4
