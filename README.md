@@ -319,10 +319,24 @@ sudo ./manage_cluster.sh apply                 # ⚠ ПОСЛЕ ЛЮБЫХ ИЗ�
 | «За последние 3 часа в Омске вырос slow query rate» | История 3.5ч |
 | «Какой кластер хуже всего себя чувствует?» | Сводка по всем кластерам |
 | «Есть ли лаг репликации где-нибудь?» | Сводка по всем кластерам |
+| «Какие были алерты вчера?» | История алертов из БД за 30ч |
+| «Покажи инциденты по Кемерово за неделю» | Алерты kemerovo за 170ч + метрики |
+| «Были ли сбои на прошлой неделе?» | Алерты по всем кластерам за период |
 
 Распознавание города работает с падежами: «в Кемерове», «Новосибирска» — найдётся.
 Распознавание времени: «вчера», «позавчера», «за N часов», «N часов назад»,
 «утром», «за сутки», «за неделю».
+
+**История алертов в чате.** Если в вопросе есть слова про алерты, инциденты,
+сбои, аварии или «что случилось», агент дополнительно достаёт записи из
+`alerts.db` и кладёт их в контекст LLM: время, severity, кластер, инстанс,
+краткое описание и — для трёх последних — прошлый разбор от LLM. Работают
+те же фильтры, что и в остальном чате: если назван город, выборка сузится до
+него; если назван период, окно ограничится им (но не шире `ALERTS_RETENTION_DAYS`).
+Без указания периода берутся последние 30 дней, не больше 20 записей.
+
+Блок подмешивается только по ключевым словам — чтобы обычные вопросы про
+текущие метрики не таскали лишнее в промпт.
 
 ### REST API
 
@@ -417,6 +431,43 @@ asyncio.run(main())
 историю за 2ч, отправляет в LLM и сохраняет диагноз — виден во вкладке
 «Алерты» веб-интерфейса и через `/alerts/history`.
 
+### Хранение истории алертов
+
+Алерты вместе с разбором от LLM пишутся в **SQLite** — `/opt/ai-alert-agent/alerts.db`
+(модуль `sqlite3` из стандартной библиотеки, дополнительных pip-пакетов не нужно).
+История переживает рестарт агента; записи старше окна хранения удаляются
+автоматически при следующей записи.
+
+```bash
+ALERTS_RETENTION_DAYS=30      # config.env, спрашивается в ./configure.sh
+```
+
+```bash
+curl -s http://localhost:5001/alerts/history?limit=5 | python3 -m json.tool
+# {
+#   "total": 42,              ← всего за окно хранения
+#   "items": [...],           ← последние limit, новые сверху
+#   "retention_days": 30,
+#   "persistent": true        ← false = БД недоступна, история только в памяти
+# }
+```
+
+Если `persistent: false` — агент не смог открыть БД (обычно права на
+`/opt/ai-alert-agent`) и работает на резервной копии в памяти: последние
+200 записей, теряются при рестарте. Причина пишется в лог:
+```bash
+journalctl -u ai-alert-agent | grep -i "хранилище алертов"
+```
+
+Посмотреть напрямую:
+```bash
+sqlite3 /opt/ai-alert-agent/alerts.db \
+  "SELECT ts, alert, cluster_label, severity FROM alerts ORDER BY ts DESC LIMIT 10;"
+```
+
+Метрики Prometheus хранятся независимо — `PROMETHEUS_RETENTION` (по умолчанию
+`30d`), каталог `/var/lib/prometheus`.
+
 ---
 
 ## Обновление настроек LLM
@@ -499,6 +550,57 @@ location /ai-agent/ws {
 чтобы `agent.py` подставил в страницу `<base href="/ai-agent/">` — от него
 браузер и достраивает все относительные адреса.
 
+### Prometheus и Alertmanager на подпутях
+
+Тот же принцип. В `./configure.sh` (секция «Обратный прокси») укажите подпути и
+внешний адрес сервера — мастер соберёт из них полные URL:
+
+```bash
+PROMETHEUS_ROOT_PATH="/prometheus"
+ALERTMANAGER_ROOT_PATH="/alertmanager"
+EXTERNAL_BASE_URL="https://monitor.company.ru"
+# → PROMETHEUS_EXTERNAL_URL="https://monitor.company.ru/prometheus"
+# → ALERTMANAGER_EXTERNAL_URL="https://monitor.company.ru/alertmanager"
+```
+
+`install_monitoring.sh` добавит в systemd-юниты:
+
+```
+--web.external-url=https://monitor.company.ru/prometheus --web.route-prefix=/
+--web.external-url=https://monitor.company.ru/alertmanager --web.route-prefix=/
+```
+
+`route-prefix=/` оставляет сервисы отвечающими в корне (префикс уже срезал
+nginx), а `external-url` нужен им, чтобы редиректы и **ссылки в алертах**
+(`generatorURL`, ссылки на silence) вели на внешний адрес, а не на `localhost`.
+Поэтому здесь нужен полный URL со схемой и хостом, а не только путь.
+
+```nginx
+location = /prometheus { return 301 /prometheus/; }
+location /prometheus/ {
+    proxy_pass http://127.0.0.1:9090/;      # слэш обязателен
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+
+location = /alertmanager { return 301 /alertmanager/; }
+location /alertmanager/ {
+    proxy_pass http://127.0.0.1:9093/;      # слэш обязателен
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+Применить к уже установленному стеку: `sudo ./scripts/install_monitoring.sh` —
+скрипт перезапишет юниты и сделает `systemctl restart`, иначе изменившийся
+`ExecStart` не подхватится.
+
+Внутренние адреса при этом не меняются и остаются на localhost: Prometheus
+ходит в Alertmanager по `localhost:9093`, Alertmanager шлёт вебхуки агенту на
+`localhost:${AGENT_PORT}/webhook`, Grafana читает Prometheus по `localhost:9090`.
+Правки в nginx на это не влияют. Если снаружи всё ходит только через nginx,
+порты 9090/9093 можно закрыть в firewalld — стек продолжит работать.
+
 Две самые частые ошибки:
 
 | Симптом | Причина |
@@ -578,6 +680,21 @@ Community-дашборды при этом остаются: их можно д�
 
 **Панели пишут «Datasource not found» или `${DS_PROMETHEUS}`** — дашборд
 импортирован без привязки датасорса. Перезалейте: `sudo ./scripts/install_monitoring.sh`.
+
+**`Grafana-Server Init Failed`** — Grafana не стартует, если провижининг-файл
+невалиден, ссылается на несуществующий каталог или в этом каталоге лежит битый
+JSON. Точная причина печатается сразу после `Init Failed:`:
+```bash
+journalctl -u grafana-server -n 40 --no-pager | grep -A3 -i "init failed\|error"
+```
+Быстро поднять, отключив провижининг дашбордов:
+```bash
+sudo mv /etc/grafana/provisioning/dashboards/mysql_monit.yml /tmp/
+sudo systemctl restart grafana-server
+```
+`install_monitoring.sh` создаёт этот файл только после того, как в
+`/var/lib/grafana/dashboards` лёг хотя бы один проверенный дашборд, поэтому
+повторный прогон скрипта такую ситуацию не создаёт.
 
 **WebSocket рвётся за прокси** — увеличьте `proxy_read_timeout` (клиент шлёт
 ping каждые 25с, таймаут должен быть больше).

@@ -116,13 +116,47 @@ GITHUB_BASE_URL="${GITHUB_BASE_URL%/}"
 GRAFANA_COM_URL="${GRAFANA_COM_URL%/}"
 
 echo ""
-echo -e "${CYAN}── 8. Порты и версии (Enter — по умолчанию) ──────────${NC}"
+echo -e "${CYAN}── 8. Обратный прокси (nginx) ────────────────────────${NC}"
+echo -e "  ${YELLOW}Подпути, на которых сервисы видны снаружи. Enter — сервис${NC}"
+echo -e "  ${YELLOW}не проксируется (доступен напрямую по своему порту).${NC}"
+
+# Привести подпуть к виду /path: без хвостового слэша, пусто = не проксируется
+norm_path() { # имя переменной
+    local v="${!1}"
+    v="/${v#/}"; v="${v%/}"
+    [[ "$v" == "/" ]] && v=""
+    eval "$1=\"\$v\""
+}
+
+ask "Подпуть AI-агента (напр. /ai-agent)"      ROOT_PATH              ""
+ask "Подпуть Prometheus (напр. /prometheus)"   PROMETHEUS_ROOT_PATH   ""
+ask "Подпуть Alertmanager (напр. /alertmanager)" ALERTMANAGER_ROOT_PATH ""
+norm_path ROOT_PATH
+norm_path PROMETHEUS_ROOT_PATH
+norm_path ALERTMANAGER_ROOT_PATH
+
+# Агенту достаточно пути, а Prometheus и Alertmanager нужен ПОЛНЫЙ внешний
+# адрес: по нему они строят ссылки в алертах (generatorURL, silence-ссылки).
+if [[ -n "$PROMETHEUS_ROOT_PATH" || -n "$ALERTMANAGER_ROOT_PATH" ]]; then
+    echo ""
+    echo -e "  ${YELLOW}Prometheus/Alertmanager строят по нему ссылки в алертах${NC}"
+    ask "Внешний адрес сервера (https://...)" EXTERNAL_BASE_URL \
+        "https://$(hostname -f 2>/dev/null || echo 'monitor.company.ru')"
+    EXTERNAL_BASE_URL="${EXTERNAL_BASE_URL%/}"
+    PROMETHEUS_EXTERNAL_URL="${EXTERNAL_BASE_URL}${PROMETHEUS_ROOT_PATH}"
+    ALERTMANAGER_EXTERNAL_URL="${EXTERNAL_BASE_URL}${ALERTMANAGER_ROOT_PATH}"
+else
+    EXTERNAL_BASE_URL=""
+    PROMETHEUS_EXTERNAL_URL=""
+    ALERTMANAGER_EXTERNAL_URL=""
+fi
+
+echo ""
+echo -e "${CYAN}── 9. Порты и версии (Enter — по умолчанию) ──────────${NC}"
 ask "Порт AI-агента" AGENT_PORT "5001"
-echo -e "  ${YELLOW}Подпуть за nginx (напр. /ai-agent). Enter — агент в корне сайта${NC}"
-ask "ROOT_PATH агента" ROOT_PATH ""
-ROOT_PATH="/${ROOT_PATH#/}"; ROOT_PATH="${ROOT_PATH%/}"
-[[ "$ROOT_PATH" == "/" ]] && ROOT_PATH=""
 ask "Prometheus retention" PROMETHEUS_RETENTION "30d"
+echo -e "  ${YELLOW}История алертов хранится в SQLite рядом с агентом${NC}"
+ask "Хранить алерты, дней" ALERTS_RETENTION_DAYS "30"
 
 # Версии — фиксированные, но настраиваемые
 PROMETHEUS_VERSION="${PROMETHEUS_VERSION:-2.52.0}"
@@ -183,13 +217,26 @@ GRAFANA_COM_URL="${GRAFANA_COM_URL}"
 # Порты
 AGENT_PORT=${AGENT_PORT}
 
-# Подпуть за обратным прокси. Пусто = агент в корне.
-# Маршруты внутри агента остаются без префикса — его срезает nginx.
+# ── Обратный прокси ──────────────────────────────────────────────────────────
+# Подпути, на которых сервисы видны снаружи. Пусто = сервис не проксируется.
+# Во всех трёх случаях префикс срезает nginx (proxy_pass со слэшем на конце),
+# а сами сервисы продолжают отвечать в корне — эти значения нужны им только
+# чтобы правильно строить собственные ссылки.
 ROOT_PATH="${ROOT_PATH}"
+PROMETHEUS_ROOT_PATH="${PROMETHEUS_ROOT_PATH}"
+ALERTMANAGER_ROOT_PATH="${ALERTMANAGER_ROOT_PATH}"
+
+# Полные внешние адреса (--web.external-url) — считаются из адреса сервера
+EXTERNAL_BASE_URL="${EXTERNAL_BASE_URL}"
+PROMETHEUS_EXTERNAL_URL="${PROMETHEUS_EXTERNAL_URL}"
+ALERTMANAGER_EXTERNAL_URL="${ALERTMANAGER_EXTERNAL_URL}"
 
 # Prometheus
 PROMETHEUS_VERSION="${PROMETHEUS_VERSION}"
 PROMETHEUS_RETENTION="${PROMETHEUS_RETENTION}"
+
+# История алертов агента (SQLite). Записи старше окна удаляются автоматически.
+ALERTS_RETENTION_DAYS=${ALERTS_RETENTION_DAYS}
 
 # Версии экспортёров
 NODE_EXPORTER_VERSION="${NODE_EXPORTER_VERSION}"

@@ -16,7 +16,9 @@ import logging
 import datetime
 import asyncio
 import re
+import sqlite3
 import httpx
+from contextlib import closing
 from pathlib import Path
 from typing import Optional, AsyncGenerator
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
@@ -46,6 +48,10 @@ WEB_DIR         = os.environ.get("WEB_DIR",         "/opt/ai-alert-agent/web")
 ROOT_PATH       = "/" + os.environ.get("ROOT_PATH", "").strip().strip("/")
 ROOT_PATH       = "" if ROOT_PATH == "/" else ROOT_PATH
 
+# История алертов: SQLite рядом с агентом, окно хранения в днях
+ALERTS_DB_PATH        = os.environ.get("ALERTS_DB_PATH", "/opt/ai-alert-agent/alerts.db")
+ALERTS_RETENTION_DAYS = int(os.environ.get("ALERTS_RETENTION_DAYS", "30"))
+
 AUTH_HEADER = LLM_API_KEY if LLM_API_KEY.startswith("Bearer ") else f"Bearer {LLM_API_KEY}"
 
 logging.basicConfig(
@@ -60,8 +66,132 @@ app = FastAPI(title="MySQL AI Agent v3", version="3.0.0", root_path=ROOT_PATH)
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
 
-alert_history: list[dict] = []
+alert_history: list[dict] = []   # запасная копия в памяти, если БД недоступна
 ws_sessions:   dict[str, list[dict]] = {}   # session_id -> messages
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ХРАНИЛИЩЕ АЛЕРТОВ
+#  SQLite из стандартной библиотеки — переживает рестарт агента, новых
+#  pip-зависимостей не требует. Записи старше ALERTS_RETENTION_DAYS удаляются.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def alerts_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(ALERTS_DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def alerts_cutoff() -> str:
+    """Нижняя граница окна хранения, ISO-8601 UTC (формат совпадает с ts)."""
+    return (datetime.datetime.utcnow()
+            - datetime.timedelta(days=ALERTS_RETENTION_DAYS)).isoformat()
+
+
+def alerts_init() -> bool:
+    try:
+        Path(ALERTS_DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+        with closing(alerts_db()) as conn, conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS alerts (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts            TEXT NOT NULL,
+                    alert         TEXT,
+                    cluster       TEXT,
+                    cluster_label TEXT,
+                    instance      TEXT,
+                    severity      TEXT,
+                    summary       TEXT,
+                    analysis      TEXT
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(ts)")
+            conn.execute("DELETE FROM alerts WHERE ts < ?", (alerts_cutoff(),))
+        logger.info(f"История алертов: {ALERTS_DB_PATH}, хранение {ALERTS_RETENTION_DAYS} дн.")
+        return True
+    except Exception as e:
+        logger.error(f"Хранилище алертов недоступно ({ALERTS_DB_PATH}): {e}. "
+                     f"История будет только в памяти и потеряется при рестарте.")
+        return False
+
+
+ALERTS_DB_OK = alerts_init()
+
+
+def alerts_save(rec: dict) -> None:
+    """Записать алерт в БД. Копия в памяти — страховка на случай сбоя БД."""
+    alert_history.insert(0, rec)
+    if len(alert_history) > 200:
+        alert_history.pop()
+
+    if not ALERTS_DB_OK:
+        return
+    try:
+        with closing(alerts_db()) as conn, conn:
+            conn.execute(
+                "INSERT INTO alerts (ts, alert, cluster, cluster_label,"
+                " instance, severity, summary, analysis)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (rec["timestamp"], rec["alert"], rec["cluster"],
+                 rec["cluster_label"], rec["instance"], rec["severity"],
+                 rec["summary"], rec["analysis"]))
+            conn.execute("DELETE FROM alerts WHERE ts < ?", (alerts_cutoff(),))
+    except Exception as e:
+        logger.error(f"Не удалось сохранить алерт в {ALERTS_DB_PATH}: {e}")
+
+
+def alerts_query(cluster: Optional[str] = None,
+                 hours: Optional[float] = None,
+                 limit: int = 20) -> list[dict]:
+    """Выборка алертов для чата: по кластеру и/или окну времени."""
+    if not ALERTS_DB_OK:
+        rows = [r for r in alert_history
+                if not cluster or r.get("cluster") == cluster]
+        return rows[:limit]
+    try:
+        since = alerts_cutoff()
+        if hours and hours > 0:
+            asked = (datetime.datetime.utcnow()
+                     - datetime.timedelta(hours=hours)).isoformat()
+            # обе метки в одном ISO-формате, поэтому сравнение строк корректно:
+            # не выходим за пределы окна хранения, даже если спросили больше
+            since = max(since, asked)
+
+        sql    = ("SELECT ts AS timestamp, alert, cluster, cluster_label,"
+                  "       instance, severity, summary, analysis"
+                  "  FROM alerts WHERE ts >= ?")
+        params: list = [since]
+        if cluster:
+            sql += " AND cluster = ?"
+            params.append(cluster)
+        sql += " ORDER BY ts DESC LIMIT ?"
+        params.append(limit)
+
+        with closing(alerts_db()) as conn:
+            return [dict(r) for r in conn.execute(sql, params).fetchall()]
+    except Exception as e:
+        logger.error(f"Не удалось выбрать алерты для чата: {e}")
+        return []
+
+
+def alerts_load(limit: int) -> tuple[int, list[dict]]:
+    """Отдать историю за окно хранения: (всего за период, последние limit)."""
+    if not ALERTS_DB_OK:
+        return len(alert_history), alert_history[:limit]
+    try:
+        cutoff = alerts_cutoff()
+        with closing(alerts_db()) as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM alerts WHERE ts >= ?", (cutoff,)).fetchone()[0]
+            rows = conn.execute(
+                "SELECT ts AS timestamp, alert, cluster, cluster_label, instance,"
+                "       severity, summary, analysis"
+                "  FROM alerts WHERE ts >= ? ORDER BY ts DESC LIMIT ?",
+                (cutoff, limit)).fetchall()
+        return total, [dict(r) for r in rows]
+    except Exception as e:
+        logger.error(f"Не удалось прочитать историю алертов: {e}")
+        return len(alert_history), alert_history[:limit]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -140,6 +270,20 @@ TIME_KEYWORDS = {
     "за день": 26, "за неделю": 170, "неделю": 170,
     "час назад": 2, "часа назад": 4, "часов назад": 8,
 }
+
+
+# Вопросы, при которых в контекст подмешивается история алертов из БД.
+# Держим список узким: лишний блок только раздувает промпт.
+ALERT_KEYWORDS = (
+    "алерт", "alert", "инцидент", "авари", "срабатыв", "сработа",
+    "тревог", "происшеств", "что случилось", "сбой", "сбои", "сбоя",
+    "были проблем", "была проблем", "проблемы были", "падал", "падени",
+)
+
+
+def detect_alert_intent(text: str) -> bool:
+    t = text.lower()
+    return any(kw in t for kw in ALERT_KEYWORDS)
 
 
 def detect_time_hours(text: str) -> float:
@@ -299,7 +443,40 @@ def system_prompt() -> str:
 2. Структурируй ответ, давай конкретные команды MySQL/Linux.
 3. Если есть исторические данные — ссылайся на конкретные значения и время пиков.
 4. Если данных недостаточно — честно об этом говори.
-5. Интерпретируй числа, а не пересказывай их."""
+5. Интерпретируй числа, а не пересказывай их.
+6. Если приложен блок «Алерты за …» — это реальная история срабатываний
+   за {ALERTS_RETENTION_DAYS} дн. Опирайся на неё: называй даты и время,
+   ищи повторяющиеся и связанные инциденты. Блок с фразой «Ни одного алерта
+   за этот период не было» означает именно это — не придумывай инциденты."""
+
+
+def fmt_alerts(rows: list[dict], period: str, label: Optional[str] = None) -> str:
+    scope = f" по кластеру {label}" if label else ""
+    if not rows:
+        return (f"## Алерты{scope} за {period}\n\n"
+                f"  Ни одного алерта за этот период не было.")
+
+    counts: dict[str, int] = {}
+    for r in rows:
+        counts[r["alert"]] = counts.get(r["alert"], 0) + 1
+
+    lines = [f"## Алерты{scope} за {period} — записей: {len(rows)}", "",
+             "Сводка: " + ", ".join(f"{k}: {v}" for k, v in
+                                    sorted(counts.items(), key=lambda kv: -kv[1])),
+             ""]
+    for i, r in enumerate(rows):
+        ts = (r.get("timestamp") or "")[:19].replace("T", " ")
+        lines.append(f"  [{ts} UTC] {(r.get('severity') or '?'):8} "
+                     f"{r.get('alert')} — {r.get('cluster_label') or '—'} / "
+                     f"{r.get('instance') or '—'}")
+        if r.get("summary"):
+            lines.append(f"      {r['summary']}")
+        # Разбор от LLM только для трёх последних: он длинный, а промпт не резиновый
+        if i < 3 and r.get("analysis"):
+            a = " ".join(r["analysis"].split())
+            lines.append(f"      прошлый разбор: {a[:400]}"
+                         f"{'…' if len(a) > 400 else ''}")
+    return "\n".join(lines)
 
 
 def fmt_current(m: dict) -> str:
@@ -352,6 +529,16 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
                 f"conn={p.get('connections_pct','?')}%  "
                 f"CPU={p.get('cpu_pct','?')}%  лаг={lag}s")
         blocks.append("\n".join(lines))
+
+    # Спросили про алерты/инциденты — подмешиваем историю из БД
+    if detect_alert_intent(user_message):
+        period = (f"последние {hours:g} ч."
+                  if hours > 0 else f"последние {ALERTS_RETENTION_DAYS} дн.")
+        rows = alerts_query(cluster=cluster["name"] if cluster else None,
+                            hours=hours if hours > 0 else None,
+                            limit=20)
+        blocks.append(fmt_alerts(rows, period,
+                                 cluster["label"] if cluster else None))
 
     return "\n\n".join(blocks), cluster, hours
 
@@ -566,7 +753,7 @@ async def webhook(request: Request):
             {"role": "user",   "content": prompt},
         ])
 
-        alert_history.insert(0, {
+        alerts_save({
             "timestamp":     datetime.datetime.utcnow().isoformat(),
             "alert":         name,
             "cluster":       cluster["name"] if cluster else None,
@@ -576,8 +763,6 @@ async def webhook(request: Request):
             "summary":       summary,
             "analysis":      analysis,
         })
-        if len(alert_history) > 200:
-            alert_history.pop()
         processed += 1
 
     return {"processed": processed}
@@ -659,7 +844,10 @@ async def api_all_status():
 
 @app.get("/alerts/history")
 def api_alerts(limit: int = 30):
-    return {"total": len(alert_history), "items": alert_history[:limit]}
+    total, items = alerts_load(limit)
+    return {"total": total, "items": items,
+            "retention_days": ALERTS_RETENTION_DAYS,
+            "persistent": ALERTS_DB_OK}
 
 
 @app.get("/health")

@@ -24,6 +24,22 @@ GRAFANA_COM_URL="${GRAFANA_COM_URL:-https://grafana.com}"; GRAFANA_COM_URL="${GR
 [[ "$GITHUB_BASE_URL" != "https://github.com" ]] && log_info "Зеркало GitHub: ${GITHUB_BASE_URL}"
 [[ "$GRAFANA_COM_URL" != "https://grafana.com" ]] && log_info "Зеркало grafana.com: ${GRAFANA_COM_URL}"
 
+# ── Работа за обратным прокси ────────────────────────────────────────────────
+# nginx срезает префикс (proxy_pass со слэшем на конце), поэтому route-prefix
+# оставляем корневым: сервисы продолжают отвечать в корне. external-url нужен
+# им, чтобы редиректы и ссылки в алертах указывали на внешний адрес.
+PROM_WEB_FLAGS=""
+if [[ -n "${PROMETHEUS_EXTERNAL_URL:-}" ]]; then
+    PROM_WEB_FLAGS="--web.external-url=${PROMETHEUS_EXTERNAL_URL} --web.route-prefix=/"
+    log_info "Prometheus снаружи: ${PROMETHEUS_EXTERNAL_URL}"
+fi
+
+AM_WEB_FLAGS=""
+if [[ -n "${ALERTMANAGER_EXTERNAL_URL:-}" ]]; then
+    AM_WEB_FLAGS="--web.external-url=${ALERTMANAGER_EXTERNAL_URL} --web.route-prefix=/"
+    log_info "Alertmanager снаружи: ${ALERTMANAGER_EXTERNAL_URL}"
+fi
+
 # =============================================================================
 log_section "1/4 Firewall"
 # =============================================================================
@@ -229,7 +245,7 @@ ExecStart=/usr/local/bin/prometheus \\
   --storage.tsdb.path=/var/lib/prometheus \\
   --storage.tsdb.retention.time=${PROMETHEUS_RETENTION} \\
   --web.listen-address=:9090 \\
-  --web.enable-lifecycle
+  --web.enable-lifecycle ${PROM_WEB_FLAGS}
 Restart=always
 RestartSec=5s
 [Install]
@@ -237,7 +253,8 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now prometheus
+systemctl enable --now prometheus 2>/dev/null || true
+systemctl restart prometheus      # подхватить изменившийся ExecStart
 sleep 3
 curl -sf http://localhost:9090/-/healthy >/dev/null && log_info "Prometheus ✓" || log_error "Prometheus не отвечает"
 
@@ -322,17 +339,18 @@ fi
 
 chown -R alertmanager:alertmanager /etc/alertmanager /var/lib/alertmanager
 
-cat > /etc/systemd/system/alertmanager.service << 'EOF'
+# heredoc без кавычек — нужен для ${AM_WEB_FLAGS}; поэтому \\ вместо \
+cat > /etc/systemd/system/alertmanager.service << EOF
 [Unit]
 Description=Alertmanager
 After=network.target
 [Service]
 User=alertmanager
 Group=alertmanager
-ExecStart=/usr/local/bin/alertmanager \
-  --config.file=/etc/alertmanager/alertmanager.yml \
-  --storage.path=/var/lib/alertmanager \
-  --web.listen-address=:9093
+ExecStart=/usr/local/bin/alertmanager \\
+  --config.file=/etc/alertmanager/alertmanager.yml \\
+  --storage.path=/var/lib/alertmanager \\
+  --web.listen-address=:9093 ${AM_WEB_FLAGS}
 Restart=always
 RestartSec=5s
 [Install]
@@ -340,7 +358,8 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now alertmanager
+systemctl enable --now alertmanager 2>/dev/null || true
+systemctl restart alertmanager      # подхватить изменившийся ExecStart
 sleep 2
 curl -sf http://localhost:9093/-/healthy >/dev/null && log_info "Alertmanager ✓" || log_error "Alertmanager не отвечает"
 
@@ -380,8 +399,36 @@ EOF
 # ── Свои дашборды (провижининг из файлов) ─────────────────────────────────────
 # Community-дашборды ниже фильтруют по job="node"/"mysql", а этот проект
 # генерирует job вида node_<кластер>, поэтому нужен дашборд под свои метки.
-mkdir -p /etc/grafana/provisioning/dashboards /var/lib/grafana/dashboards
-cat > /etc/grafana/provisioning/dashboards/mysql_monit.yml << 'EOF'
+#
+# Важно: Grafana НЕ СТАРТУЕТ, если провижининг ссылается на несуществующий
+# каталог или там лежит битый JSON. Поэтому провайдер создаётся только после
+# того, как в каталог реально лёг хотя бы один проверенный дашборд.
+DASH_SRC="${SCRIPT_DIR}/../grafana/dashboards"
+DASH_DST="/var/lib/grafana/dashboards"
+DASH_PROVIDER="/etc/grafana/provisioning/dashboards/mysql_monit.yml"
+
+mkdir -p /etc/grafana/provisioning/dashboards "$DASH_DST"
+
+DASH_OK=0
+if compgen -G "${DASH_SRC}/*.json" > /dev/null; then
+    for f in "${DASH_SRC}"/*.json; do
+        if python3 -c "
+import json, sys
+d = json.load(open(sys.argv[1], encoding='utf-8'))
+sys.exit(0 if d.get('title') and isinstance(d.get('panels'), list) else 1)
+" "$f" 2>/dev/null; then
+            cp "$f" "${DASH_DST}/"
+            DASH_OK=$((DASH_OK + 1))
+        else
+            log_warn "Дашборд $(basename "$f") невалиден — пропущен"
+        fi
+    done
+fi
+
+if [[ $DASH_OK -gt 0 ]]; then
+    chown -R grafana:grafana "$DASH_DST" 2>/dev/null || true
+    chmod 755 "$DASH_DST"
+    cat > "$DASH_PROVIDER" << 'EOF'
 apiVersion: 1
 providers:
   - name: mysql-ai-monitoring
@@ -395,19 +442,29 @@ providers:
       path: /var/lib/grafana/dashboards
       foldersFromFilesStructure: false
 EOF
-
-if compgen -G "${SCRIPT_DIR}/../grafana/dashboards/*.json" > /dev/null; then
-    cp "${SCRIPT_DIR}"/../grafana/dashboards/*.json /var/lib/grafana/dashboards/
-    chown -R grafana:grafana /var/lib/grafana/dashboards 2>/dev/null || true
-    log_info "Свои дашборды скопированы: $(ls -1 "${SCRIPT_DIR}"/../grafana/dashboards/*.json | wc -l) шт."
+    log_info "Свои дашборды: ${DASH_OK} шт. → папка «MySQL AI Monitoring»"
 else
-    log_warn "Каталог grafana/dashboards пуст — свои дашборды не установлены"
+    # Провайдер, указывающий в пустоту, роняет старт Grafana — убираем
+    rm -f "$DASH_PROVIDER"
+    log_warn "Валидных дашбордов не найдено — провижининг не настраивается"
 fi
 
-systemctl enable --now grafana-server
+systemctl enable --now grafana-server 2>/dev/null || true
+systemctl restart grafana-server 2>/dev/null || true
 sleep 4
+
+if ! systemctl is-active --quiet grafana-server; then
+    log_error "Grafana не запустилась. Причина из журнала:"
+    journalctl -u grafana-server -n 20 --no-pager \
+        | grep -iE "init failed|provisioning|error|level=eror" | tail -8 || true
+    echo ""
+    log_warn "Чаще всего это провижининг. Снять его и поднять Grafana:"
+    echo "    mv ${DASH_PROVIDER} /tmp/ && systemctl restart grafana-server"
+    exit 1
+fi
+
 grafana-cli admin reset-admin-password "${GRAFANA_ADMIN_PASSWORD}" 2>/dev/null || true
-curl -sf http://localhost:3000/api/health >/dev/null && log_info "Grafana ✓" || log_error "Grafana не отвечает"
+curl -sf http://localhost:3000/api/health >/dev/null && log_info "Grafana ✓" || log_error "Grafana не отвечает на :3000"
 
 # ── Импорт дашбордов ──────────────────────────────────────────────────────────
 # JSON скачивается с ${GRAFANA_COM_URL} и отправляется в Grafana целиком.
