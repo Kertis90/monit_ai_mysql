@@ -469,3 +469,9 @@ textarea#input:disabled { opacity: .55; }
 .cg-line         { fill: none; stroke: var(--accent, #4c8dff); stroke-width: 2;
                    vector-effect: non-scaling-stroke; }
 .cg-area         { fill: var(--accent, #4c8dff); opacity: .12; stroke: none; }
+
+/* Источник алерта: Prometheus / Zabbix / API */
+.src-badge { font-size: 10px; padding: 1px 7px; border-radius: 9px;
+             border: 1px solid var(--border, #2b313c);
+             color: var(--muted, #8b95a5); text-transform: uppercase;
+             letter-spacing: .3px; }

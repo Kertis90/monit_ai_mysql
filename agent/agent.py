@@ -110,6 +110,12 @@ SSO_TRUSTED_PROXIES   = [p.strip() for p in
                          if p.strip()]
 SSO_LOGOUT_URL        = os.environ.get("SSO_LOGOUT_URL", "")
 
+# ── Приём алертов из внешних систем (Zabbix и т.п.) ──────────────────────────
+# Внешняя система не умеет логиниться cookie, поэтому отдельный токен.
+# Несколько токенов через запятую — чтобы отозвать один, не трогая остальные.
+INGEST_TOKENS = [t.strip() for t in
+                 os.environ.get("INGEST_TOKENS", "").split(",") if t.strip()]
+
 # ── OIDC / OAuth2 (встроенный) ───────────────────────────────────────────────
 OIDC_ENABLED        = os.environ.get("OIDC_ENABLED", "false").lower() == "true"
 OIDC_ISSUER         = os.environ.get("OIDC_ISSUER", "")
@@ -352,6 +358,14 @@ def alerts_init() -> bool:
                 )
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(ts)")
+            # Миграция: в БД прошлых версий колонки source нет.
+            # Всё, что записано до неё, пришло из Alertmanager.
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(alerts)")}
+            if "source" not in cols:
+                conn.execute("ALTER TABLE alerts ADD COLUMN source TEXT")
+                conn.execute("UPDATE alerts SET source = 'prometheus'"
+                             " WHERE source IS NULL")
+                logger.info("В таблицу alerts добавлена колонка source")
             conn.execute("DELETE FROM alerts WHERE ts < ?", (alerts_cutoff(),))
         logger.info(f"История алертов: {ALERTS_DB_PATH}, хранение {ALERTS_RETENTION_DAYS} дн.")
         return True
@@ -376,11 +390,12 @@ def alerts_save(rec: dict) -> None:
         with closing(agent_db()) as conn, conn:
             conn.execute(
                 "INSERT INTO alerts (ts, alert, cluster, cluster_label,"
-                " instance, severity, summary, analysis)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                " instance, severity, summary, analysis, source)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (rec["timestamp"], rec["alert"], rec["cluster"],
                  rec["cluster_label"], rec["instance"], rec["severity"],
-                 rec["summary"], rec["analysis"]))
+                 rec["summary"], rec["analysis"],
+                 rec.get("source", "prometheus")))
             conn.execute("DELETE FROM alerts WHERE ts < ?", (alerts_cutoff(),))
     except Exception as e:
         logger.error(f"Не удалось сохранить алерт в {ALERTS_DB_PATH}: {e}")
@@ -404,7 +419,8 @@ def alerts_query(cluster: Optional[str] = None,
             since = max(since, asked)
 
         sql    = ("SELECT ts AS timestamp, alert, cluster, cluster_label,"
-                  "       instance, severity, summary, analysis"
+                  "       instance, severity, summary, analysis,"
+                  "       COALESCE(source, 'prometheus') AS source"
                   "  FROM alerts WHERE ts >= ?")
         params: list = [since]
         if cluster:
@@ -431,7 +447,8 @@ def alerts_load(limit: int) -> tuple[int, list[dict]]:
                 "SELECT COUNT(*) FROM alerts WHERE ts >= ?", (cutoff,)).fetchone()[0]
             rows = conn.execute(
                 "SELECT id, ts AS timestamp, alert, cluster, cluster_label,"
-                "       instance, severity, summary, analysis"
+                "       instance, severity, summary, analysis,"
+                "       COALESCE(source, 'prometheus') AS source"
                 "  FROM alerts WHERE ts >= ? ORDER BY ts DESC LIMIT ?",
                 (cutoff, limit)).fetchall()
         return total, [dict(r) for r in rows]
@@ -926,43 +943,71 @@ def clusters_index_text() -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 TIME_KEYWORDS = {
-    "вчера": 30, "позавчера": 54,
+    "позавчера": 54, "вчера": 30,
     "прошлый день": 30, "прошлой ночью": 16,
     "утром": 14, "ночью": 12, "вечером": 12, "днём": 12, "днем": 12,
-    "последние сутки": 26, "за сутки": 26, "сутки": 26,
-    "за день": 26, "за неделю": 170, "неделю": 170,
+    "сегодня": 24, "за сегодня": 24,
+    "последние сутки": 26, "за сутки": 26, "сутки": 26, "за день": 26,
+    "на прошлой неделе": 170, "прошлой неделе": 170,
+    "за неделю": 170, "неделю": 170, "недели": 170,
+    "за две недели": 340, "за месяц": 730, "месяц": 730,
     "час назад": 2, "часа назад": 4, "часов назад": 8,
 }
 
-
-# Вопросы, при которых в контекст подмешивается история алертов из БД.
-# Держим список узким: лишний блок только раздувает промпт.
-ALERT_KEYWORDS = (
-    "алерт", "alert", "инцидент", "авари", "срабатыв", "сработа",
-    "тревог", "происшеств", "что случилось", "сбой", "сбои", "сбоя",
-    "были проблем", "была проблем", "проблемы были", "падал", "падени",
+# Вопросы про историю без явного периода: «покажи динамику», «был ли рост».
+# Для них берём окно по умолчанию, иначе агент отвечает, что данных нет,
+# хотя Prometheus их хранит.
+HISTORY_KEYWORDS = (
+    "истори", "динамик", "тренд", "за период", "график", "графики",
+    "как менялось", "как менялась", "как изменил", "рост", "росла", "рос ли",
+    "падал", "падени", "снижал", "было раньше", "в прошлом",
+    "статистик", "средн", "пик", "максимум за", "минимум за",
 )
+DEFAULT_HISTORY_HOURS = 24.0
 
 
-def detect_alert_intent(text: str) -> bool:
+def detect_history_intent(text: str) -> bool:
     t = text.lower()
-    return any(kw in t for kw in ALERT_KEYWORDS)
+    return any(kw in t for kw in HISTORY_KEYWORDS)
 
 
 def detect_time_hours(text: str) -> float:
+    """Окно в часах из фразы. 0 — период не назван."""
     t = text.lower()
-    m = re.search(r'за\s+послед[ниеюю]+\s+(\d+)\s+час', t)
+
+    # минуты — для коротких окон вида «за последние 30 минут»
+    m = re.search(r'за\s+(?:послед[а-яё]+\s+)?(\d+)\s+минут', t)
     if m:
-        return float(m.group(1)) + 0.5
-    m = re.search(r'за\s+(\d+)\s+час', t)
+        return max(float(m.group(1)) / 60 + 0.25, 0.5)
+
+    m = re.search(r'за\s+(?:послед[а-яё]+\s+)?(\d+)\s+час', t)
     if m:
         return float(m.group(1)) + 0.5
     m = re.search(r'(\d+)\s+час[а-яё]*\s+назад', t)
     if m:
         return float(m.group(1)) + 1
+
+    # дни и недели: «за 3 дня», «за последние 2 недели», «5 дней назад»
+    m = re.search(r'за\s+(?:послед[а-яё]+\s+)?(\d+)\s+(?:дн|сут)', t)
+    if m:
+        return float(m.group(1)) * 24 + 2
+    m = re.search(r'(\d+)\s+(?:дн|сут)[а-яё]*\s+назад', t)
+    if m:
+        return float(m.group(1)) * 24 + 12
+    m = re.search(r'за\s+(?:послед[а-яё]+\s+)?(\d+)\s+недел', t)
+    if m:
+        return float(m.group(1)) * 168 + 2
+    m = re.search(r'за\s+(?:послед[а-яё]+\s+)?(\d+)\s+месяц', t)
+    if m:
+        return float(m.group(1)) * 730
+
     for kw, hours in TIME_KEYWORDS.items():
         if kw in t:
             return float(hours)
+
+    # Период не назван, но спрашивают про историю — берём окно по умолчанию
+    if detect_history_intent(t):
+        return DEFAULT_HISTORY_HOURS
     return 0.0
 
 
@@ -1338,6 +1383,16 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
                 f"CPU={p.get('cpu_pct','?')}%  лаг={lag}s")
         blocks.append("\n".join(lines))
 
+        # Спросили про историю, но город не назвали — раньше в контекст
+        # уходил только текущий статус, и агент отвечал, что данных нет.
+        # Собираем историю по всем кластерам (их обычно единицы).
+        if hours > 0 and clusters:
+            hists = await asyncio.gather(
+                *[collect_history(c, hours) for c in clusters])
+            for c, h in zip(clusters, hists):
+                if h:
+                    blocks.append(fmt_history(h, c["label"]))
+
     # Спросили про алерты/инциденты — подмешиваем историю из БД
     if detect_alert_intent(user_message):
         period = (f"последние {hours:g} ч."
@@ -1501,7 +1556,9 @@ def oidc_redirect_uri(request: Request) -> str:
 PUBLIC_PATHS = {"/login", "/api/login", "/api/logout", "/health",
                 # без этих двух OIDC уйдёт в бесконечный редирект:
                 # чтобы войти, до них надо дойти без сессии
-                "/auth/oidc/login", "/auth/oidc/callback"}
+                "/auth/oidc/login", "/auth/oidc/callback",
+                # защищён своим токеном, cookie у Zabbix нет
+                "/api/alerts/ingest"}
 
 
 def _is_public(path: str) -> bool:
@@ -2051,6 +2108,120 @@ def api_chat_history_clear(client_id: str = ""):
     ws_sessions.pop(client_id, None)
     return {"client_id": client_id, "removed": removed}
 
+
+
+# ── Приём алертов из внешних систем ──────────────────────────────────────────
+
+class IngestAlert(BaseModel):
+    alert:       str                      # имя/тип события
+    summary:     str = ""                 # краткое описание
+    severity:    str = "warning"          # critical | warning | info
+    cluster:     str = ""                 # имя из clusters.json, если применимо
+    instance:    str = ""                 # хост:порт или просто хост
+    description: str = ""                 # подробности от внешней системы
+    source:      str = "api"              # zabbix, nagios, custom…
+
+
+def check_ingest_token(request: Request) -> bool:
+    """Токен из Authorization: Bearer или X-API-Key."""
+    if not INGEST_TOKENS:
+        return False
+    supplied = (request.headers.get("x-api-key") or "").strip()
+    if not supplied:
+        auth = (request.headers.get("authorization") or "").strip()
+        if auth.lower().startswith("bearer "):
+            supplied = auth[7:].strip()
+    if not supplied:
+        return False
+    # постоянное время сравнения — токен не подобрать по таймингу
+    return any(hmac.compare_digest(supplied, t) for t in INGEST_TOKENS)
+
+
+@app.post("/api/alerts/ingest")
+async def api_alert_ingest(payload: IngestAlert, request: Request):
+    """Зарегистрировать алерт из внешней системы и разобрать его через LLM.
+
+    Пример для Zabbix (действие → webhook):
+      curl -X POST https://host/ai-agent/api/alerts/ingest \
+           -H 'X-API-Key: <token>' -H 'Content-Type: application/json' \
+           -d '{"alert":"Free disk space is low","severity":"critical",
+                "cluster":"kemerovo","instance":"10.1.0.1",
+                "summary":"/var 8% free","source":"zabbix"}'
+    """
+    if not INGEST_TOKENS:
+        raise HTTPException(status_code=503,
+                            detail="Приём алертов выключен: не задан INGEST_TOKENS")
+    if not check_ingest_token(request):
+        peer = request.client.host if request.client else "?"
+        logger.warning(f"Приём алерта отклонён: неверный токен (с {peer})")
+        raise HTTPException(status_code=401, detail="Неверный токен")
+
+    name     = payload.alert.strip() or "ExternalAlert"
+    severity = payload.severity.strip().lower() or "warning"
+    if severity not in ("critical", "warning", "info"):
+        severity = "warning"
+
+    cluster       = find_cluster(payload.cluster) if payload.cluster else None
+    cluster_label = cluster["label"] if cluster else (payload.cluster or "—")
+    summary       = payload.summary.strip() or name
+
+    # Тот же разбор, что и для алертов Alertmanager: если кластер известен,
+    # подкладываем его метрики и историю, иначе разбираем по тексту события.
+    blocks = [f"## Событие из внешней системы ({payload.source})",
+              f"  Имя:        {name}",
+              f"  Важность:   {severity}",
+              f"  Объект:     {payload.instance or '—'}",
+              f"  Кластер:    {cluster_label}",
+              f"  Описание:   {summary}"]
+    if payload.description.strip():
+        blocks.append(f"  Подробности: {payload.description.strip()}")
+
+    if cluster:
+        try:
+            current = await collect_current(cluster)
+            blocks.append(fmt_current(current))
+            hist = await collect_history(cluster, 2)
+            blocks.append(fmt_history(hist, cluster["label"]))
+        except Exception as e:
+            logger.error(f"Не удалось собрать метрики для внешнего алерта: {e}")
+    else:
+        blocks.append("  (кластер не сопоставлен — метрик из Prometheus нет, "
+                      "разбирай по описанию события)")
+
+    prompt = "\n".join(blocks) + """
+
+## Задача
+1. Причина срабатывания (1-2 предложения).
+2. Реальное влияние прямо сейчас.
+3. 2-4 вероятных источника.
+4. Немедленные команды для диагностики.
+5. Шаги устранения.
+6. Нужен ли срочный вызов DBA — да/нет."""
+
+    try:
+        analysis = await llm_complete([
+            {"role": "system", "content": system_prompt()},
+            {"role": "user",   "content": prompt},
+        ])
+    except Exception as e:
+        logger.error(f"LLM не разобрала внешний алерт: {e}")
+        analysis = f"Разбор не выполнен: LLM недоступна ({e})"
+
+    alerts_save({
+        "timestamp":     datetime.datetime.utcnow().isoformat(),
+        "alert":         name,
+        "cluster":       cluster["name"] if cluster else None,
+        "cluster_label": cluster_label,
+        "instance":      payload.instance or "—",
+        "severity":      severity,
+        "summary":       summary,
+        "analysis":      analysis,
+        "source":        payload.source.strip().lower() or "api",
+    })
+    logger.info(f"Принят алерт из {payload.source}: {name} ({severity})")
+    return {"ok": True, "alert": name, "severity": severity,
+            "cluster": cluster["name"] if cluster else None,
+            "source": payload.source, "analyzed": not analysis.startswith("Разбор не выполнен")}
 
 @app.delete("/api/alerts/{alert_id}")
 def api_alert_delete(alert_id: int, request: Request):

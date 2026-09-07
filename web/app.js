@@ -346,13 +346,14 @@ const App = (() => {
       const p    = d.primary || {};
       const up   = p.mysql_up === '1.0' || p.mysql_up === '1';
       const qps  = num(p.qps);
-      const lag  = d.replica ? num(d.replica.replication_lag_s) : null;
+      // отставание СВЕРХ плановой задержки; поле переименовано в агенте
+      const lag  = d.replica ? num(d.replica.replication_lag_over_plan_s) : null;
 
       let html = `<span class="mini-badge ${up ? 'ok' : 'crit'}">${up ? '●&nbsp;UP' : '✕&nbsp;DOWN'}</span>`;
-      html += `<span class="mini-badge">${qps.toFixed(0)} qps</span>`;
-      if (lag !== null) {
+      if (!isNaN(qps)) html += `<span class="mini-badge">${qps.toFixed(0)} qps</span>`;
+      if (lag !== null && !isNaN(lag)) {
         const cls = lag > 60 ? 'crit' : lag > 10 ? 'warn' : 'ok';
-        html += `<span class="mini-badge ${cls}">лаг ${lag.toFixed(0)}s</span>`;
+        html += `<span class="mini-badge ${cls}" title="Отставание сверх плановой задержки">лаг ${lag.toFixed(0)}s</span>`;
       }
       el.innerHTML = html;
     } catch { /* тихо */ }
@@ -441,15 +442,19 @@ const App = (() => {
     let replHtml = '';
     if (s.replica) {
       const rp    = s.replica;
-      const lag   = num(rp.replication_lag_s);
+      const lag   = num(rp.replication_lag_over_plan_s);
+      const plan  = num(rp.replication_planned_delay_s);
       const ioUp  = rp.replication_io_up  === '1.0' || rp.replication_io_up  === '1';
       const sqlUp = rp.replication_sql_up === '1.0' || rp.replication_sql_up === '1';
       const lagCls = lag > 60 ? 'crit' : lag > 10 ? 'warn' : 'good';
       replHtml = `
         <div class="metric"><div class="lbl">Repl IO/SQL</div>
           <div class="val ${ioUp && sqlUp ? 'good' : 'crit'}">${ioUp?'✓':'✗'}/${sqlUp?'✓':'✗'}</div></div>
-        <div class="metric"><div class="lbl">Лаг репл.</div>
-          <div class="val ${lagCls}">${isNaN(lag)?'—':lag.toFixed(0)+'s'}</div></div>`;
+        <div class="metric"><div class="lbl">Лаг сверх плана</div>
+          <div class="val ${lagCls}">${isNaN(lag)?'—':lag.toFixed(0)+'s'}</div></div>
+        ${!isNaN(plan) && plan > 0 ? `
+        <div class="metric"><div class="lbl">Плановая задержка</div>
+          <div class="val">${(plan/3600).toFixed(1)} ч</div></div>` : ''}`;
     }
 
     return `
@@ -496,6 +501,7 @@ const App = (() => {
           <div class="ahead">
             <span class="aname">${esc(it.alert)}</span>
             <span class="mini-badge ${it.severity === 'critical' ? 'crit' : 'warn'}">${esc(it.severity)}</span>
+            <span class="src-badge" title="Источник алерта">${esc(srcLabel(it.source))}</span>
           </div>
           <div class="ameta">${esc(it.cluster_label || it.instance)} · ${esc((it.timestamp||'').replace('T',' ').slice(0,19))} UTC</div>
           <div class="asummary">${esc(it.summary)}</div>
@@ -536,6 +542,14 @@ const App = (() => {
     } catch (e) {
       alert('Не удалось удалить: ' + e);
     }
+  }
+
+  // Источник алерта: prometheus — свой стек, остальное пришло по API
+  const SRC_NAMES = { prometheus: 'Prometheus', api: 'API', zabbix: 'Zabbix',
+                      nagios: 'Nagios', custom: 'Custom' };
+  function srcLabel(src) {
+    const s = (src || 'prometheus').toLowerCase();
+    return SRC_NAMES[s] || s;
   }
 
   function toggleAnalysis(i, btn) {

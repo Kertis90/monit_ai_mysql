@@ -166,6 +166,16 @@ echo -e "  ${YELLOW}История алертов хранится в SQLite р�
 ask "Хранить алерты, дней" ALERTS_RETENTION_DAYS "30"
 ask "Хранить историю чатов, дней" CHATS_RETENTION_DAYS "30"
 
+echo -e "  ${YELLOW}Токен для приёма алертов из внешних систем (Zabbix и т.п.)${NC}"
+echo -e "  ${YELLOW}Enter — сгенерировать новый, минус (-) — выключить приём${NC}"
+ask "Токен приёма алертов" INGEST_TOKENS ""
+if [[ "${INGEST_TOKENS}" == "-" ]]; then
+    INGEST_TOKENS=""
+elif [[ -z "${INGEST_TOKENS}" ]]; then
+    INGEST_TOKENS=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+    echo -e "  ${GREEN}✓ Токен сгенерирован (будет в config.env)${NC}"
+fi
+
 echo ""
 echo -e "${CYAN}── 10. Аутентификация ────────────────────────────────${NC}"
 echo -e "  ${YELLOW}Веб-интерфейс закрывается формой входа.${NC}"
@@ -413,6 +423,10 @@ ALERTS_RETENTION_DAYS=${ALERTS_RETENTION_DAYS}
 
 # История чатов (та же БД). Пользователь опознаётся по client_id браузера.
 CHATS_RETENTION_DAYS=${CHATS_RETENTION_DAYS}
+
+# Токены для POST /api/alerts/ingest (несколько — через запятую).
+# Пусто = приём алертов из внешних систем выключен.
+INGEST_TOKENS="${INGEST_TOKENS}"
 
 # Версии экспортёров
 NODE_EXPORTER_VERSION="${NODE_EXPORTER_VERSION}"
