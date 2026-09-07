@@ -188,6 +188,106 @@ def check_groups(cfg: dict, username: str, conn) -> None:
             print("  [?]   %s — ошибка проверки: %s" % (grp, e))
 
 
+# (хост,пользователь,домен). Пустое поле пользователя по правилам NIS —
+# «любой», дефис — «никто».
+NETGROUP_TRIPLE = re.compile(r"^\(\s*([^,]*?)\s*,\s*([^,]*?)\s*,\s*([^)]*?)\s*\)$")
+
+
+def attr(entry, name: str) -> list:
+    data = entry.entry_attributes_as_dict
+    for key, val in data.items():
+        if key.lower() == name.lower():
+            if val is None:
+                return []
+            return val if isinstance(val, list) else [val]
+    return []
+
+
+def load_netgroups(cfg: dict, conn) -> dict:
+    """Все netgroup ветки разом: {имя: (пользователи, вложенные, шаблон)}.
+
+    Забираем одним запросом, а не по одной: так видно и те netgroup, о которых
+    администратор ещё не знает, что пользователь в них состоит.
+    """
+    base = cfg.get("LDAP_NETGROUP_BASE") or cfg.get("LDAP_BASE_DN", "")
+    flt  = cfg.get("LDAP_NETGROUP_FILTER") or "(objectClass=nisNetgroup)"
+    out  = {}
+    if not base:
+        return out
+    conn.search(base, flt, search_scope=SUBTREE,
+                attributes=["cn", "nisNetgroupTriple", "memberNisNetgroup"])
+    for entry in conn.entries:
+        names = attr(entry, "cn")
+        if not names:
+            continue
+        users, any_user = set(), False
+        for triple in attr(entry, "nisNetgroupTriple"):
+            m = NETGROUP_TRIPLE.match(str(triple).strip())
+            if not m:
+                continue
+            who = m.group(2)
+            if who == "":
+                any_user = True
+            elif who != "-":
+                users.add(who.lower())
+        nested = [str(x) for x in attr(entry, "memberNisNetgroup")]
+        out[str(names[0]).lower()] = (users, nested, any_user)
+    return out
+
+
+def netgroup_has(all_ng: dict, name: str, who: str, seen=None) -> bool:
+    """Есть ли пользователь в netgroup с учётом вложенных."""
+    seen = seen if seen is not None else set()
+    key = name.lower()
+    if key in seen or key not in all_ng:
+        return False
+    seen.add(key)
+    users, nested, any_user = all_ng[key]
+    if any_user or who in users:
+        return True
+    return any(netgroup_has(all_ng, n, who, seen) for n in nested)
+
+
+def check_netgroups(cfg: dict, username: str, conn) -> None:
+    """Заданные netgroup и — главное — в каких пользователь реально состоит."""
+    base = cfg.get("LDAP_NETGROUP_BASE") or cfg.get("LDAP_BASE_DN", "")
+    if not base:
+        print("  ветка для поиска netgroup не задана")
+        return
+    try:
+        all_ng = load_netgroups(cfg, conn)
+    except Exception as e:
+        print("  не удалось прочитать netgroup из %s: %s" % (base, e))
+        return
+    if not all_ng:
+        print("  в %s не найдено ни одной nisNetgroup" % base)
+        return
+
+    who     = (username or "").lower()
+    listed  = [n.strip() for n in
+               cfg.get("LDAP_ALLOWED_NETGROUPS", "").split(";") if n.strip()]
+    print("  всего netgroup в ветке: %d" % len(all_ng))
+
+    for ng in listed:
+        if ng.lower() not in all_ng:
+            print("  [нет] %s — такой netgroup в ветке нет" % ng)
+        elif netgroup_has(all_ng, ng, who):
+            print("  [да]  входит      %s" % ng)
+        else:
+            print("  [--]  не входит   %s" % ng)
+
+    mine = sorted(n for n in all_ng if netgroup_has(all_ng, n, who))
+    if not mine:
+        print("  Пользователь не найден ни в одной netgroup этой ветки.")
+        return
+    print("")
+    print("  %s состоит в: %s" % (username, ", ".join(mine)))
+    if not listed:
+        print("  Впишите нужные в config.env:")
+        print("    LDAP_ALLOWED_NETGROUPS=\"%s\"" % ";".join(mine))
+        print("  и переустановите агента: sudo ./scripts/install_agent.sh")
+
+
 def main():
     args = sys.argv[1:]
     here = os.path.dirname(os.path.abspath(__file__))
@@ -204,7 +304,9 @@ def main():
     print("Настройки из config.env:")
     for k in ("LDAP_ENABLED", "LDAP_URL", "LDAP_BASE_DN", "LDAP_BIND_TEMPLATE",
               "LDAP_USER_FILTER", "LDAP_TLS_VERIFY", "LDAP_TIMEOUT",
-              "LDAP_SEARCH_USER", "LDAP_NESTED_GROUPS"):
+              "LDAP_SEARCH_USER", "LDAP_NESTED_GROUPS",
+              "LDAP_ALLOWED_NETGROUPS", "LDAP_NETGROUP_BASE",
+              "LDAP_NETGROUP_FILTER"):
         print("  %-20s %s" % (k, cfg.get(k) or "(пусто)"))
     print("  %-20s %s" % ("LDAP_SEARCH_PASSWORD",
                           "задан" if cfg.get("LDAP_SEARCH_PASSWORD")
@@ -282,6 +384,9 @@ def main():
     try:
         conn = connect(cfg, good[0], password)
         check_groups(cfg, username, conn)
+        print("")
+        print("Проверка netgroup:")
+        check_netgroups(cfg, username, conn)
         conn.unbind()
     except Exception as e:
         print("  не удалось проверить: %s" % e)

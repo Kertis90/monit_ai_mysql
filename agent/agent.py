@@ -100,6 +100,18 @@ if LDAP_REQUIRED_GROUP and LDAP_REQUIRED_GROUP not in LDAP_ALLOWED_GROUPS:
     LDAP_ALLOWED_GROUPS.append(LDAP_REQUIRED_GROUP)
 # Вложенные группы AD: пользователь в группе, которая входит в разрешённую
 LDAP_NESTED_GROUPS    = os.environ.get("LDAP_NESTED_GROUPS", "true").lower() == "true"
+# Netgroup (nisNetgroup) — второй способ описания состава, привычный там, где
+# каталог обслуживает и вход на Linux-серверы через nslcd. Устроен иначе, чем
+# группы AD: членство лежит не в memberOf у пользователя, а в самой netgroup,
+# в атрибуте nisNetgroupTriple вида (хост,пользователь,домен).
+LDAP_ALLOWED_NETGROUPS = [n.strip() for n in
+                          os.environ.get("LDAP_ALLOWED_NETGROUPS", "").split(";")
+                          if n.strip()]
+# У netgroup обычно своя ветка: nslcd описывает её отдельной строкой
+# "base netgroup ou=netgroup,dc=...". Пусто — ищем от общего LDAP_BASE_DN.
+LDAP_NETGROUP_BASE    = os.environ.get("LDAP_NETGROUP_BASE", "").strip()
+LDAP_NETGROUP_FILTER  = os.environ.get("LDAP_NETGROUP_FILTER",
+                                       "(objectClass=nisNetgroup)")
 LDAP_TLS_VERIFY       = os.environ.get("LDAP_TLS_VERIFY", "true").lower() == "true"
 # Целое число секунд, не дробное: ldap3 на Linux кладёт receive_timeout
 # в pack('LL', ...), а struct не принимает float и падает с "required
@@ -311,6 +323,122 @@ def ldap_conn(user: str, password: str):
                       receive_timeout=LDAP_TIMEOUT)
 
 
+def _dir_conn(conn):
+    """(соединение, открыли ли мы его сами) для поиска по каталогу.
+
+    Отдельно, потому что проверок теперь две — группы и netgroup, — и открывать
+    ради них два соединения незачем.
+    """
+    if conn is not None:
+        return conn, False
+    if not LDAP_SEARCH_USER:
+        logger.error("Проверка доступа без пароля пользователя требует "
+                     "сервисной учётки LDAP_SEARCH_USER")
+        return None, False
+    try:
+        return ldap_conn(LDAP_SEARCH_USER, LDAP_SEARCH_PASSWORD), True
+    except Exception as e:
+        logger.error(f"Не удалось подключиться к каталогу: {e}")
+        return None, False
+
+
+def _attr(entry, name: str) -> list:
+    """Значения атрибута без оглядки на регистр имени, всегда списком."""
+    data = entry.entry_attributes_as_dict
+    for key, val in data.items():
+        if key.lower() == name.lower():
+            if val is None:
+                return []
+            return val if isinstance(val, list) else [val]
+    return []
+
+
+# (хост, пользователь, домен). Пробелы вокруг полей каталоги ставят по-разному.
+NETGROUP_TRIPLE = re.compile(r"^\(\s*([^,]*?)\s*,\s*([^,]*?)\s*,\s*([^)]*?)\s*\)$")
+
+
+def netgroup_members(conn, name: str, seen=None, depth: int = 0) -> tuple:
+    """(имена пользователей, есть ли триплет-шаблон) в netgroup и вложенных.
+
+    Пустое поле пользователя в триплете по правилам NIS означает «любой», а
+    дефис — «никто». Различать обязательно: (-,,) открыл бы вход всем.
+    """
+    seen = seen if seen is not None else set()
+    users, any_user = set(), False
+    key = name.lower()
+    if key in seen or depth > 10:      # netgroup умеет ссылаться сама на себя
+        return users, any_user
+    seen.add(key)
+
+    from ldap3 import SUBTREE
+    from ldap3.utils.conv import escape_filter_chars
+    base = LDAP_NETGROUP_BASE or LDAP_BASE_DN
+    flt  = "(&%s(cn=%s))" % (LDAP_NETGROUP_FILTER, escape_filter_chars(name))
+    conn.search(base, flt, search_scope=SUBTREE,
+                attributes=["nisNetgroupTriple", "memberNisNetgroup"])
+    if not conn.entries:
+        logger.warning(f"Netgroup {name} не найдена в {base}")
+        return users, any_user
+
+    for entry in conn.entries:
+        for triple in _attr(entry, "nisNetgroupTriple"):
+            m = NETGROUP_TRIPLE.match(str(triple).strip())
+            if not m:
+                continue
+            who = m.group(2)
+            if who == "":
+                any_user = True        # шаблон: подходит кто угодно
+            elif who != "-":
+                users.add(who.lower())
+        for nested in _attr(entry, "memberNisNetgroup"):
+            sub_users, sub_any = netgroup_members(conn, str(nested), seen, depth + 1)
+            users |= sub_users
+            any_user = any_user or sub_any
+    return users, any_user
+
+
+def ldap_matched_netgroups(username: str, conn=None) -> list:
+    """Какие из разрешённых netgroup содержат пользователя."""
+    if not LDAP_ALLOWED_NETGROUPS:
+        return []
+    if not (LDAP_NETGROUP_BASE or LDAP_BASE_DN):
+        logger.error("Заданы netgroup, но искать негде: пусты и "
+                     "LDAP_NETGROUP_BASE, и LDAP_BASE_DN")
+        return []
+    try:
+        from ldap3 import SUBTREE  # noqa: F401
+    except ImportError:
+        logger.error("Проверка netgroup требует пакета ldap3")
+        return []
+
+    conn, own_conn = _dir_conn(conn)
+    if conn is None:
+        return []
+    who = (username or "").lower()
+    matched = []
+    try:
+        for ng in LDAP_ALLOWED_NETGROUPS:
+            try:
+                users, any_user = netgroup_members(conn, ng, set())
+            except Exception as e:
+                logger.error(f"Netgroup {ng}: ошибка чтения — {e}")
+                continue
+            if any_user:
+                logger.warning(
+                    f"Netgroup {ng} содержит триплет с пустым полем "
+                    f"пользователя — по правилам NIS это «любой», вход "
+                    f"открыт всем в каталоге")
+            if any_user or who in users:
+                matched.append(ng)
+    finally:
+        if own_conn:
+            try:
+                conn.unbind()
+            except Exception:
+                pass
+    return matched
+
+
 def ldap_matched_groups(username: str, conn=None) -> list:
     """Какие из разрешённых групп содержат пользователя.
 
@@ -335,18 +463,9 @@ def ldap_matched_groups(username: str, conn=None) -> list:
         logger.error("Проверка групп требует пакета ldap3")
         return []
 
-    own_conn = False
+    conn, own_conn = _dir_conn(conn)
     if conn is None:
-        if not LDAP_SEARCH_USER:
-            logger.error("Проверка групп без пароля пользователя требует "
-                         "сервисной учётки LDAP_SEARCH_USER")
-            return []
-        try:
-            conn = ldap_conn(LDAP_SEARCH_USER, LDAP_SEARCH_PASSWORD)
-            own_conn = True
-        except Exception as e:
-            logger.error(f"Не удалось подключиться к каталогу для проверки групп: {e}")
-            return []
+        return []
 
     # 1.2.840.113556.1.4.1941 — правило AD «член в том числе через вложенность».
     # Без него пользователь во вложенной группе выглядит как посторонний,
@@ -407,16 +526,33 @@ def ldap_authenticate(username: str, password: str) -> bool:
 
 
 def group_access_allowed(username: str) -> tuple:
-    """(разрешён ли вход по группам, названия совпавших групп).
+    """(разрешён ли вход, названия совпавших групп и netgroup).
 
-    Группы — второй путь получения доступа наряду со списком: заводить
-    каждого вручную в домене на сотни человек нереально.
+    Второй путь получения доступа наряду со списком: заводить каждого вручную
+    в домене на сотни человек нереально. Подходит любое совпадение — хоть
+    группа AD, хоть netgroup; одно соединение обслуживает обе проверки.
     """
-    if not (LDAP_ENABLED and LDAP_ALLOWED_GROUPS):
+    if not LDAP_ENABLED:
         return False, []
-    matched = ldap_matched_groups(username)
-    if matched == ["*"]:
-        return False, []          # список групп пуст — этот путь не используется
+    if not (LDAP_ALLOWED_GROUPS or LDAP_ALLOWED_NETGROUPS):
+        return False, []          # ни то, ни другое не задано — путь не используется
+
+    conn, own_conn = _dir_conn(None)
+    if conn is None:
+        return False, []
+    matched = []
+    try:
+        if LDAP_ALLOWED_GROUPS:
+            matched += ldap_matched_groups(username, conn)
+        if LDAP_ALLOWED_NETGROUPS:
+            matched += ["netgroup " + n
+                        for n in ldap_matched_netgroups(username, conn)]
+    finally:
+        if own_conn:
+            try:
+                conn.unbind()
+            except Exception:
+                pass
     return bool(matched), matched
 
 

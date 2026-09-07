@@ -10,6 +10,7 @@
     sudo ./scripts/import_nslcd.py --write         # записать в config.env
     sudo ./scripts/import_nslcd.py --write \\
          --groups 'CN=DBA,OU=Groups,DC=company,DC=ru'
+    sudo ./scripts/import_nslcd.py --write --netgroups 'dba;monitoring'
 
 Соответствие параметров:
 
@@ -21,6 +22,11 @@
     filter passwd           LDAP_USER_FILTER (шаблон с {username})
     ssl / tls_reqcert       LDAP_TLS_VERIFY
     bind_timelimit          LDAP_TIMEOUT
+    base netgroup           LDAP_NETGROUP_BASE
+    filter netgroup         LDAP_NETGROUP_FILTER
+
+Строка "base <карта> <dn>" задаёт ветку только для этой карты и общий base
+не заменяет — иначе пользователей искали бы в ветке netgroup.
 """
 import os
 import re
@@ -41,12 +47,41 @@ def parse_nslcd(path: str) -> dict:
             if len(parts) != 2:
                 continue
             key, val = parts[0].lower(), parts[1].strip()
-            # map и filter встречаются несколько раз — храним списком
-            if key in ("map", "filter"):
+            # base, map и filter встречаются несколько раз — храним списком.
+            # base особенно важен: строка "base netgroup ou=..." затёрла бы
+            # общий base, и агент искал бы пользователей в ветке netgroup.
+            if key in ("map", "filter", "base"):
                 cfg.setdefault(key, []).append(val)
             else:
                 cfg[key] = val
     return cfg
+
+
+# Карты nslcd: "base <карта> <dn>" задаёт ветку только для неё
+NSLCD_MAPS = {"alias", "aliases", "ether", "ethers", "group", "host", "hosts",
+              "netgroup", "network", "networks", "passwd", "protocol",
+              "protocols", "rpc", "service", "services", "shadow"}
+
+
+def bases(cfg: dict) -> dict:
+    """Ветки поиска: ключ "" — общая, остальные — по имени карты."""
+    out = {}
+    for val in cfg.get("base", []):
+        parts = val.split(None, 1)
+        if len(parts) == 2 and parts[0].lower() in NSLCD_MAPS:
+            out.setdefault(parts[0].lower(), parts[1].strip())
+        else:
+            out.setdefault("", val.strip())
+    return out
+
+
+def map_filter(cfg: dict, name: str) -> str:
+    """Строка "filter <карта> (...)" — фильтр объектов этой карты."""
+    for f in cfg.get("filter", []):
+        parts = f.split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == name:
+            return parts[1].strip()
+    return ""
 
 
 def user_filter(cfg: dict) -> str:
@@ -90,7 +125,8 @@ def bind_template(cfg: dict) -> str:
     Нам нужен шаблон. Для AD надёжнее всего UPN: user@domain, домен собираем
     из base DN.
     """
-    base = cfg.get("base", "")
+    b = bases(cfg)
+    base = b.get("") or b.get("passwd", "")
     dcs = re.findall(r"DC=([^,]+)", base, re.I)
     return "{username}@" + ".".join(dcs) if dcs else "{username}"
 
@@ -101,12 +137,19 @@ def tls_verify(cfg: dict) -> str:
     return "false" if req in ("never", "allow") else "true"
 
 
-def build(cfg: dict, groups: str) -> dict:
+def build(cfg: dict, groups: str, netgroups: str = "") -> dict:
     uri = (cfg.get("uri") or "").split()[0] if cfg.get("uri") else ""
+    b   = bases(cfg)
+    # Ветка netgroup обычно своя; если отдельной строки нет, ищем от общей
+    ng_base   = b.get("netgroup", "")
+    ng_filter = map_filter(cfg, "netgroup") or "(objectClass=nisNetgroup)"
     return {
         "LDAP_ENABLED":         "true",
         "LDAP_URL":             uri,
-        "LDAP_BASE_DN":         cfg.get("base", ""),
+        "LDAP_BASE_DN":         b.get("") or b.get("passwd", ""),
+        "LDAP_ALLOWED_NETGROUPS": netgroups,
+        "LDAP_NETGROUP_BASE":   ng_base,
+        "LDAP_NETGROUP_FILTER": ng_filter,
         "LDAP_BIND_TEMPLATE":   bind_template(cfg),
         "LDAP_USER_FILTER":     user_filter(cfg),
         "LDAP_SEARCH_USER":     cfg.get("binddn", ""),
@@ -145,9 +188,12 @@ def main():
     write  = "--write" in args
     src    = NSLCD
     groups = ""
+    netgroups = ""
     for i, a in enumerate(args):
         if a == "--groups" and i + 1 < len(args):
             groups = args[i + 1]
+        if a == "--netgroups" and i + 1 < len(args):
+            netgroups = args[i + 1]
         if a == "--file" and i + 1 < len(args):
             src = args[i + 1]
 
@@ -156,7 +202,7 @@ def main():
         sys.exit(1)
 
     cfg    = parse_nslcd(src)
-    values = build(cfg, groups)
+    values = build(cfg, groups, netgroups)
 
     if not values["LDAP_URL"]:
         print("В %s нет параметра uri — подключаться некуда." % src)
@@ -167,10 +213,19 @@ def main():
         shown = "***" if k.endswith("PASSWORD") and v else (v or "(пусто)")
         print("  %-22s %s" % (k, shown))
 
-    if not groups:
-        print("\n  LDAP_ALLOWED_GROUPS не задан — вход будет только по явно")
-        print("  выданным доступам. Укажите группы:")
-        print("    --groups 'CN=DBA,OU=Groups,DC=company,DC=ru;CN=Ops,...'")
+    if not (groups or netgroups):
+        print("")
+        print("  Ни группы, ни netgroup не заданы — вход будет только по")
+        print("  явно выданным доступам. Укажите то, чем у вас описан состав:")
+        print("    --groups    'CN=DBA,OU=Groups,DC=company,DC=ru'")
+        print("    --netgroups 'dba;monitoring'")
+        if values["LDAP_NETGROUP_BASE"]:
+            print("")
+            print("  В nslcd.conf есть ветка netgroup — %s"
+                  % values["LDAP_NETGROUP_BASE"])
+            print("  Посмотреть, какие netgroup там лежат:")
+            print("    ldapsearch -x -b '%s' '(objectClass=nisNetgroup)' cn"
+                  % values["LDAP_NETGROUP_BASE"])
 
     if not write:
         print("\nЭто предпросмотр. Для записи добавьте --write")

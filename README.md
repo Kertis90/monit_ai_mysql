@@ -1629,6 +1629,51 @@ sudo ./scripts/import_nslcd.py --write      --groups 'CN=DBA,OU=Groups,DC=compan
 в разрешённую группу через промежуточную, выглядел бы посторонним, а такая
 вложенность в AD встречается постоянно.
 
+**Доступ по netgroup.** Там, где каталог обслуживает ещё и вход на
+Linux-серверы через `nslcd`, состав обычно описан не группами AD, а
+**netgroup** (`nisNetgroup`). Устроены они принципиально иначе: членство лежит
+не в `memberOf` у пользователя, а в самой netgroup — в атрибуте
+`nisNetgroupTriple` вида `(хост,пользователь,домен)`, с вложением через
+`memberNisNetgroup`. Поэтому проверка групп их не видит, и нужна отдельная.
+
+```bash
+# Имена (cn), через «;». Работает вместе с LDAP_ALLOWED_GROUPS: доступ даёт
+# любое совпадение — хоть группа AD, хоть netgroup
+LDAP_ALLOWED_NETGROUPS="dba;monitoring"
+# Своя ветка (в nslcd — строка «base netgroup ...»). Пусто — от LDAP_BASE_DN
+LDAP_NETGROUP_BASE="ou=netgroup,dc=company,dc=ru"
+LDAP_NETGROUP_FILTER="(objectClass=nisNetgroup)"
+```
+
+Не помните имена netgroup — их покажет диагностика, вместе с тем, в каких
+состоит конкретный человек:
+
+```bash
+sudo ./scripts/ldap_test.py --user ivkop
+```
+
+Она же выведет готовую строку `LDAP_ALLOWED_NETGROUPS` для вставки в
+`config.env`. Либо прямо из каталога:
+
+```bash
+ldapsearch -x -b 'ou=netgroup,dc=company,dc=ru' '(objectClass=nisNetgroup)' cn
+```
+
+Вложенные netgroup раскрываются, ссылки по кругу не зацикливают. Пустое поле
+пользователя в триплете — например `(-,,)` — по правилам NIS означает
+**любой**, то есть вход открыт всем в каталоге; агент такое пропускает, но
+пишет предупреждение в лог. Дефис `-` означает «никто».
+
+**Импорт netgroup из nslcd.** Ветка и фильтр берутся автоматически:
+
+```bash
+sudo ./scripts/import_nslcd.py --write --netgroups 'dba;monitoring'
+```
+
+Заодно исправлено чтение самого `nslcd.conf`: строка `base netgroup ou=...`
+задаёт ветку только для этой карты и общий `base` не заменяет — иначе
+пользователей искали бы среди netgroup.
+
 Проверка групп работает и для SSO с OIDC — там пароля пользователя нет,
 поэтому поиск идёт сервисной учёткой `LDAP_SEARCH_USER`.
 

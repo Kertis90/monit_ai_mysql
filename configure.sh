@@ -237,6 +237,13 @@ print(f"pbkdf2_sha256${it}${salt}${dk.hex()}")
             ask "Группы доступа (DN через ;)" LDAP_ALLOWED_GROUPS ""
             echo -e "  ${YELLOW}Учитывать вложенные группы AD (обычно да)${NC}"
             ask "Вложенные группы (true/false)" LDAP_NESTED_GROUPS "true"
+            echo -e "  ${YELLOW}Netgroup (nisNetgroup) — если состав описан ими,${NC}"
+            echo -e "  ${YELLOW}как в nslcd. Имена (cn) через точку с запятой.${NC}"
+            ask "Netgroup доступа (cn через ;)" LDAP_ALLOWED_NETGROUPS ""
+            if [[ -n "${LDAP_ALLOWED_NETGROUPS:-}" ]]; then
+                echo -e "  ${YELLOW}Ветка netgroup. Enter — искать от общего Base DN${NC}"
+                ask "Base DN для netgroup" LDAP_NETGROUP_BASE ""
+            fi
         fi
         ask "Проверять TLS-сертификат (true/false)" LDAP_TLS_VERIFY "true"
         echo -e "  ${YELLOW}Сервисная учётка нужна, чтобы выдавать доступ выбором${NC}"
@@ -252,6 +259,7 @@ print(f"pbkdf2_sha256${it}${salt}${dk.hex()}")
     else
         LDAP_URL=""; LDAP_BIND_TEMPLATE=""; LDAP_BASE_DN=""
         LDAP_USER_FILTER=""; LDAP_ALLOWED_GROUPS=""; LDAP_NESTED_GROUPS="true"
+        LDAP_ALLOWED_NETGROUPS=""; LDAP_NETGROUP_BASE=""
         LDAP_TLS_VERIFY="true"
         LDAP_SEARCH_USER=""; LDAP_SEARCH_PASSWORD=""
     fi
@@ -300,6 +308,7 @@ else
     AUTH_SESSION_TTL_HOURS="12"
     LDAP_ENABLED="false"; LDAP_URL=""; LDAP_BIND_TEMPLATE=""; LDAP_BASE_DN=""
     LDAP_USER_FILTER=""; LDAP_REQUIRED_GROUP=""; LDAP_TLS_VERIFY="true"
+    LDAP_ALLOWED_NETGROUPS=""; LDAP_NETGROUP_BASE=""
     SSO_ENABLED="false"; SSO_HEADER="X-Remote-User"
     SSO_TRUSTED_PROXIES="127.0.0.1,::1"; SSO_LOGOUT_URL=""
     LDAP_SEARCH_USER=""; LDAP_SEARCH_PASSWORD=""
@@ -385,6 +394,13 @@ LDAP_USER_FILTER="${LDAP_USER_FILTER}"
 # Пусто = вход только по явно выданным доступам.
 LDAP_ALLOWED_GROUPS="${LDAP_ALLOWED_GROUPS}"
 LDAP_NESTED_GROUPS="${LDAP_NESTED_GROUPS}"
+# Netgroup (nisNetgroup): имена через «;». Членство лежит в самой netgroup,
+# в триплетах (хост,пользователь,домен), а не в memberOf у пользователя.
+LDAP_ALLOWED_NETGROUPS="${LDAP_ALLOWED_NETGROUPS:-}"
+# Своя ветка netgroup (в nslcd — строка "base netgroup ...").
+# Пусто — искать от LDAP_BASE_DN.
+LDAP_NETGROUP_BASE="${LDAP_NETGROUP_BASE:-}"
+LDAP_NETGROUP_FILTER="${LDAP_NETGROUP_FILTER:-(objectClass=nisNetgroup)}"
 LDAP_TLS_VERIFY="${LDAP_TLS_VERIFY}"
 # Сервисная учётка — только для поиска по каталогу при выдаче доступов
 LDAP_SEARCH_USER="${LDAP_SEARCH_USER}"
