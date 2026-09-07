@@ -18,6 +18,7 @@ const App = (() => {
     currentTab:    'chat',
     streamingEl:   null,   // элемент .msg-body куда стримятся токены
     streamBuf:     '',     // сырой текст ответа до разметки
+    lastQuestion:  '',     // вопрос — сохраняем вместе с оценкой
     pendingCharts: null,   // графики, ждущие конца ответа
     awaitingReply: false,
     pingTimer:     null,
@@ -211,6 +212,15 @@ const App = (() => {
         break;
       }
 
+      case 'tools':
+        // какие инструменты модель запросила сама
+        if (state.streamingEl) {
+          const meta = state.streamingEl.parentElement.querySelector('.msg-meta');
+          if (meta) meta.innerHTML += ' <span class="ctx-chip">' +
+                                      esc(msg.used.join(', ')) + '</span>';
+        }
+        break;
+
       case 'charts':
         // Не рисуем сразу: ответ ещё стримится. Прикрепим к нему по 'done',
         // иначе графики влезали между вопросом и ответом.
@@ -240,6 +250,8 @@ const App = (() => {
         attachCharts(state.streamingEl.parentElement, state.pendingCharts);
         state.pendingCharts = null;
       }
+      attachFeedback(state.streamingEl.parentElement, state.lastQuestion,
+                     state.streamingEl.textContent || '');
       state.streamingEl = null;
     }
     state.awaitingReply = false;
@@ -278,6 +290,7 @@ const App = (() => {
 
     // Заготовка под ответ со стримингом
     state.streamBuf = '';
+    state.lastQuestion = text;
     const el = addMsg('assistant', '', 'AI Agent');
     el.innerHTML = '<span class="thinking"><i></i><i></i><i></i></span>';
     state.streamingEl   = el;
@@ -691,6 +704,36 @@ const App = (() => {
     const r = await fetch('api/users/' + encodeURIComponent(username), { method: 'DELETE' });
     if (!r.ok) { alert('Не удалось отозвать доступ'); return; }
     await loadAccess();
+  }
+
+  // ═══ ОЦЕНКА ОТВЕТА ══════════════════════════════════════════════
+  // Без неё непонятно, где агент систематически промахивается,
+  // и улучшения делаются вслепую.
+
+  function attachFeedback(msgEl, question, answer) {
+    if (!msgEl || msgEl.querySelector('.fb-bar')) return;
+    const bar = document.createElement('div');
+    bar.className = 'fb-bar';
+    bar.innerHTML = '<span class="fb-q">Ответ помог?</span>' +
+                    '<button class="fb-btn" data-r="1" type="button">да</button>' +
+                    '<button class="fb-btn" data-r="-1" type="button">нет</button>';
+
+    bar.addEventListener('click', async (e) => {
+      const b = e.target.closest('.fb-btn');
+      if (!b) return;
+      const rating = parseInt(b.dataset.r, 10);
+      let comment = '';
+      if (rating < 0) comment = prompt('Что было не так? (необязательно)') || '';
+      bar.innerHTML = '<span class="fb-q">Спасибо, учтём</span>';
+      try {
+        await fetch('api/feedback', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ rating, comment, question, answer,
+                                 client_id: state.clientId }),
+        });
+      } catch (err) { console.warn('Оценка не отправлена:', err); }
+    });
+    msgEl.appendChild(bar);
   }
 
   // ═══ РАЗМЕТКА ОТВЕТА ════════════════════════════════════════════

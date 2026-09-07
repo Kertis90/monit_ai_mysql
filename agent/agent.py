@@ -152,7 +152,54 @@ logging.basicConfig(
 )
 logger = logging.getLogger("agent")
 
-app = FastAPI(title="MySQL AI Agent v3", version="3.0.0", root_path=ROOT_PATH)
+API_DESCRIPTION = """
+API AI-агента мониторинга MySQL.
+
+Позволяет внешним системам **регистрировать события** и **общаться с агентом**
+программно, без веб-интерфейса.
+
+### Аутентификация
+
+| Способ | Где применяется |
+|--------|-----------------|
+| `X-API-Key` или `Authorization: Bearer` | приём событий `/api/alerts/ingest` — для Zabbix и подобных |
+| Сессионная cookie | остальные методы; получается через `POST /api/login` |
+
+### Типовые сценарии
+
+Зарегистрировать событие из внешнего мониторинга:
+
+    curl -X POST /api/alerts/ingest -H 'X-API-Key: ТОКЕН'          -d '{"alert":"Disk low","severity":"critical","cluster":"kemerovo"}'
+
+Задать вопрос агенту и получить разбор:
+
+    curl -X POST /chat -d '{"message":"что с Кемерово за час?"}'
+
+Забрать метрики или детальную статистику:
+
+    curl '/api/series/kemerovo?hours=6&step=300&format=csv'
+"""
+
+API_TAGS = [
+    {"name": "События", "description": "Регистрация и просмотр алертов, "
+                                       "в том числе из внешних систем"},
+    {"name": "Чат", "description": "Диалог с агентом и оценка ответов"},
+    {"name": "Метрики", "description": "Ряды, графики и детальная статистика"},
+    {"name": "Диагностика", "description": "SQL-запросы и диагностика кластеров"},
+    {"name": "Кластеры", "description": "Состав и состояние кластеров"},
+    {"name": "Доступ", "description": "Вход, выход, управление доступами"},
+    {"name": "Служебное", "description": "Health-check и конфигурация"},
+]
+
+app = FastAPI(
+    title="MySQL AI Agent",
+    version=os.environ.get("AGENT_VERSION", "1.15.0"),
+    description=API_DESCRIPTION,
+    openapi_tags=API_TAGS,
+    root_path=ROOT_PATH,
+    # Swagger-страница доступна без входа: без неё внешние интеграции
+    # не могут узнать формат запросов. Сами методы при этом закрыты.
+    docs_url="/docs", redoc_url="/redoc", openapi_url="/openapi.json")
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
 
@@ -682,6 +729,82 @@ def users_init() -> bool:
 
 
 USERS_DB_OK = users_init()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ОБРАТНАЯ СВЯЗЬ ПО ОТВЕТАМ
+#  Без неё непонятно, на каких вопросах агент промахивается, и улучшения
+#  делаются вслепую. Храним вопрос, ответ и оценку — через месяц видно,
+#  где он систематически не справляется.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def feedback_init() -> bool:
+    if not ALERTS_DB_OK:
+        return False
+    try:
+        with closing(agent_db()) as conn, conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS feedback (
+                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts        TEXT NOT NULL,
+                    client_id TEXT,
+                    username  TEXT,
+                    rating    INTEGER NOT NULL,
+                    question  TEXT,
+                    answer    TEXT,
+                    comment   TEXT
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_ts"
+                         " ON feedback(ts)")
+        return True
+    except Exception as e:
+        logger.error(f"Таблица обратной связи недоступна: {e}")
+        return False
+
+
+FEEDBACK_DB_OK = feedback_init()
+
+
+def feedback_save(client_id: str, username: str, rating: int,
+                  question: str, answer: str, comment: str = "") -> bool:
+    if not FEEDBACK_DB_OK:
+        return False
+    try:
+        with closing(agent_db()) as conn, conn:
+            conn.execute(
+                "INSERT INTO feedback (ts, client_id, username, rating,"
+                " question, answer, comment) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (datetime.datetime.utcnow().isoformat(), client_id, username,
+                 1 if rating > 0 else -1, question[:4000], answer[:8000],
+                 comment[:1000]))
+        return True
+    except Exception as e:
+        logger.error(f"Не удалось сохранить оценку: {e}")
+        return False
+
+
+def feedback_stats(days: int = 30) -> dict:
+    """Сводка: сколько оценок, доля полезных, последние отрицательные."""
+    if not FEEDBACK_DB_OK:
+        return {"total": 0, "useful": 0, "useless": 0, "recent_bad": []}
+    try:
+        since = (datetime.datetime.utcnow()
+                 - datetime.timedelta(days=days)).isoformat()
+        with closing(agent_db()) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*), SUM(rating > 0), SUM(rating < 0)"
+                "  FROM feedback WHERE ts >= ?", (since,)).fetchone()
+            bad = conn.execute(
+                "SELECT ts, username, question, comment FROM feedback"
+                " WHERE ts >= ? AND rating < 0 ORDER BY ts DESC LIMIT 20",
+                (since,)).fetchall()
+        return {"days": days, "total": row[0] or 0,
+                "useful": row[1] or 0, "useless": row[2] or 0,
+                "recent_bad": [dict(b) for b in bad]}
+    except Exception as e:
+        logger.error(f"Не удалось получить сводку по оценкам: {e}")
+        return {"total": 0, "useful": 0, "useless": 0, "recent_bad": []}
 
 
 def norm_username(name: str) -> str:
@@ -1978,6 +2101,143 @@ LOG_KEYWORDS = (
 def detect_log_intent(text: str) -> bool:
     t = text.lower()
     return any(kw in t for kw in LOG_KEYWORDS)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  БАЗА ДЛЯ СРАВНЕНИЯ, ДИФФ КОНФИГУРАЦИЙ, ЛЕНТА СОБЫТИЙ
+# ══════════════════════════════════════════════════════════════════════════════
+
+BASELINE_OFFSET_DAYS = int(os.environ.get("BASELINE_OFFSET_DAYS", "7"))
+
+
+async def collect_baseline(cluster: dict, hours: float) -> dict:
+    """Те же метрики неделю назад — чтобы было с чем сравнивать.
+
+    Без базы «QPS 1200» ничего не значит: модель не знает, много это или мало,
+    и вынуждена гадать. Смещение ровно на неделю берёт тот же день недели
+    и тот же час — по будням и выходным профиль нагрузки разный.
+    """
+    prim = cluster["primary_ip"]
+    inst = f"{prim}:9104"
+    off  = f"{BASELINE_OFFSET_DAYS * 24}h"
+
+    queries = {
+        "qps":             f'rate(mysql_global_status_queries{{instance="{inst}"}}[5m] offset {off})',
+        "slow_qps":        f'rate(mysql_global_status_slow_queries{{instance="{inst}"}}[5m] offset {off})',
+        "connections_pct": (f'mysql_global_status_threads_connected{{instance="{inst}"}} offset {off}'
+                            f'/mysql_global_variables_max_connections{{instance="{inst}"}} offset {off}*100'),
+        "cpu_pct":         (f'100-(avg by(instance)(rate(node_cpu_seconds_total'
+                            f'{{mode="idle",instance="{prim}:9100"}}[5m] offset {off}))*100)'),
+        "iowait_pct":      (f'avg by(instance)(rate(node_cpu_seconds_total'
+                            f'{{mode="iowait",instance="{prim}:9100"}}[5m] offset {off}))*100'),
+    }
+    async with httpx.AsyncClient() as client:
+        keys = list(queries.keys())
+        res  = await asyncio.gather(
+            *[prom_range_summary(client, queries[k], hours) for k in keys])
+    return {"offset_days": BASELINE_OFFSET_DAYS,
+            **{k: v for k, v in zip(keys, res)}}
+
+
+def fmt_baseline(now: dict, base: dict, label: str) -> str:
+    """Сравнение «сейчас против недели назад» с относительным изменением."""
+    rows = []
+    for k, cur in now.items():
+        if k in ("period_hours", "offset_days") or not isinstance(cur, dict):
+            continue
+        old = base.get(k)
+        if not isinstance(old, dict) or not old.get("avg"):
+            continue
+        try:
+            delta = (cur["avg"] - old["avg"]) / abs(old["avg"]) * 100
+        except (TypeError, ZeroDivisionError):
+            continue
+        mark = "выше" if delta > 0 else "ниже"
+        rows.append(f"  {k}: сейчас {cur['avg']}, неделю назад {old['avg']} "
+                    f"({abs(delta):.0f}% {mark})")
+    if not rows:
+        return ""
+    return (f"## Сравнение с обычным днём — {label}\n\n"
+            f"  Те же метрики {base['offset_days']} дн. назад, тот же день "
+            f"недели и час.\n"
+            f"  Отклонение в пределах 20-30% обычно норма.\n\n" + "\n".join(rows))
+
+
+# ── Расхождения конфигурации между серверами кластера ────────────────────────
+
+CONFIG_DIFF_SQL = """SELECT VARIABLE_NAME, VARIABLE_VALUE
+  FROM performance_schema.global_variables
+ WHERE VARIABLE_NAME IN (
+   'max_connections','innodb_buffer_pool_size','innodb_log_file_size',
+   'innodb_flush_log_at_trx_commit','sync_binlog','read_only','super_read_only',
+   'slow_query_log','long_query_time','log_timestamps','sql_mode',
+   'transaction_isolation','character_set_server','collation_server',
+   'innodb_io_capacity','innodb_flush_method','table_open_cache',
+   'tmp_table_size','max_heap_table_size','binlog_format','gtid_mode')"""
+
+
+async def collect_config_diff(cluster: dict) -> str:
+    """Сравнить параметры primary и replica.
+
+    Расхождения между серверами одного кластера — частая причина странного
+    поведения: реплика с другим buffer pool или flush-политикой ведёт себя
+    иначе при той же нагрузке.
+    """
+    hosts = cluster_hosts(cluster)
+    if len(hosts) < 2 or not cluster_db_creds(cluster):
+        return ""
+
+    results = {}
+    for ip, role in hosts:
+        res = await sql_execute(cluster, CONFIG_DIFF_SQL, ip)
+        if res.get("error"):
+            return (f"## Конфигурация {cluster['label']}\n\n"
+                    f"  Не удалось сравнить: {res['error'][:160]}")
+        results[role] = {r[0]: r[1] for r in res["rows"]}
+
+    roles = list(results.keys())
+    a, b = results[roles[0]], results[roles[1]]
+    diff = [(k, a.get(k), b.get(k)) for k in sorted(set(a) | set(b))
+            if a.get(k) != b.get(k)]
+    if not diff:
+        return (f"## Конфигурация {cluster['label']}\n\n"
+                f"  Ключевые параметры primary и replica совпадают.")
+
+    out = [f"## Расхождения конфигурации {cluster['label']}", "",
+           f"  Параметр | {roles[0]} | {roles[1]}",
+           "  ---------+----------+----------"]
+    for k, va, vb in diff:
+        out.append(f"  {k} | {va} | {vb}")
+    out.append("")
+    out.append("  Часть расхождений нормальна (read_only на реплике), "
+               "но остальные объясни.")
+    return "\n".join(out)
+
+
+# ── Единая лента событий ─────────────────────────────────────────────────────
+
+def build_timeline(alerts: list, extra_events: Optional[list] = None) -> str:
+    """Все события одной лентой по времени.
+
+    Метрики, логи и алерты приходят разными блоками, и модель сопоставляет их
+    сама. Одна отсортированная лента показывает причинно-следственную связь
+    сразу: всплеск iowait, следом таймаут в логе, следом алерт.
+    """
+    events = []
+    for a in alerts:
+        ts = (a.get("timestamp") or "")[:19].replace("T", " ")
+        events.append((ts, f"АЛЕРТ  {a.get('severity','?'):8} {a.get('alert')} "
+                           f"— {a.get('cluster_label') or '—'}"))
+    for e in (extra_events or []):
+        events.append((e.get("ts", ""), e.get("text", "")))
+
+    events = [e for e in events if e[0]]
+    if not events:
+        return ""
+    events.sort(key=lambda e: e[0])
+    lines = ["## Лента событий (UTC, по времени)", ""]
+    lines += [f"  {ts}  {txt}" for ts, txt in events[-60:]]
+    return "\n".join(lines)
 # ══════════════════════════════════════════════════════════════════════════════
 
 DIAG_QUERIES = [
@@ -2068,6 +2328,71 @@ DIAG_QUERIES = [
         "optional": True,
     },
 ]
+
+
+async def explain_top_queries(cluster: dict, host: str, limit: int = 3) -> str:
+    """Планы выполнения самых тяжёлых запросов + схема их таблиц.
+
+    Без плана ответ упирается в «запрос медленный». С планом получается
+    «полное сканирование orders, нет индекса по (created, status)» —
+    и конкретная команда CREATE INDEX.
+
+    Ограничение: в performance_schema хранится DIGEST_TEXT с «?» вместо
+    значений. EXPLAIN такой текст обычно принимает, но не всегда — неудачи
+    пропускаем молча, они ожидаемы.
+    """
+    if not cluster_db_creds(cluster):
+        return ""
+
+    top = await sql_execute(cluster, """
+        SELECT DIGEST_TEXT, ROUND(SUM_TIMER_WAIT/1e12, 2) AS total_sec,
+               COUNT_STAR, SUM_ROWS_EXAMINED
+          FROM performance_schema.events_statements_summary_by_digest
+         WHERE SCHEMA_NAME IS NOT NULL AND DIGEST_TEXT LIKE 'SELECT%'
+         ORDER BY SUM_TIMER_WAIT DESC LIMIT 5""", host)
+    if top.get("error") or not top.get("rows"):
+        return ""
+
+    out, done = [], 0
+    tables_seen = set()
+    for row in top["rows"]:
+        if done >= limit:
+            break
+        digest = (row[0] or "").strip()
+        if not digest:
+            continue
+        # «?» — плейсхолдеры дайджеста. Подставляем 1: для плана этого хватает,
+        # а разбирать типы параметров тут негде.
+        query = digest.replace("?", "1")
+        plan = await sql_execute(cluster, "EXPLAIN " + query, host)
+        if plan.get("error"):
+            logger.info("EXPLAIN пропущен: %s", plan["error"][:90])
+            continue
+
+        done += 1
+        out.append(f"### Запрос {done} — {row[1]} с суммарно, "
+                   f"{row[2]} вызовов, строк просмотрено {row[3]}")
+        out.append("  " + digest[:400])
+        out.append(fmt_sql_result(plan).split("\n", 1)[1].lstrip("\n"))
+
+        # схемы таблиц из плана: без них рекомендации по индексам вслепую
+        for prow in plan.get("rows", []):
+            tbl = next((str(v) for c, v in zip(plan["columns"], prow)
+                        if c.lower() == "table" and v), "")
+            if tbl and tbl not in tables_seen and len(tables_seen) < 4:
+                tables_seen.add(tbl)
+                ddl = await sql_execute(cluster, "SHOW CREATE TABLE " + tbl, host)
+                if not ddl.get("error") and ddl.get("rows"):
+                    out.append(f"  Схема {tbl}:")
+                    out.append("  " + str(ddl["rows"][0][-1])[:900])
+        out.append("")
+
+    if not out:
+        return ""
+    return (f"## Планы выполнения тяжёлых запросов ({host})\n\n"
+            f"  EXPLAIN для самых дорогих SELECT и схемы их таблиц.\n"
+            f"  Используй это для конкретных рекомендаций по индексам.\n\n"
+            + "\n".join(out))
 
 DIAG_KEYWORDS = (
     "диагностик", "продиагностируй", "разбер", "почему медленн", "тормоз",
@@ -2495,6 +2820,233 @@ def fmt_series_table(data: dict, label: str) -> str:
     return "\n".join(head + rows)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  TOOL CALLING
+#  Модель сама решает, что ей нужно, вместо угадывания по ключевым словам.
+#  Список слов приходилось расширять после каждой новой формулировки —
+#  «статистика», «детально», «за последний час» промахивались по очереди.
+#
+#  Режим опциональный: не всякий OpenAI-совместимый эндпоинт поддерживает
+#  инструменты. При LLM_TOOLS=auto делается пробный запрос, и при отказе
+#  агент работает по-старому.
+# ══════════════════════════════════════════════════════════════════════════════
+
+LLM_TOOLS      = os.environ.get("LLM_TOOLS", "auto").lower()   # auto|on|off
+LLM_TOOL_ROUNDS = int(os.environ.get("LLM_TOOL_ROUNDS", "3"))
+TOOLS_SUPPORTED = None          # None — ещё не проверяли
+
+
+def tool_specs() -> list:
+    """Описание инструментов в формате OpenAI function calling."""
+    names = [c["name"] for c in enabled_clusters()] or ["<нет кластеров>"]
+    cl = {"type": "string", "description": "имя кластера: " + ", ".join(names)}
+    hrs = {"type": "number",
+           "description": f"окно в часах, максимум {MAX_METRICS_HOURS:g}"}
+    return [
+        {"type": "function", "function": {
+            "name": "get_current_metrics",
+            "description": "Текущие метрики кластера: доступность, QPS, "
+                           "подключения, CPU, отставание реплики.",
+            "parameters": {"type": "object", "properties": {"cluster": cl},
+                           "required": ["cluster"]}}},
+        {"type": "function", "function": {
+            "name": "get_history",
+            "description": "Агрегаты min/avg/max за период и сравнение "
+                           "с тем же периодом неделю назад.",
+            "parameters": {"type": "object",
+                           "properties": {"cluster": cl, "hours": hrs},
+                           "required": ["cluster", "hours"]}}},
+        {"type": "function", "function": {
+            "name": "get_breakdown",
+            "description": "Детальная статистика по интервалам: значения "
+                           "CPU, iowait, памяти, дисков, QPS по каждому шагу. "
+                           "Отдельная таблица на каждый сервер кластера.",
+            "parameters": {"type": "object", "properties": {
+                "cluster": cl, "hours": hrs,
+                "step_seconds": {"type": "integer",
+                                 "description": "шаг разбивки, по умолчанию 300"}},
+                "required": ["cluster", "hours"]}}},
+        {"type": "function", "function": {
+            "name": "run_diagnostics",
+            "description": "Диагностика Performance Schema: тяжёлые запросы, "
+                           "полные сканирования, блокировки, ожидания, "
+                           "планы выполнения и схемы таблиц.",
+            "parameters": {"type": "object", "properties": {"cluster": cl},
+                           "required": ["cluster"]}}},
+        {"type": "function", "function": {
+            "name": "run_sql",
+            "description": "Читающий SQL-запрос к кластеру. Разрешены только "
+                           "SELECT, SHOW, EXPLAIN, DESCRIBE.",
+            "parameters": {"type": "object", "properties": {
+                "cluster": cl,
+                "sql": {"type": "string", "description": "текст запроса"}},
+                "required": ["cluster", "sql"]}}},
+        {"type": "function", "function": {
+            "name": "read_logs",
+            "description": "Slow-лог MySQL и логи приложения за период "
+                           "с серверов кластера.",
+            "parameters": {"type": "object", "properties": {
+                "cluster": cl, "hours": hrs,
+                "filter": {"type": "string",
+                           "description": "дополнительная строка поиска"}},
+                "required": ["cluster", "hours"]}}},
+        {"type": "function", "function": {
+            "name": "get_alerts",
+            "description": "История сработавших алертов с разбором.",
+            "parameters": {"type": "object", "properties": {
+                "cluster": cl, "hours": hrs},
+                "required": []}}},
+    ]
+
+
+async def run_tool(name: str, args: dict) -> str:
+    """Выполнить инструмент и вернуть текст для модели."""
+    cname   = str(args.get("cluster") or "").strip()
+    cluster = find_cluster(cname) if cname else None
+    hours   = min(float(args.get("hours") or 6), MAX_METRICS_HOURS)
+
+    if name in ("get_current_metrics", "get_history", "get_breakdown",
+                "run_diagnostics", "run_sql", "read_logs") and not cluster:
+        return f"Кластер «{cname}» не найден. Доступные: " + \
+               ", ".join(c["name"] for c in enabled_clusters())
+
+    try:
+        if name == "get_current_metrics":
+            return fmt_current(await collect_current(cluster))
+
+        if name == "get_history":
+            hist  = await collect_history(cluster, hours)
+            parts = [fmt_history(hist, cluster["label"])]
+            base  = await collect_baseline(cluster, hours)
+            cmp_  = fmt_baseline(hist, base, cluster["label"])
+            if cmp_:
+                parts.append(cmp_)
+            return "\n\n".join(parts)
+
+        if name == "get_breakdown":
+            step = int(args.get("step_seconds") or 300)
+            tabs = await collect_series_tables(cluster, hours, max(step, 15))
+            return "\n\n".join(fmt_series_table(t, cluster["label"]) for t in tabs)
+
+        if name == "run_diagnostics":
+            out = []
+            for ip, role in cluster_hosts(cluster):
+                diag = await run_diagnostics(cluster, ip)
+                if diag:
+                    out.append(fmt_diagnostics(
+                        diag, f"{cluster['label']} · {role}", ip))
+            cfg = await collect_config_diff(cluster)
+            if cfg:
+                out.append(cfg)
+            plans = await explain_top_queries(cluster, cluster["primary_ip"])
+            if plans:
+                out.append(plans)
+            return "\n\n".join(out) or "Диагностика недоступна: не задан db_user."
+
+        if name == "run_sql":
+            return fmt_sql_result(
+                await sql_execute(cluster, str(args.get("sql") or "")))
+
+        if name == "read_logs":
+            out = []
+            for ip, role in cluster_hosts(cluster):
+                t = await remote_time(ip)
+                if t is None:
+                    out.append(f"{ip}: сервер недоступен по SSH")
+                    continue
+                ue, se = t["epoch"], t["epoch"] - hours * 3600
+                lu = t["local"]
+                ls = lu - datetime.timedelta(hours=hours)
+                flt = str(args.get("filter") or "")
+                out.append(await read_slow_log(cluster, ip, ls, lu, flt, se, ue))
+                app = await read_app_log(cluster, ip, ls, lu, flt, se, ue)
+                if app:
+                    out.append(app)
+            return "\n\n".join(p for p in out if p) or "Логи прочитать не удалось."
+
+        if name == "get_alerts":
+            rows = alerts_query(cluster=cluster["name"] if cluster else None,
+                                hours=hours, limit=20)
+            return fmt_alerts(rows, f"последние {hours:g} ч.",
+                              cluster["label"] if cluster else None)
+
+        return f"Неизвестный инструмент: {name}"
+    except Exception as e:
+        logger.error(f"Инструмент {name} упал: {e}")
+        return f"Инструмент {name} завершился ошибкой: {e}"
+
+
+async def llm_probe_tools() -> bool:
+    """Поддерживает ли эндпоинт инструменты. Проверяем один раз."""
+    global TOOLS_SUPPORTED
+    if TOOLS_SUPPORTED is not None:
+        return TOOLS_SUPPORTED
+    if LLM_TOOLS == "off":
+        TOOLS_SUPPORTED = False
+        return False
+    if LLM_TOOLS == "on":
+        TOOLS_SUPPORTED = True
+        return True
+    try:
+        headers = {"Content-Type": "application/json",
+                   "Authorization": AUTH_HEADER}
+        payload = {"model": LLM_MODEL, "max_tokens": 16,
+                   "messages": [{"role": "user", "content": "ping"}],
+                   "tools": tool_specs()[:1]}
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(f"{LLM_BASE_URL}/chat/completions",
+                                  headers=headers, json=payload)
+        TOOLS_SUPPORTED = r.status_code == 200
+    except Exception as e:
+        logger.warning(f"Проверка поддержки инструментов не удалась: {e}")
+        TOOLS_SUPPORTED = False
+    logger.info("Инструменты LLM: %s",
+                "поддерживаются" if TOOLS_SUPPORTED else
+                "не поддерживаются, работаем по ключевым словам")
+    return TOOLS_SUPPORTED
+
+
+async def llm_with_tools(messages: list) -> tuple:
+    """Диалог с инструментами. Возвращает (сообщения для финального ответа,
+    список выполненных инструментов)."""
+    headers = {"Content-Type": "application/json", "Authorization": AUTH_HEADER}
+    used = []
+    convo = list(messages)
+
+    for _ in range(LLM_TOOL_ROUNDS):
+        payload = {"model": LLM_MODEL, "max_tokens": LLM_MAX_TOKENS,
+                   "temperature": LLM_TEMPERATURE, "messages": convo,
+                   "tools": tool_specs(), "tool_choice": "auto"}
+        try:
+            async with httpx.AsyncClient(timeout=90) as client:
+                r = await client.post(f"{LLM_BASE_URL}/chat/completions",
+                                      headers=headers, json=payload)
+                r.raise_for_status()
+                msg = r.json()["choices"][0]["message"]
+        except Exception as e:
+            logger.error(f"Раунд с инструментами не удался: {e}")
+            break
+
+        calls = msg.get("tool_calls") or []
+        if not calls:
+            break                      # модель готова отвечать
+
+        convo.append(msg)
+        for call in calls:
+            fn = call.get("function", {})
+            name = fn.get("name", "")
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            logger.info(f"Инструмент: {name} {args}")
+            result = await run_tool(name, args)
+            used.append(name)
+            convo.append({"role": "tool", "tool_call_id": call.get("id", ""),
+                          "name": name, "content": result[:20000]})
+    return convo, used
+
+
 async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], float]:
     """Определить кластер и временное окно, собрать контекст метрик."""
     cluster = detect_cluster_in_text(user_message)
@@ -2516,6 +3068,14 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
         if hours > 0:
             hist = await collect_history(cluster, hours)
             blocks.append(fmt_history(hist, cluster["label"]))
+            # С чем сравнивать: те же метрики неделю назад
+            try:
+                base = await collect_baseline(cluster, hours)
+                cmp_block = fmt_baseline(hist, base, cluster["label"])
+                if cmp_block:
+                    blocks.append(cmp_block)
+            except Exception as e:
+                logger.error(f"База для сравнения не собрана: {e}")
             # Просили разбивку по интервалам — агрегатов недостаточно:
             # по min/avg/max не видно, когда был всплеск и с чем он совпал
             if detect_breakdown_intent(user_message):
@@ -2542,6 +3102,30 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
                 if diag:
                     blocks.append(fmt_diagnostics(
                         diag, f"{cluster['label']} · {role}", ip))
+
+            # Расхождения параметров между серверами кластера
+            try:
+                cfg = await collect_config_diff(cluster)
+                if cfg:
+                    blocks.append(cfg)
+            except Exception as e:
+                logger.error(f"Сравнение конфигураций не удалось: {e}")
+
+            # Планы выполнения — превращают «запрос медленный»
+            # в конкретную рекомендацию по индексам
+            try:
+                plans = await explain_top_queries(cluster, cluster["primary_ip"])
+                if plans:
+                    blocks.append(plans)
+            except Exception as e:
+                logger.error(f"EXPLAIN не выполнен: {e}")
+
+            # Лента событий: причинно-следственную связь видно сразу
+            tl = build_timeline(alerts_query(
+                cluster=cluster["name"], hours=hours if hours > 0 else 24,
+                limit=40))
+            if tl:
+                blocks.append(tl)
 
         # Логи читаем по SSH с самих серверов. Период приводим к ВРЕМЕНИ
         # СЕРВЕРА: метки в логах пишутся в его часовом поясе, и разница
@@ -2782,7 +3366,10 @@ PUBLIC_PATHS = {"/login", "/api/login", "/api/logout", "/health",
                 # чтобы войти, до них надо дойти без сессии
                 "/auth/oidc/login", "/auth/oidc/callback",
                 # защищён своим токеном, cookie у Zabbix нет
-                "/api/alerts/ingest"}
+                "/api/alerts/ingest",
+                # описание API открыто: иначе внешняя система не узнает
+                # формат запросов. Сами методы остаются закрытыми.
+                "/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"}
 
 
 def _is_public(path: str) -> bool:
@@ -2829,7 +3416,7 @@ class LoginRequest(BaseModel):
     password: str
 
 
-@app.post("/api/login")
+@app.post("/api/login", tags=["Доступ"], summary="Вход")
 def api_login(req: LoginRequest, response: Response):
     if not AUTH_ENABLED:
         return {"ok": True, "username": "anonymous", "source": "disabled"}
@@ -2853,13 +3440,13 @@ def api_login(req: LoginRequest, response: Response):
     return {"ok": True, "username": req.username.strip(), "source": source}
 
 
-@app.post("/api/logout")
+@app.post("/api/logout", tags=["Доступ"], summary="Выход")
 def api_logout(response: Response):
     response.delete_cookie(AUTH_COOKIE, path="/")
     return {"ok": True, "sso_logout_url": SSO_LOGOUT_URL or None}
 
 
-@app.get("/api/me")
+@app.get("/api/me", tags=["Доступ"], summary="Текущий пользователь")
 def api_me(request: Request):
     if not AUTH_ENABLED:
         return {"authenticated": True, "username": "anonymous", "source": "disabled"}
@@ -2966,7 +3553,7 @@ class GrantRequest(BaseModel):
     role: str = "user"
 
 
-@app.get("/api/users")
+@app.get("/api/users", tags=["Доступ"], summary="Список выданных доступов")
 def api_users(request: Request):
     require_admin(request)
     return {"items": users_list(),
@@ -3162,6 +3749,18 @@ async def websocket_chat(ws: WebSocket):
                 "content": f"{context_text}\n\n## Вопрос\n\n{text}",
             })
 
+            # Если эндпоинт умеет инструменты — даём модели дозапросить
+            # недостающее самой, вместо угадывания по ключевым словам.
+            # Собранный контекст остаётся: он покрывает типовые вопросы
+            # без лишних раундов к LLM.
+            if await llm_probe_tools():
+                try:
+                    messages, used = await llm_with_tools(messages)
+                    if used:
+                        await ws.send_json({"type": "tools", "used": used})
+                except Exception as e:
+                    logger.error(f"Режим инструментов не сработал: {e}")
+
             # 3. Стримить ответ
             full_answer = []
             stopped = False
@@ -3292,7 +3891,7 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = "rest"
 
 
-@app.post("/chat")
+@app.post("/chat", tags=["Чат"], summary="Задать вопрос агенту (без стриминга)")
 async def rest_chat(req: ChatRequest):
     """REST-версия чата (без стриминга) — для curl и интеграций."""
     context_text, cluster, hours = await build_chat_context(req.message)
@@ -3324,7 +3923,7 @@ async def rest_chat_get(message: str, session_id: str = "rest"):
     return await rest_chat(ChatRequest(message=message, session_id=session_id))
 
 
-@app.get("/clusters")
+@app.get("/clusters", tags=["Кластеры"], summary="Список кластеров")
 def api_clusters():
     # Не отдаём пароли наружу
     safe = []
@@ -3350,7 +3949,7 @@ async def api_cluster_history(name: str, hours: float = 24):
     return await collect_history(cluster, hours)
 
 
-@app.get("/status")
+@app.get("/status", tags=["Кластеры"], summary="Состояние всех кластеров")
 async def api_all_status():
     clusters = enabled_clusters()
     results  = await asyncio.gather(*[collect_current(c) for c in clusters])
@@ -3370,7 +3969,39 @@ def chat_key_for(request: Request, client_id: str = "") -> str:
     return client_id
 
 
-@app.get("/chat/history")
+
+class FeedbackRequest(BaseModel):
+    rating:    int              # 1 — помог, -1 — не помог
+    question:  str = ""
+    answer:    str = ""
+    comment:   str = ""
+    client_id: str = ""
+
+
+@app.post("/api/feedback", tags=["Чат"], summary="Оценить ответ агента")
+def api_feedback(req: FeedbackRequest, request: Request):
+    """Сохранить оценку ответа. Нужна, чтобы видеть, на каких вопросах
+    агент промахивается."""
+    user = current_user(request) if AUTH_ENABLED else None
+    ok = feedback_save(
+        client_id=req.client_id,
+        username=(user or {}).get("username", ""),
+        rating=req.rating, question=req.question,
+        answer=req.answer, comment=req.comment)
+    if not ok:
+        raise HTTPException(status_code=503, detail="Хранилище недоступно")
+    return {"ok": True}
+
+
+@app.get("/api/feedback/stats", tags=["Чат"],
+         summary="Сводка по оценкам ответов")
+def api_feedback_stats(request: Request, days: int = 30):
+    """Доля полезных ответов и последние отрицательные оценки.
+    Только для администраторов."""
+    require_admin(request)
+    return feedback_stats(days)
+
+@app.get("/chat/history", tags=["Чат"], summary="История переписки")
 def api_chat_history(request: Request, client_id: str = "", limit: int = 50):
     """История чата текущего пользователя (или браузера, если логина нет)."""
     client_id = chat_key_for(request, client_id)
@@ -3381,7 +4012,7 @@ def api_chat_history(request: Request, client_id: str = "", limit: int = 50):
             "retention_days": CHATS_RETENTION_DAYS, "persistent": CHATS_DB_OK}
 
 
-@app.delete("/chat/history")
+@app.delete("/chat/history", tags=["Чат"], summary="Очистить свою историю")
 def api_chat_history_clear(request: Request, client_id: str = ""):
     """Забыть свою историю."""
     client_id = chat_key_for(request, client_id)
@@ -3420,7 +4051,7 @@ def check_ingest_token(request: Request) -> bool:
     return any(hmac.compare_digest(supplied, t) for t in INGEST_TOKENS)
 
 
-@app.post("/api/alerts/ingest")
+@app.post("/api/alerts/ingest", tags=["События"], summary="Зарегистрировать событие из внешней системы")
 async def api_alert_ingest(payload: IngestAlert, request: Request):
     """Зарегистрировать алерт из внешней системы и разобрать его через LLM.
 
@@ -3506,7 +4137,7 @@ async def api_alert_ingest(payload: IngestAlert, request: Request):
             "cluster": cluster["name"] if cluster else None,
             "source": payload.source, "analyzed": not analysis.startswith("Разбор не выполнен")}
 
-@app.delete("/api/alerts/{alert_id}")
+@app.delete("/api/alerts/{alert_id}", tags=["События"], summary="Удалить запись истории")
 def api_alert_delete(alert_id: int, request: Request):
     """Удалить одну запись истории алертов. Только для администраторов."""
     require_admin(request)
@@ -3515,7 +4146,7 @@ def api_alert_delete(alert_id: int, request: Request):
     return {"ok": True, "id": alert_id}
 
 
-@app.delete("/api/alerts")
+@app.delete("/api/alerts", tags=["События"], summary="Удалить все записи одного типа")
 def api_alerts_delete_by_name(request: Request, name: str = ""):
     """Удалить все записи одного типа — например, пачку ложных
     ReplicationLagCritical, нагенерированных ошибочным правилом."""
@@ -3534,7 +4165,7 @@ class SqlRequest(BaseModel):
     host:    str = ""      # пусто = primary
 
 
-@app.post("/api/query")
+@app.post("/api/query", tags=["Диагностика"], summary="Читающий SQL-запрос к кластеру")
 async def api_query(req: SqlRequest, request: Request):
     """Читающий SQL-запрос к кластеру. Только для администраторов."""
     require_admin(request)
@@ -3548,7 +4179,7 @@ async def api_query(req: SqlRequest, request: Request):
 
 
 
-@app.get("/api/diagnose/{name}")
+@app.get("/api/diagnose/{name}", tags=["Диагностика"], summary="Диагностический набор Performance Schema")
 async def api_diagnose(name: str, request: Request, host: str = "",
                        keys: str = ""):
     """Диагностический набор по кластеру. Требует прав администратора."""
@@ -3574,14 +4205,14 @@ async def api_diagnose(name: str, request: Request, host: str = "",
         ],
     }
 
-@app.get("/api/db/versions")
+@app.get("/api/db/versions", tags=["Диагностика"], summary="Версии MySQL по кластерам")
 def api_db_versions(request: Request):
     """Версии MySQL, полученные на старте."""
     return {"versions": DB_VERSIONS,
             "clusters_without_creds": [
                 c["name"] for c in enabled_clusters() if not cluster_db_creds(c)]}
 
-@app.get("/api/series/{name}")
+@app.get("/api/series/{name}", tags=["Метрики"], summary="Детальная статистика по интервалам")
 async def api_series(name: str, hours: float = 6, step: int = 300,
                      format: str = "json"):
     """Детальная статистика по интервалам: ресурсы ОС + основное по СУБД.
@@ -3632,7 +4263,7 @@ async def api_series(name: str, hours: float = 6, step: int = 300,
         ],
     }
 
-@app.get("/api/charts/{name}")
+@app.get("/api/charts/{name}", tags=["Метрики"], summary="Ряды для графиков")
 async def api_charts(name: str, hours: float = 6, keys: str = ""):
     """Ряды для графиков по кластеру. keys — список ключей через запятую."""
     cluster = find_cluster(name)
@@ -3643,7 +4274,7 @@ async def api_charts(name: str, hours: float = 6, keys: str = ""):
     return {"cluster": cluster["name"], "cluster_label": cluster["label"],
             "hours": hours, "charts": charts}
 
-@app.get("/alerts/history")
+@app.get("/alerts/history", tags=["События"], summary="История алертов с разбором ИИ")
 def api_alerts(limit: int = 30):
     total, items = alerts_load(limit)
     return {"total": total, "items": items,
@@ -3651,7 +4282,7 @@ def api_alerts(limit: int = 30):
             "persistent": ALERTS_DB_OK}
 
 
-@app.get("/health")
+@app.get("/health", tags=["Служебное"], summary="Проверка живости")
 def health():
     return {
         "status":    "ok",
@@ -3661,7 +4292,7 @@ def health():
     }
 
 
-@app.get("/config")
+@app.get("/config", tags=["Служебное"], summary="Действующая конфигурация")
 def config_info():
     return {
         "llm_base_url":    LLM_BASE_URL,
