@@ -1489,11 +1489,179 @@ def db_versions_text() -> str:
         if v:
             lines.append(f"  {c['label']}: {v}")
     return "\n".join(lines) if len(lines) > 1 else ""
+
+
 # ══════════════════════════════════════════════════════════════════════════════
+#  ДИАГНОСТИЧЕСКИЙ НАБОР
+#  Готовые читающие запросы по методике из документации MySQL (Performance
+#  Schema) и представлений sys. Агент выполняет их сам и подкладывает
+#  результаты в разбор — вместо того чтобы советовать «посмотрите сами».
+#  Все запросы проходят тот же валидатор, что и запросы пользователя.
+# ══════════════════════════════════════════════════════════════════════════════
+
+DIAG_QUERIES = [
+    {
+        "key": "top_queries", "title": "Самые тяжёлые запросы (по суммарному времени)",
+        "why": "показывает, куда реально уходит время сервера",
+        "sql": """SELECT DIGEST_TEXT AS query, COUNT_STAR AS calls,
+       ROUND(SUM_TIMER_WAIT/1e12, 2) AS total_sec,
+       ROUND(AVG_TIMER_WAIT/1e9, 2)  AS avg_ms,
+       SUM_ROWS_EXAMINED AS rows_examined, SUM_ROWS_SENT AS rows_sent
+  FROM performance_schema.events_statements_summary_by_digest
+ WHERE SCHEMA_NAME IS NOT NULL
+ ORDER BY SUM_TIMER_WAIT DESC LIMIT 10""",
+    },
+    {
+        "key": "full_scans", "title": "Запросы с полным сканированием таблиц",
+        "why": "нехватка индексов — самая частая причина роста нагрузки",
+        "sql": """SELECT DIGEST_TEXT AS query, COUNT_STAR AS calls,
+       SUM_ROWS_EXAMINED AS rows_examined,
+       ROUND(SUM_TIMER_WAIT/1e12, 2) AS total_sec
+  FROM performance_schema.events_statements_summary_by_digest
+ WHERE SUM_NO_INDEX_USED > 0 AND SCHEMA_NAME IS NOT NULL
+ ORDER BY SUM_TIMER_WAIT DESC LIMIT 10""",
+    },
+    {
+        "key": "active", "title": "Активные сессии прямо сейчас",
+        "why": "видно долгие и подвисшие запросы",
+        "sql": """SELECT ID, USER, HOST, DB, COMMAND, TIME, STATE,
+       LEFT(INFO, 200) AS query
+  FROM information_schema.PROCESSLIST
+ WHERE COMMAND <> 'Sleep'
+ ORDER BY TIME DESC LIMIT 20""",
+    },
+    {
+        "key": "waits", "title": "Ожидания по типам событий",
+        "why": "различает упор в диск, в блокировки и в сеть",
+        "sql": """SELECT EVENT_NAME, COUNT_STAR AS waits,
+       ROUND(SUM_TIMER_WAIT/1e12, 2) AS total_sec
+  FROM performance_schema.events_waits_summary_global_by_event_name
+ WHERE COUNT_STAR > 0 AND EVENT_NAME <> 'idle'
+ ORDER BY SUM_TIMER_WAIT DESC LIMIT 15""",
+    },
+    {
+        "key": "table_io", "title": "Таблицы с наибольшим вводом-выводом",
+        "why": "указывает, какие таблицы греют диск",
+        "sql": """SELECT OBJECT_SCHEMA AS db, OBJECT_NAME AS tbl,
+       COUNT_READ AS reads, COUNT_WRITE AS writes,
+       ROUND(SUM_TIMER_WAIT/1e12, 2) AS total_sec
+  FROM performance_schema.table_io_waits_summary_by_table
+ WHERE OBJECT_SCHEMA NOT IN ('mysql','performance_schema','sys')
+ ORDER BY SUM_TIMER_WAIT DESC LIMIT 10""",
+    },
+    {
+        "key": "file_io", "title": "Файлы с наибольшим вводом-выводом",
+        "why": "подтверждает или опровергает упор в диск",
+        "sql": """SELECT FILE_NAME AS file, COUNT_READ AS reads, COUNT_WRITE AS writes,
+       ROUND(SUM_NUMBER_OF_BYTES_READ/1048576, 1)  AS read_mb,
+       ROUND(SUM_NUMBER_OF_BYTES_WRITE/1048576, 1) AS write_mb
+  FROM performance_schema.file_summary_by_instance
+ ORDER BY SUM_TIMER_WAIT DESC LIMIT 10""",
+    },
+    {
+        "key": "locks", "title": "Ожидания блокировок",
+        "why": "кто кого блокирует прямо сейчас",
+        "sql": """SELECT waiting_pid, waiting_query, blocking_pid, blocking_query,
+       wait_age
+  FROM sys.innodb_lock_waits LIMIT 10""",
+        "optional": True,
+    },
+    {
+        "key": "unused_idx", "title": "Неиспользуемые индексы",
+        "why": "лишние индексы замедляют запись и занимают память",
+        "sql": """SELECT object_schema AS db, object_name AS tbl, index_name
+  FROM sys.schema_unused_indexes LIMIT 20""",
+        "optional": True,
+    },
+    {
+        "key": "conn", "title": "Подключения и потоки",
+        "why": "показывает упор в max_connections и отказы",
+        "sql": """SHOW GLOBAL STATUS WHERE Variable_name IN
+       ('Threads_connected','Threads_running','Max_used_connections',
+        'Aborted_connects','Connection_errors_max_connections')""",
+    },
+    {
+        "key": "innodb", "title": "Состояние InnoDB",
+        "why": "буферный пул, ожидания строк, дедлоки",
+        "sql": "SHOW ENGINE INNODB STATUS",
+        "optional": True,
+    },
+]
+
+DIAG_KEYWORDS = (
+    "диагностик", "продиагностируй", "разбер", "почему медленн", "тормоз",
+    "что не так", "найди проблем", "узкое место", "боттлнек", "bottleneck",
+    "оптимизир", "почему тормозит", "проверь бд", "проверь базу",
+)
+
+
+def detect_diagnose_intent(text: str) -> bool:
+    t = text.lower()
+    return any(kw in t for kw in DIAG_KEYWORDS)
+
+
+def run_diagnostics(cluster: dict, host: Optional[str] = None,
+                    keys: Optional[list] = None) -> list:
+    """Выполнить диагностический набор. Недоступные запросы пропускаются:
+    sys.innodb_lock_waits и часть представлений есть не во всех сборках."""
+    if not cluster_db_creds(cluster):
+        return []
+    out = []
+    for q in DIAG_QUERIES:
+        if keys and q["key"] not in keys:
+            continue
+        res = sql_run(cluster, q["sql"], host)
+        if res.get("error"):
+            # необязательные молча пропускаем — иначе половина отчёта
+            # состояла бы из «нет доступа к sys»
+            if not q.get("optional"):
+                out.append({**q, "result": res})
+            else:
+                logger.info(f"Диагностика: {q['key']} пропущен ({res['error'][:80]})")
+            continue
+        out.append({**q, "result": res})
+    return out
+
+
+def fmt_diagnostics(items: list, label: str, host: str) -> str:
+    if not items:
+        return ""
+    head = [f"## Диагностика {label} ({host})", "",
+            "  Данные собраны агентом по методике Performance Schema.",
+            "  Опирайся на них, а не на общие рекомендации.", ""]
+    for it in items:
+        head.append(f"### {it['title']} — {it['why']}")
+        head.append(fmt_sql_result(it["result"]).split("\n", 1)[1].lstrip("\n"))
+        head.append("")
+    return "\n".join(head)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def now_text() -> str:
+    """Текущие дата и время для промпта.
+
+    Без этого модель берёт дату из своих обучающих данных и уверенно пишет
+    позапрошлый год — а все выводы про «вчера» и «на прошлой неделе»
+    оказываются про не тот период.
+    """
+    MONTHS = ("января", "февраля", "марта", "апреля", "мая", "июня", "июля",
+              "августа", "сентября", "октября", "ноября", "декабря")
+    DAYS = ("понедельник", "вторник", "среда", "четверг",
+            "пятница", "суббота", "воскресенье")
+    utc   = datetime.datetime.utcnow()
+    local = datetime.datetime.now()
+    return (f"СЕГОДНЯ: {local.day} {MONTHS[local.month - 1]} {local.year} года, "
+            f"{DAYS[local.weekday()]}, {local:%H:%M} по времени сервера "
+            f"({utc:%Y-%m-%d %H:%M} UTC).\n"
+            f"Дата в формате ISO: {local:%Y-%m-%d}. Текущий год: {local.year}.\n"
+            f"Считай «сегодня», «вчера», «на прошлой неделе» ОТ ЭТОЙ ДАТЫ, "
+            f"а не от даты из своих обучающих данных.")
+
 
 def system_prompt() -> str:
     return f"""Ты — опытный DBA и SRE со специализацией на MySQL/InnoDB и репликации.
 Ты обслуживаешь MySQL-кластеры (primary + replica) в разных городах.
+
+{now_text()}
 
 Доступные кластеры:
 {clusters_index_text()}
@@ -1551,7 +1719,21 @@ def system_prompt() -> str:
     и разный SHOW). Агент умеет только ЧИТАТЬ: не предлагай ему выполнить
     INSERT/UPDATE/DELETE/ALTER — такие запросы отклоняются. Команды на
     изменение давай пользователю для ручного выполнения, отдельно и с
-    предупреждением."""
+    предупреждением.
+
+11. ДИАГНОСТИКА. Если приложен блок «Диагностика …» — агент уже выполнил
+    набор запросов Performance Schema. Разбирай по методике:
+      1) есть ли проблема вообще — по метрикам и активным сессиям;
+      2) куда уходит время — самые тяжёлые запросы по суммарному времени,
+         а не по числу вызовов;
+      3) почему они тяжёлые — полное сканирование, ожидания блокировок,
+         ввод-вывод по таблицам и файлам;
+      4) упирается ли в ресурсы сервера — сопоставь с CPU, iowait, памятью;
+      5) что делать — конкретные индексы, переписывание запросов, параметры.
+    Называй конкретные запросы (DIGEST_TEXT), таблицы и цифры из блока.
+    Общие советы уровня «включите slow query log» без опоры на эти данные
+    не давай — данные уже собраны. Если часть запросов отсутствует
+    (нет прав или представлений sys), скажи об этом и какие права нужны."""
 
 
 def fmt_alerts(rows: list[dict], period: str, label: Optional[str] = None) -> str:
@@ -1869,6 +2051,16 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
         user_sql = extract_sql(user_message)
         if user_sql and cluster_db_creds(cluster):
             blocks.append(fmt_sql_result(sql_run(cluster, user_sql)))
+
+        # Просят разобраться, почему медленно — собираем диагностический
+        # набор сами, по каждому серверу. Советовать «посмотрите
+        # performance_schema» бессмысленно, если можно просто посмотреть.
+        if detect_diagnose_intent(user_message) and cluster_db_creds(cluster):
+            for ip, role in cluster_hosts(cluster):
+                diag = run_diagnostics(cluster, ip)
+                if diag:
+                    blocks.append(fmt_diagnostics(
+                        diag, f"{cluster['label']} · {role}", ip))
     else:
         # Обзор всех
         clusters = enabled_clusters()
@@ -2389,10 +2581,16 @@ async def websocket_chat(ws: WebSocket):
             if not text:
                 continue
 
-            # Пользователь опознаётся по client_id из localStorage браузера.
-            # Если его нет (старый клиент) — работаем как раньше, по session_id.
-            cid = str(msg.get("client_id") or "").strip()[:128]
+            # Чей это разговор. Когда включена аутентификация, ключ — ИМЯ
+            # ПОЛЬЗОВАТЕЛЯ: агентом пользуются несколько человек, и history
+            # одного не должна попадать в контекст другого. По браузеру
+            # (client_id) делим только когда логина нет вовсе — иначе двое
+            # за одной машиной видели бы переписку друг друга, а один человек
+            # с ноутбука и с телефона имел бы две несвязанные истории.
+            browser_id = str(msg.get("client_id") or "").strip()[:128]
             fp  = str(msg.get("fingerprint") or "").strip()[:128]
+            cid = (f"user:{norm_username(ws_user['username'])}"
+                   if ws_user else browser_id)
             key = cid or sid
 
             history = ws_sessions.get(key)
@@ -2642,9 +2840,22 @@ async def api_all_status():
 
 
 
+def chat_key_for(request: Request, client_id: str = "") -> str:
+    """Ключ истории: вошедший пользователь важнее переданного client_id.
+
+    Иначе, зная чужой client_id, можно было бы прочитать чужую переписку.
+    """
+    if AUTH_ENABLED:
+        user = current_user(request)
+        if user:
+            return f"user:{norm_username(user['username'])}"
+    return client_id
+
+
 @app.get("/chat/history")
-def api_chat_history(client_id: str = "", limit: int = 50):
-    """История чата конкретного браузера (client_id из localStorage)."""
+def api_chat_history(request: Request, client_id: str = "", limit: int = 50):
+    """История чата текущего пользователя (или браузера, если логина нет)."""
+    client_id = chat_key_for(request, client_id)
     if not client_id:
         raise HTTPException(status_code=400, detail="client_id обязателен")
     items = chat_load(client_id, limit)
@@ -2653,8 +2864,9 @@ def api_chat_history(client_id: str = "", limit: int = 50):
 
 
 @app.delete("/chat/history")
-def api_chat_history_clear(client_id: str = ""):
-    """Забыть историю этого браузера."""
+def api_chat_history_clear(request: Request, client_id: str = ""):
+    """Забыть свою историю."""
+    client_id = chat_key_for(request, client_id)
     if not client_id:
         raise HTTPException(status_code=400, detail="client_id обязателен")
     removed = chat_clear(client_id)
@@ -2816,6 +3028,32 @@ def api_query(req: SqlRequest, request: Request):
         raise HTTPException(status_code=400, detail=res["error"])
     return res
 
+
+
+@app.get("/api/diagnose/{name}")
+def api_diagnose(name: str, request: Request, host: str = "", keys: str = ""):
+    """Диагностический набор по кластеру. Требует прав администратора."""
+    require_admin(request)
+    cluster = find_cluster(name)
+    if not cluster:
+        raise HTTPException(status_code=404, detail="Кластер не найден")
+    if not cluster_db_creds(cluster):
+        raise HTTPException(status_code=400,
+                            detail="Для кластера не задан db_user")
+    wanted = [k.strip() for k in keys.split(",") if k.strip()] or None
+    hosts  = [(host, "указанный")] if host else cluster_hosts(cluster)
+    return {
+        "cluster": cluster["name"], "cluster_label": cluster["label"],
+        "available_checks": [{"key": q["key"], "title": q["title"]}
+                             for q in DIAG_QUERIES],
+        "servers": [
+            {"host": ip, "role": role,
+             "checks": [{"key": d["key"], "title": d["title"],
+                         "result": d["result"]}
+                        for d in run_diagnostics(cluster, ip, wanted)]}
+            for ip, role in hosts
+        ],
+    }
 
 @app.get("/api/db/versions")
 def api_db_versions(request: Request):
