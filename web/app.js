@@ -237,7 +237,10 @@ const App = (() => {
     }
     state.awaitingReply = false;
     $('input').disabled = false;
+    $('send-btn').style.display = '';
     $('send-btn').disabled = false;
+    $('stop-btn').style.display = 'none';
+    $('stop-btn').disabled = false;
     $('input').focus();
     scrollToBottom();
   }
@@ -275,7 +278,8 @@ const App = (() => {
     input.value    = '';
     autoResize(input);
     input.disabled = true;
-    $('send-btn').disabled = true;
+    $('send-btn').style.display = 'none';
+    $('stop-btn').style.display = '';
 
     state.ws.send(JSON.stringify({
       type:       'message',
@@ -284,6 +288,13 @@ const App = (() => {
       client_id:   state.clientId,
       fingerprint: state.fingerprint,
     }));
+  }
+
+  function stopGeneration() {
+    if (!state.awaitingReply) return;
+    // Сервер прервёт стрим и пришлёт done — там же снимем блокировку ввода
+    if (state.wsReady) state.ws.send(JSON.stringify({ type: 'stop' }));
+    $('stop-btn').disabled = true;
   }
 
   function addMsg(role, text, metaText) {
@@ -871,6 +882,7 @@ const App = (() => {
     });
     input.addEventListener('input', () => autoResize(input));
     $('send-btn').addEventListener('click', sendMessage);
+    $('stop-btn').addEventListener('click', stopGeneration);
   }
 
   document.addEventListener('DOMContentLoaded', init);
@@ -879,5 +891,6 @@ const App = (() => {
   return { showTab, pickCluster, useSuggestion, toggleAnalysis,
            loadStatus, loadAlerts, refreshClusters, forgetHistory, logout,
            loadAccess, searchDirectory, grantFound, grantAgain,
-           grantManual, revokeAccess, deleteAlert, deleteAlertsByName };
+           grantManual, revokeAccess, deleteAlert, deleteAlertsByName,
+           stopGeneration };
 })();

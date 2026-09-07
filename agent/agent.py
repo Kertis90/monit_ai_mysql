@@ -979,6 +979,10 @@ HISTORY_KEYWORDS = (
     "статистик", "средн", "пик", "максимум за", "минимум за",
 )
 DEFAULT_HISTORY_HOURS = 24.0
+# Потолок окна для МЕТРИК: за более длинный период выборка распухает,
+# а пользы в разборе не прибавляется. История алертов живёт отдельно
+# и этим потолком не ограничена (ALERTS_RETENTION_DAYS).
+MAX_METRICS_HOURS = float(os.environ.get("MAX_METRICS_HOURS", "24"))
 
 
 def detect_history_intent(text: str) -> bool:
@@ -1486,28 +1490,30 @@ def detect_breakdown_intent(text: str) -> bool:
 
 
 async def collect_series_table(cluster: dict, hours: float, step_s: int,
-                               max_rows: Optional[int] = None) -> dict:
-    """Ряды всех показателей на общей сетке времени.
+                               max_rows: Optional[int] = None,
+                               host: Optional[str] = None,
+                               role: str = "primary") -> dict:
+    """Ряды всех показателей ОДНОГО СЕРВЕРА на общей сетке времени.
 
-    max_rows — бюджет строк: когда таблиц несколько (вопрос без названия
-    города), общий лимит делится между кластерами.
+    host — адрес сервера; по умолчанию primary. У кластера с репликой серверов
+    два, ресурсы у них разные, и сводить их в одну таблицу нельзя.
+
+    max_rows — бюджет строк: когда таблиц несколько, общий лимит делится.
     """
     limit = max_rows or SERIES_MAX_ROWS
-    prim = cluster["primary_ip"]
-    ctx  = {"inst": f"{prim}:9104", "node": f"{prim}:9100"}
+    ip    = host or cluster["primary_ip"]
+    ctx   = {"inst": f"{ip}:9104", "node": f"{ip}:9100"}
 
-    # Шаг не может быть мельче реальности и не должен раздувать таблицу
     points = int(hours * 3600 / max(step_s, 15))
     if points > limit:
         step_s = int(hours * 3600 / limit)
-        # округляем вверх до целых минут — «по 7 минут» читается странно
         step_s = max(int((step_s + 59) // 60) * 60, 60)
         adjusted = True
     else:
         adjusted = False
 
-    # Окно rate() берём равным шагу, но не меньше 1 минуты, иначе на редкой
-    # сетке rate посчитается по одной точке и даст пустоту
+    # Окно rate() не меньше минуты: на редкой сетке иначе считается по одной
+    # точке и даёт пустоту
     w = f"{max(step_s, 60)}s"
 
     end   = datetime.datetime.utcnow()
@@ -1533,10 +1539,33 @@ async def collect_series_table(cluster: dict, hours: float, step_s: int,
         series = await asyncio.gather(
             *[one(client, expr.format(w=w, **ctx)) for _, expr in SERIES_SPECS])
 
-    names = [n for n, _ in SERIES_SPECS]
+    names  = [n for n, _ in SERIES_SPECS]
     stamps = sorted({t for s in series for t in s})
     return {"step_s": step_s, "adjusted": adjusted, "hours": hours,
+            "host": ip, "role": role,
             "names": names, "stamps": stamps, "series": series}
+
+
+def cluster_hosts(cluster: dict) -> list:
+    """[(адрес, роль)] всех серверов кластера — primary и, если есть, replica."""
+    hosts = [(cluster["primary_ip"], "primary")]
+    if cluster.get("replica_ip"):
+        hosts.append((cluster["replica_ip"], "replica"))
+    return hosts
+
+
+async def collect_series_tables(cluster: dict, hours: float, step_s: int,
+                                max_rows: Optional[int] = None) -> list:
+    """Отдельная таблица на КАЖДЫЙ сервер кластера.
+
+    Раньше отдавалась одна таблица по primary, и статистика реплики просто
+    терялась — при вопросе про кластер с двумя серверами это неверно.
+    """
+    hosts  = cluster_hosts(cluster)
+    budget = max((max_rows or SERIES_MAX_ROWS) // len(hosts), 40)
+    return list(await asyncio.gather(
+        *[collect_series_table(cluster, hours, step_s, budget, ip, role)
+          for ip, role in hosts]))
 
 
 def fmt_series_table(data: dict, label: str) -> str:
@@ -1548,7 +1577,8 @@ def fmt_series_table(data: dict, label: str) -> str:
     step_min = data["step_s"] / 60
     step_txt = (f"{step_min:.0f} мин" if step_min >= 1
                 else f"{data['step_s']} с")
-    head = [f"## Детальная статистика {label}: шаг {step_txt}, "
+    who = f"{label} · {data.get('role', 'primary')} {data.get('host', '')}"
+    head = [f"## Детальная статистика {who}: шаг {step_txt}, "
             f"период {data['hours']:g} ч, точек {len(stamps)}"]
     if data["adjusted"]:
         head.append("  (шаг увеличен: запрошенный дал бы слишком длинную "
@@ -1584,6 +1614,17 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
     hours   = detect_time_hours(user_message)
     blocks  = []
 
+    # Обрезаем окно метрик, но не молча: если просили неделю, а отдаём сутки,
+    # LLM должна об этом сказать, иначе ответ будет вводить в заблуждение.
+    asked_hours = hours
+    if hours > MAX_METRICS_HOURS:
+        hours = MAX_METRICS_HOURS
+        blocks.append(
+            f"## Ограничение периода\n\n"
+            f"  Запрошено {asked_hours:g} ч, метрики отданы за последние "
+            f"{hours:g} ч — это максимум для одного разбора.\n"
+            f"  Обязательно предупреди об этом в ответе.")
+
     if cluster:
         if hours > 0:
             hist = await collect_history(cluster, hours)
@@ -1591,9 +1632,11 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
             # Просили разбивку по интервалам — агрегатов недостаточно:
             # по min/avg/max не видно, когда был всплеск и с чем он совпал
             if detect_breakdown_intent(user_message):
-                step  = parse_step_seconds(user_message) or 300
-                table = await collect_series_table(cluster, hours, step)
-                blocks.append(fmt_series_table(table, cluster["label"]))
+                step = parse_step_seconds(user_message) or 300
+                # по таблице на каждый сервер: у кластера с репликой их два,
+                # и ресурсы у них разные
+                for tb in await collect_series_tables(cluster, hours, step):
+                    blocks.append(fmt_series_table(tb, cluster["label"]))
         current = await collect_current(cluster)
         blocks.append(fmt_current(current))
     else:
@@ -1627,11 +1670,12 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
                 step = parse_step_seconds(user_message) or 300
                 # бюджет строк делим между кластерами, иначе контекст распухнет
                 budget = max(SERIES_MAX_ROWS // max(len(clusters), 1), 40)
-                tables = await asyncio.gather(
-                    *[collect_series_table(c, hours, step, budget)
+                grouped = await asyncio.gather(
+                    *[collect_series_tables(c, hours, step, budget)
                       for c in clusters])
-                for c, tb in zip(clusters, tables):
-                    blocks.append(fmt_series_table(tb, c["label"]))
+                for c, tables in zip(clusters, grouped):
+                    for tb in tables:
+                        blocks.append(fmt_series_table(tb, c["label"]))
 
     # Спросили про алерты/инциденты — подмешиваем историю из БД
     if detect_alert_intent(user_message):
@@ -2061,6 +2105,7 @@ async def websocket_chat(ws: WebSocket):
       Сервер → {"type": "done"}                                     — конец ответа
       Сервер → {"type": "error",    "text": "..."}
       Клиент → {"type": "ping"} / Сервер → {"type": "pong"}
+      Клиент → {"type": "stop"}  — прервать генерацию текущего ответа
     """
     await ws.accept()
 
@@ -2079,21 +2124,34 @@ async def websocket_chat(ws: WebSocket):
     logger.info(f"WS connected: {session_id}"
                 + (f" user={ws_user['username']}" if ws_user else ""))
 
-    try:
+    # Пока идёт стриминг, основной цикл занят и receive_text() не вызывается —
+    # значит «стоп» никто бы не услышал. Поэтому чтение вынесено в отдельную
+    # задачу: она разбирает служебные сообщения сразу, а вопросы кладёт в очередь.
+    inbox: asyncio.Queue = asyncio.Queue()
+    stop_event = asyncio.Event()
+
+    async def reader():
         while True:
             raw = await ws.receive_text()
             try:
-                msg = json.loads(raw)
+                m = json.loads(raw)
             except json.JSONDecodeError:
                 await ws.send_json({"type": "error", "text": "Невалидный JSON"})
                 continue
-
-            if msg.get("type") == "ping":
+            kind = m.get("type")
+            if kind == "ping":
                 await ws.send_json({"type": "pong"})
-                continue
+            elif kind == "stop":
+                stop_event.set()
+            elif kind == "message":
+                await inbox.put(m)
 
-            if msg.get("type") != "message":
-                continue
+    reader_task = asyncio.create_task(reader())
+
+    try:
+        while True:
+            msg = await inbox.get()
+            stop_event.clear()
 
             text = msg.get("text", "").strip()
             sid  = msg.get("session_id", session_id)
@@ -2159,12 +2217,23 @@ async def websocket_chat(ws: WebSocket):
 
             # 3. Стримить ответ
             full_answer = []
+            stopped = False
             async for token in llm_stream(messages):
+                if stop_event.is_set():
+                    stopped = True
+                    break
                 full_answer.append(token)
                 await ws.send_json({"type": "token", "text": token})
 
             answer = "".join(full_answer)
-            await ws.send_json({"type": "done"})
+            if stopped:
+                # Прерванный ответ всё равно сохраняем: пользователь его видел,
+                # и в следующем вопросе на него может ссылаться.
+                answer += "\n\n[генерация остановлена]"
+                await ws.send_json({"type": "token",
+                                    "text": "\n\n[остановлено]"})
+                logger.info(f"Генерация остановлена пользователем: {sid}")
+            await ws.send_json({"type": "done", "stopped": stopped})
 
             # 4. Сохранить историю (без огромного контекста метрик)
             history.append({"role": "user",      "content": text})
@@ -2183,6 +2252,13 @@ async def websocket_chat(ws: WebSocket):
         try:
             await ws.close()
         except Exception:
+            pass
+    finally:
+        # Без этого задача-читатель переживёт соединение и повиснет
+        reader_task.cancel()
+        try:
+            await reader_task
+        except (asyncio.CancelledError, Exception):
             pass
 
 
@@ -2502,16 +2578,17 @@ async def api_series(name: str, hours: float = 6, step: int = 300,
     if not cluster:
         raise HTTPException(status_code=404, detail="Кластер не найден")
 
-    data = await collect_series_table(cluster, max(hours, 0.1), max(step, 15))
+    tables = await collect_series_tables(cluster, max(hours, 0.1), max(step, 15))
 
     if format == "csv":
-        head = "time," + ",".join(data["names"])
-        rows = [head]
-        for ts in data["stamps"]:
-            t = datetime.datetime.utcfromtimestamp(ts).isoformat() + "Z"
-            rows.append(t + "," + ",".join(
-                ("" if s.get(ts) is None else f"{s[ts]:.3f}")
-                for s in data["series"]))
+        # колонка server: в одном файле данные обоих серверов кластера
+        rows = ["server,role,time," + ",".join(tables[0]["names"])]
+        for data in tables:
+            for ts in data["stamps"]:
+                t = datetime.datetime.utcfromtimestamp(ts).isoformat() + "Z"
+                rows.append(f'{data["host"]},{data["role"]},{t},' + ",".join(
+                    ("" if s.get(ts) is None else f"{s[ts]:.3f}")
+                    for s in data["series"]))
         return PlainTextResponse(
             "\n".join(rows), media_type="text/csv; charset=utf-8",
             headers={"Content-Disposition":
@@ -2520,14 +2597,22 @@ async def api_series(name: str, hours: float = 6, step: int = 300,
     return {
         "cluster":       cluster["name"],
         "cluster_label": cluster["label"],
-        "hours":         data["hours"],
-        "step_seconds":  data["step_s"],
-        "step_adjusted": data["adjusted"],
-        "columns":       ["time"] + data["names"],
-        "rows": [
-            [datetime.datetime.utcfromtimestamp(ts).isoformat() + "Z"] +
-            [s.get(ts) for s in data["series"]]
-            for ts in data["stamps"]
+        "hours":         tables[0]["hours"],
+        "step_seconds":  tables[0]["step_s"],
+        "step_adjusted": tables[0]["adjusted"],
+        "columns":       ["time"] + tables[0]["names"],
+        # по блоку на каждый сервер кластера
+        "servers": [
+            {
+                "host": d["host"],
+                "role": d["role"],
+                "rows": [
+                    [datetime.datetime.utcfromtimestamp(ts).isoformat() + "Z"] +
+                    [s.get(ts) for s in d["series"]]
+                    for ts in d["stamps"]
+                ],
+            }
+            for d in tables
         ],
     }
 

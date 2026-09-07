@@ -481,3 +481,10 @@ textarea#input:disabled { opacity: .55; }
              border: 1px solid var(--border, #2b313c);
              color: var(--muted, #8b95a5); text-transform: uppercase;
              letter-spacing: .3px; }
+
+/* Кнопка остановки генерации — на месте отправки, пока идёт ответ */
+.stop-btn { width: 38px; height: 38px; flex: 0 0 38px; border-radius: 9px;
+            border: 1px solid var(--border, #2b313c);
+            background: var(--panel, #1b1f27); color: var(--muted, #8b95a5);
+            cursor: pointer; font-size: 13px; line-height: 1; }
+.stop-btn:hover { border-color: #e05a5a; color: #e05a5a; }
