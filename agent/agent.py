@@ -3497,7 +3497,16 @@ async def auth_middleware(request: Request, call_next):
     if not AUTH_ENABLED:
         return await call_next(request)
 
-    path = request.url.path
+    # ВАЖНО: request.url.path — сырой путь, как его прислал прокси.
+    # Если nginx не срезает префикс (proxy_pass без слэша на конце), сюда
+    # приходит /ai-agent/login, в список публичных путей это не попадает,
+    # и агент редиректит на /ai-agent/login — вечный круг. Поэтому префикс
+    # снимаем сами и работаем дальше с путём внутри приложения.
+    prefix = (request.scope.get("root_path") or ROOT_PATH).rstrip("/")
+    path   = request.url.path
+    if prefix and path.startswith(prefix):
+        path = path[len(prefix):] or "/"
+
     if _is_public(path):
         return await call_next(request)
 
@@ -3516,7 +3525,6 @@ async def auth_middleware(request: Request, call_next):
         denied = sso_denied(request)
         accept = request.headers.get("accept", "")
         if "text/html" in accept:
-            prefix = (request.scope.get("root_path") or ROOT_PATH).rstrip("/")
             # denied=1 — чтобы форма объяснила, что дело не в пароле
             return RedirectResponse(f"{prefix}/login" + ("?denied=1" if denied else ""),
                                     status_code=302)
