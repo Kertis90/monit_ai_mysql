@@ -1017,6 +1017,106 @@ async def prom_range_summary(client: httpx.AsyncClient, query: str,
     return {}
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  ДАННЫЕ ДЛЯ ГРАФИКОВ
+#  Ряды отдаются как есть, рисует их браузер инлайновым SVG. Так не нужны ни
+#  библиотеки графиков (закрытый контур — CDN недоступен), ни серверный рендер.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Набор показателей для графиков и отчёта. {inst} — primary, {node} — его node,
+# {repl} — реплика. Панели без нужных плейсхолдеров пропускаются.
+CHART_SPECS = [
+    {"key": "qps", "title": "Запросы в секунду", "unit": "/с",
+     "expr": 'rate(mysql_global_status_queries{{instance="{inst}"}}[5m])'},
+    {"key": "slow", "title": "Медленные запросы", "unit": "/с",
+     "expr": 'rate(mysql_global_status_slow_queries{{instance="{inst}"}}[5m])'},
+    {"key": "conn", "title": "Подключения", "unit": "",
+     "expr": 'mysql_global_status_threads_connected{{instance="{inst}"}}'},
+    {"key": "conn_pct", "title": "Использование лимита подключений", "unit": "%",
+     "expr": 'mysql_global_status_threads_connected{{instance="{inst}"}}'
+             '/mysql_global_variables_max_connections{{instance="{inst}"}}*100'},
+    {"key": "innodb_hit", "title": "InnoDB buffer pool hit rate", "unit": "%",
+     "expr": '100*(1-(rate(mysql_global_status_innodb_buffer_pool_reads{{instance="{inst}"}}[5m])'
+             '/clamp_min(rate(mysql_global_status_innodb_buffer_pool_read_requests'
+             '{{instance="{inst}"}}[5m]),1)))'},
+    {"key": "cpu", "title": "CPU сервера", "unit": "%",
+     "expr": '100-(avg by(instance)(rate(node_cpu_seconds_total'
+             '{{mode="idle",instance="{node}"}}[5m]))*100)'},
+    {"key": "iowait", "title": "CPU iowait", "unit": "%",
+     "expr": 'avg by(instance)(rate(node_cpu_seconds_total'
+             '{{mode="iowait",instance="{node}"}}[5m]))*100'},
+    {"key": "mem", "title": "Занято памяти", "unit": "%",
+     "expr": '100*(1-(node_memory_MemAvailable_bytes{{instance="{node}"}}'
+             '/node_memory_MemTotal_bytes{{instance="{node}"}}))'},
+    {"key": "disk_io", "title": "Дисковый ввод-вывод", "unit": "Б/с",
+     "expr": 'sum(rate(node_disk_read_bytes_total{{instance="{node}"}}[5m])'
+             '+rate(node_disk_written_bytes_total{{instance="{node}"}}[5m]))'},
+    {"key": "repl_lag", "title": "Отставание реплики сверх плана", "unit": "с",
+     "expr": 'mysql:replica_effective_lag_seconds{{instance="{repl}"}}',
+     "needs_replica": True},
+]
+
+
+async def prom_range_series(client: httpx.AsyncClient, query: str,
+                            hours: float) -> list[list]:
+    """Сырой ряд [[unix_ts, значение], ...] — для отрисовки графика."""
+    end   = datetime.datetime.utcnow()
+    start = end - datetime.timedelta(hours=hours)
+    # ~200 точек на график: больше браузеру не нужно, меньше — теряется форма
+    step  = max(int(hours * 3600 / 200), 15)
+    try:
+        r = await client.get(
+            f"{PROMETHEUS_URL}/api/v1/query_range",
+            params={"query": query,
+                    "start": start.isoformat() + "Z",
+                    "end":   end.isoformat() + "Z",
+                    "step":  str(step)},
+            timeout=20.0)
+        d = r.json()
+        if d.get("status") != "success" or not d["data"]["result"]:
+            return []
+        return [[int(float(v[0])), round(float(v[1]), 3)]
+                for v in d["data"]["result"][0]["values"]]
+    except Exception as e:
+        logger.error(f"Не удалось получить ряд для графика: {e}")
+        return []
+
+
+async def build_charts(cluster: dict, hours: float,
+                       keys: Optional[list[str]] = None) -> list[dict]:
+    """Собрать данные графиков по кластеру за период."""
+    prim = cluster["primary_ip"]
+    repl = cluster.get("replica_ip", "")
+    ctx  = {"inst": f"{prim}:9104", "node": f"{prim}:9100",
+            "repl": f"{repl}:9104" if repl else ""}
+
+    specs = [s for s in CHART_SPECS
+             if (not s.get("needs_replica") or repl)
+             and (not keys or s["key"] in keys)]
+
+    async with httpx.AsyncClient() as client:
+        series = await asyncio.gather(
+            *[prom_range_series(client, s["expr"].format(**ctx), hours)
+              for s in specs])
+
+    charts = []
+    for spec, points in zip(specs, series):
+        if not points:
+            continue
+        vals = [p[1] for p in points]
+        charts.append({
+            "key":    spec["key"],
+            "title":  spec["title"],
+            "unit":   spec["unit"],
+            "points": points,
+            "min":    round(min(vals), 2),
+            "max":    round(max(vals), 2),
+            "avg":    round(sum(vals) / len(vals), 2),
+            "last":   vals[-1],
+        })
+    return charts
+
+
 async def collect_current(cluster: dict) -> dict:
     """Текущие метрики кластера (async, параллельно)."""
     async with httpx.AsyncClient() as client:
@@ -1622,6 +1722,19 @@ def api_directory_search(request: Request, q: str = "", limit: int = 25):
     return {"items": found, "query": q}
 
 
+@app.get("/report", response_class=HTMLResponse)
+def report_page(request: Request):
+    """Печатная версия отчёта. PDF делает браузер (Ctrl+P → Сохранить как PDF):
+    так не нужны ни серверный рендер, ни новые pip-зависимости."""
+    path = Path(WEB_DIR) / "report.html"
+    if not path.exists():
+        return HTMLResponse("<h1>report.html не найден</h1>", status_code=500)
+    prefix = (request.scope.get("root_path") or ROOT_PATH).rstrip("/")
+    html = path.read_text(encoding="utf-8")
+    html = html.replace('<base href="/">', f'<base href="{prefix}/">', 1)
+    return HTMLResponse(html)
+
+
 @app.get("/login", response_class=HTMLResponse)
 def login_page(request: Request):
     path = Path(WEB_DIR) / "login.html"
@@ -1716,6 +1829,22 @@ async def websocket_chat(ws: WebSocket):
                 "cluster": cluster["label"] if cluster else None,
                 "hours":   hours if hours > 0 else None,
             })
+
+            # Графики за тот же период, что разбирает LLM. Отправляем ДО ответа:
+            # пока модель думает, пользователь уже видит картину.
+            if cluster and hours > 0:
+                try:
+                    charts = await build_charts(cluster, hours)
+                    if charts:
+                        await ws.send_json({
+                            "type":          "charts",
+                            "cluster":       cluster["name"],
+                            "cluster_label": cluster["label"],
+                            "hours":         hours,
+                            "charts":        charts,
+                        })
+                except Exception as e:
+                    logger.error(f"Не удалось собрать графики: {e}")
 
             # 2. Собрать messages
             messages = [{"role": "system", "content": system_prompt()}]
@@ -1941,6 +2070,18 @@ def api_alerts_delete_by_name(request: Request, name: str = ""):
         raise HTTPException(status_code=400, detail="Укажите параметр name")
     removed = alerts_delete_by_name(name)
     return {"ok": True, "alert": name, "removed": removed}
+
+
+@app.get("/api/charts/{name}")
+async def api_charts(name: str, hours: float = 6, keys: str = ""):
+    """Ряды для графиков по кластеру. keys — список ключей через запятую."""
+    cluster = find_cluster(name)
+    if not cluster:
+        raise HTTPException(status_code=404, detail="Кластер не найден")
+    wanted = [k.strip() for k in keys.split(",") if k.strip()] or None
+    charts = await build_charts(cluster, max(hours, 0.25), wanted)
+    return {"cluster": cluster["name"], "cluster_label": cluster["label"],
+            "hours": hours, "charts": charts}
 
 @app.get("/alerts/history")
 def api_alerts(limit: int = 30):

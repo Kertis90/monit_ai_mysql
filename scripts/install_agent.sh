@@ -37,6 +37,7 @@ cp "${SCRIPT_DIR}/../web/index.html"      "${AGENT_DIR}/web/"
 cp "${SCRIPT_DIR}/../web/style.css"       "${AGENT_DIR}/web/"
 cp "${SCRIPT_DIR}/../web/app.js"          "${AGENT_DIR}/web/"
 cp "${SCRIPT_DIR}/../web/login.html"      "${AGENT_DIR}/web/"
+cp "${SCRIPT_DIR}/../web/report.html"     "${AGENT_DIR}/web/"
 
 log_info "Файлы скопированы в ${AGENT_DIR}"
 

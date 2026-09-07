@@ -205,6 +205,10 @@ const App = (() => {
         break;
       }
 
+      case 'charts':
+        renderCharts(msg);
+        break;
+
       case 'done':
         finishStreaming();
         break;
@@ -646,6 +650,98 @@ const App = (() => {
     const r = await fetch('api/users/' + encodeURIComponent(username), { method: 'DELETE' });
     if (!r.ok) { alert('Не удалось отозвать доступ'); return; }
     await loadAccess();
+  }
+
+  // ═══ ГРАФИКИ ════════════════════════════════════════════════════
+  // Рисуем сами, инлайновым SVG: в закрытом контуре CDN недоступен,
+  // а тащить библиотеку графиков ради линии — лишняя зависимость.
+
+  function fmtNum(v) {
+    const a = Math.abs(v);
+    if (a >= 1e9) return (v / 1e9).toFixed(1) + 'G';
+    if (a >= 1e6) return (v / 1e6).toFixed(1) + 'M';
+    if (a >= 1e3) return (v / 1e3).toFixed(1) + 'k';
+    if (a >= 10)  return v.toFixed(0);
+    if (a >= 1)   return v.toFixed(1);
+    return v.toFixed(2);
+  }
+
+  function fmtTime(ts) {
+    const d = new Date(ts * 1000);
+    return String(d.getHours()).padStart(2, '0') + ':' +
+           String(d.getMinutes()).padStart(2, '0');
+  }
+
+  function sparkSvg(chart, w, h) {
+    const pts = chart.points;
+    if (!pts.length) return '';
+    const padL = 46, padR = 10, padT = 12, padB = 20;
+    const iw = w - padL - padR, ih = h - padT - padB;
+
+    const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
+    const x0 = xs[0], x1 = xs[xs.length - 1] || x0 + 1;
+    let lo = Math.min(...ys), hi = Math.max(...ys);
+    if (hi === lo) { hi = lo + 1; lo = Math.max(0, lo - 1); }
+    // немного воздуха сверху, чтобы пик не упирался в рамку
+    hi += (hi - lo) * 0.1;
+
+    const px = t => padL + ((t - x0) / (x1 - x0 || 1)) * iw;
+    const py = v => padT + ih - ((v - lo) / (hi - lo)) * ih;
+
+    const line = pts.map((p, i) => (i ? 'L' : 'M') + px(p[0]).toFixed(1) +
+                                   ' ' + py(p[1]).toFixed(1)).join(' ');
+    const area = line + ` L${px(x1).toFixed(1)} ${(padT + ih).toFixed(1)}` +
+                        ` L${px(x0).toFixed(1)} ${(padT + ih).toFixed(1)} Z`;
+
+    // три горизонтальные линии сетки с подписями
+    let grid = '';
+    for (let k = 0; k <= 2; k++) {
+      const v = lo + (hi - lo) * (k / 2), y = py(v);
+      grid += `<line x1="${padL}" y1="${y.toFixed(1)}" x2="${w - padR}" y2="${y.toFixed(1)}"
+                     class="cg-grid"/>
+               <text x="${padL - 6}" y="${(y + 3).toFixed(1)}" class="cg-lbl"
+                     text-anchor="end">${esc(fmtNum(v))}</text>`;
+    }
+    const tAxis = `<text x="${padL}" y="${h - 5}" class="cg-lbl">${esc(fmtTime(x0))}</text>
+                   <text x="${w - padR}" y="${h - 5}" class="cg-lbl"
+                         text-anchor="end">${esc(fmtTime(x1))}</text>`;
+
+    return `<svg viewBox="0 0 ${w} ${h}" class="cg-svg" preserveAspectRatio="none"
+                 role="img" aria-label="${esc(chart.title)}">
+              ${grid}
+              <path d="${area}" class="cg-area"/>
+              <path d="${line}" class="cg-line"/>
+              ${tAxis}
+            </svg>`;
+  }
+
+  function chartCard(chart) {
+    const u = chart.unit ? ' ' + esc(chart.unit) : '';
+    return `<div class="cg-card">
+      <div class="cg-head">
+        <span class="cg-title">${esc(chart.title)}</span>
+        <span class="cg-stats">сейчас ${esc(fmtNum(chart.last))}${u}
+          · средн ${esc(fmtNum(chart.avg))}${u}
+          · макс ${esc(fmtNum(chart.max))}${u}</span>
+      </div>
+      ${sparkSvg(chart, 520, 130)}
+    </div>`;
+  }
+
+  function renderCharts(msg) {
+    const wrap = document.createElement('div');
+    wrap.className = 'cg-block';
+    const period = msg.hours >= 24
+      ? (msg.hours / 24).toFixed(1).replace('.0', '') + ' сут'
+      : msg.hours + ' ч';
+    wrap.innerHTML =
+      `<div class="cg-block-head">
+         <b>${esc(msg.cluster_label)}</b> · за ${esc(period)}
+         <a class="cg-pdf" href="report?cluster=${encodeURIComponent(msg.cluster)}&hours=${encodeURIComponent(msg.hours)}"
+            target="_blank" rel="noopener">📄 Отчёт PDF</a>
+       </div>` + msg.charts.map(chartCard).join('');
+    $('messages').appendChild(wrap);
+    scrollToBottom();
   }
 
   // ═══ УТИЛИТЫ ════════════════════════════════════════════════════

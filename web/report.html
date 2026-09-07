@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Отчёт — MySQL AI Agent</title>
+<!-- href подставляет agent.py из ROOT_PATH, как на остальных страницах -->
+<base href="/">
+<style>
+  :root { --ink:#111; --muted:#666; --line:#d8dce3; --accent:#2b6cb0; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:28px 32px; background:#fff; color:var(--ink);
+         font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; }
+  h1 { font-size:21px; margin:0 0 4px; }
+  h2 { font-size:16px; margin:0 0 10px; }
+  .sub { color:var(--muted); font-size:13px; }
+  .bar { display:flex; align-items:center; gap:12px; margin:0 0 22px;
+         padding-bottom:14px; border-bottom:2px solid var(--line); }
+  .btn { padding:8px 16px; border:1px solid var(--accent); background:var(--accent);
+         color:#fff; border-radius:7px; cursor:pointer; font:inherit; font-weight:600; }
+  .btn.ghost { background:#fff; color:var(--accent); font-weight:500; }
+  .spacer { margin-left:auto; }
+
+  table.kv { width:100%; border-collapse:collapse; margin-bottom:26px; }
+  table.kv th, table.kv td { text-align:left; padding:7px 10px;
+                             border-bottom:1px solid var(--line); font-size:13px; }
+  table.kv th { background:#f4f6f9; font-weight:600; }
+  table.kv td.num, table.kv th.num { text-align:right;
+                                     font-variant-numeric:tabular-nums; }
+
+  .card { border:1px solid var(--line); border-radius:8px; padding:12px 14px;
+          margin-bottom:16px; page-break-inside:avoid; break-inside:avoid; }
+  .card h3 { font-size:14px; margin:0 0 2px; }
+  .card .st { font-size:11px; color:var(--muted); margin-bottom:6px; }
+  svg { width:100%; height:150px; display:block; }
+  .grid { stroke:var(--line); stroke-width:1; }
+  .lbl  { fill:var(--muted); font-size:10px; }
+  .line { fill:none; stroke:var(--accent); stroke-width:1.6; }
+  .area { fill:var(--accent); opacity:.10; }
+
+  .muted { color:var(--muted); }
+  footer { margin-top:26px; padding-top:12px; border-top:1px solid var(--line);
+           font-size:11px; color:var(--muted); }
+
+  /* Печать: убираем кнопки, поля страницы, не разрываем карточки графиков */
+  @media print {
+    body { padding:0; }
+    .noprint { display:none !important; }
+    .card { border-color:#bbb; }
+    @page { margin:14mm; }
+  }
+</style>
+</head>
+<body>
+
+<div class="bar">
+  <div>
+    <h1 id="title">Отчёт по кластеру</h1>
+    <div class="sub" id="subtitle">Загрузка…</div>
+  </div>
+  <span class="spacer"></span>
+  <button class="btn noprint" id="print-btn">📄 Сохранить в PDF</button>
+  <button class="btn ghost noprint" id="back-btn">Назад</button>
+</div>
+
+<div id="body"><div class="muted">Собираю данные…</div></div>
+
+<footer id="foot"></footer>
+
+<script>
+(() => {
+  const q       = new URLSearchParams(location.search);
+  const cluster = q.get('cluster') || '';
+  const hours   = parseFloat(q.get('hours') || '24');
+
+  const esc = (s) => String(s ?? '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  function fmtNum(v) {
+    const a = Math.abs(v);
+    if (a >= 1e9) return (v / 1e9).toFixed(1) + 'G';
+    if (a >= 1e6) return (v / 1e6).toFixed(1) + 'M';
+    if (a >= 1e3) return (v / 1e3).toFixed(1) + 'k';
+    if (a >= 10)  return v.toFixed(0);
+    if (a >= 1)   return v.toFixed(1);
+    return v.toFixed(2);
+  }
+
+  function fmtTime(ts) {
+    const d = new Date(ts * 1000);
+    return String(d.getHours()).padStart(2, '0') + ':' +
+           String(d.getMinutes()).padStart(2, '0');
+  }
+
+  // Тот же рисовальщик, что в чате: инлайновый SVG, без библиотек —
+  // в закрытом контуре CDN недоступен, а печать всё равно идёт из браузера.
+  function svgChart(chart, w, h) {
+    const pts = chart.points;
+    if (!pts.length) return '';
+    const padL = 48, padR = 10, padT = 12, padB = 20;
+    const iw = w - padL - padR, ih = h - padT - padB;
+
+    const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
+    const x0 = xs[0], x1 = xs[xs.length - 1] || x0 + 1;
+    let lo = Math.min(...ys), hi = Math.max(...ys);
+    if (hi === lo) { hi = lo + 1; lo = Math.max(0, lo - 1); }
+    hi += (hi - lo) * 0.1;
+
+    const px = (t) => padL + ((t - x0) / (x1 - x0 || 1)) * iw;
+    const py = (v) => padT + ih - ((v - lo) / (hi - lo)) * ih;
+
+    const line = pts.map((p, i) => (i ? 'L' : 'M') +
+                 px(p[0]).toFixed(1) + ' ' + py(p[1]).toFixed(1)).join(' ');
+    const base = (padT + ih).toFixed(1);
+    const area = line + ' L' + px(x1).toFixed(1) + ' ' + base +
+                        ' L' + px(x0).toFixed(1) + ' ' + base + ' Z';
+
+    let grid = '';
+    for (let k = 0; k <= 2; k++) {
+      const v = lo + (hi - lo) * (k / 2), y = py(v).toFixed(1);
+      grid += '<line x1="' + padL + '" y1="' + y + '" x2="' + (w - padR) +
+              '" y2="' + y + '" class="grid"/>' +
+              '<text x="' + (padL - 6) + '" y="' + (py(v) + 3).toFixed(1) +
+              '" class="lbl" text-anchor="end">' + esc(fmtNum(v)) + '</text>';
+    }
+
+    return '<svg viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none" ' +
+           'role="img" aria-label="' + esc(chart.title) + '">' + grid +
+           '<path d="' + area + '" class="area"/>' +
+           '<path d="' + line + '" class="line"/>' +
+           '<text x="' + padL + '" y="' + (h - 5) + '" class="lbl">' +
+           esc(fmtTime(x0)) + '</text>' +
+           '<text x="' + (w - padR) + '" y="' + (h - 5) +
+           '" class="lbl" text-anchor="end">' + esc(fmtTime(x1)) + '</text></svg>';
+  }
+
+  function periodLabel(h) {
+    return h >= 24 ? (h / 24).toFixed(1).replace('.0', '') + ' сут' : h + ' ч';
+  }
+
+  async function main() {
+    const body = document.getElementById('body');
+    if (!cluster) {
+      body.innerHTML = '<div class="muted">Не указан кластер. ' +
+                       'Адрес должен быть вида <code>report?cluster=имя&amp;hours=24</code></div>';
+      return;
+    }
+    try {
+      const r = await fetch('api/charts/' + encodeURIComponent(cluster) +
+                            '?hours=' + encodeURIComponent(hours));
+      if (r.status === 401) { location.href = new URL('login', document.baseURI).href; return; }
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const d = await r.json();
+
+      const period = periodLabel(hours);
+      document.getElementById('title').textContent = 'Отчёт: ' + d.cluster_label;
+      document.getElementById('subtitle').textContent =
+        'Период: последние ' + period + ' · сформирован ' +
+        new Date().toLocaleString('ru-RU');
+      document.title = 'Отчёт ' + d.cluster_label + ' — ' + period;
+
+      if (!d.charts.length) {
+        body.innerHTML = '<div class="muted">За этот период нет данных. ' +
+                         'Проверьте, собираются ли метрики кластера.</div>';
+        return;
+      }
+
+      const rows = d.charts.map((c) =>
+        '<tr><td>' + esc(c.title) + '</td>' +
+        '<td class="num">' + esc(fmtNum(c.last)) + '</td>' +
+        '<td class="num">' + esc(fmtNum(c.avg))  + '</td>' +
+        '<td class="num">' + esc(fmtNum(c.min))  + '</td>' +
+        '<td class="num">' + esc(fmtNum(c.max))  + '</td>' +
+        '<td class="muted">' + esc(c.unit) + '</td></tr>').join('');
+
+      const cards = d.charts.map((c) =>
+        '<div class="card"><h3>' + esc(c.title) + '</h3>' +
+        '<div class="st">сейчас ' + esc(fmtNum(c.last)) + ' ' + esc(c.unit) +
+        ' · средн ' + esc(fmtNum(c.avg)) +
+        ' · мин ' + esc(fmtNum(c.min)) +
+        ' · макс ' + esc(fmtNum(c.max)) + '</div>' +
+        svgChart(c, 900, 150) + '</div>').join('');
+
+      body.innerHTML =
+        '<h2>Сводка показателей</h2>' +
+        '<table class="kv"><tr><th>Показатель</th><th class="num">Сейчас</th>' +
+        '<th class="num">Средн.</th><th class="num">Мин.</th>' +
+        '<th class="num">Макс.</th><th>Ед.</th></tr>' + rows + '</table>' +
+        '<h2>Графики</h2>' + cards;
+
+      document.getElementById('foot').textContent =
+        'MySQL AI Monitoring · кластер ' + d.cluster_label + ' (' + d.cluster +
+        ') · период ' + period + ' · источник данных: Prometheus';
+    } catch (e) {
+      body.innerHTML = '<div class="muted">Не удалось получить данные: ' +
+                       esc(e.message) + '</div>';
+    }
+  }
+
+  document.getElementById('print-btn').addEventListener('click', () => window.print());
+  document.getElementById('back-btn').addEventListener('click', () => history.back());
+  main();
+})();
+</script>
+
+</body>
+</html>
