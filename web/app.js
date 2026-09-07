@@ -17,6 +17,7 @@ const App = (() => {
     clusters:      [],
     currentTab:    'chat',
     streamingEl:   null,   // элемент .msg-body куда стримятся токены
+    pendingCharts: null,   // графики, ждущие конца ответа
     awaitingReply: false,
     pingTimer:     null,
   };
@@ -206,7 +207,9 @@ const App = (() => {
       }
 
       case 'charts':
-        renderCharts(msg);
+        // Не рисуем сразу: ответ ещё стримится. Прикрепим к нему по 'done',
+        // иначе графики влезали между вопросом и ответом.
+        state.pendingCharts = msg;
         break;
 
       case 'done':
@@ -225,6 +228,11 @@ const App = (() => {
       if (think) think.remove();
       if (suffix) state.streamingEl.textContent += suffix;
       state.streamingEl.classList.remove('streaming');
+      // Графики встраиваем в само сообщение, а не отдельным блоком снизу
+      if (state.pendingCharts) {
+        attachCharts(state.streamingEl.parentElement, state.pendingCharts);
+        state.pendingCharts = null;
+      }
       state.streamingEl = null;
     }
     state.awaitingReply = false;
@@ -727,7 +735,7 @@ const App = (() => {
     for (let k = 0; k <= 2; k++) {
       const v = lo + (hi - lo) * (k / 2), y = py(v);
       grid += `<line x1="${padL}" y1="${y.toFixed(1)}" x2="${w - padR}" y2="${y.toFixed(1)}"
-                     class="cg-grid"/>
+                     class="cg-gridline"/>
                <text x="${padL - 6}" y="${(y + 3).toFixed(1)}" class="cg-lbl"
                      text-anchor="end">${esc(fmtNum(v))}</text>`;
     }
@@ -762,30 +770,71 @@ const App = (() => {
           · средн ${esc(fmtNum(chart.avg))}${u}
           · макс ${esc(fmtNum(chart.max))}${u}</span>
       </div>
-      ${sparkSvg(chart, 520, 130)}
+      ${sparkSvg(chart, 420, 96)}
     </div>`;
   }
 
-  function renderCharts(msg) {
+  // Компактная строка под ответом: две ссылки, ничего лишнего.
+  // Графики разворачиваются по клику — стена картинок под каждым ответом
+  // мешала читать сам ответ.
+  function attachCharts(msgEl, msg) {
+    if (!msgEl) return;
     const wrap = document.createElement('div');
     wrap.className = 'cg-block';
+
     const period = msg.hours >= 24
       ? (msg.hours / 24).toFixed(1).replace('.0', '') + ' сут'
       : msg.hours + ' ч';
-    // Реальный охват данных: если он короче запрошенного периода, это видно
-    const all = msg.charts.flatMap(c => c.points.map(p => p[0]));
-    const t0 = Math.min(...all), t1 = Math.max(...all);
-    const range = all.length
-      ? ` (${fmtTick(t0, t1 - t0)} — ${fmtTick(t1, t1 - t0)})` : '';
-    wrap.innerHTML =
-      `<div class="cg-block-head">
-         <b>${esc(msg.cluster_label)}</b> · за ${esc(period)}${esc(range)}
-         <a class="cg-pdf" href="report?cluster=${encodeURIComponent(msg.cluster)}&hours=${encodeURIComponent(msg.hours)}"
-            target="_blank" rel="noopener">📄 Отчёт PDF</a>
-       </div>` + msg.charts.map(chartCard).join('');
-    $('messages').appendChild(wrap);
+    const pdfUrl = 'report?cluster=' + encodeURIComponent(msg.cluster) +
+                   '&hours=' + encodeURIComponent(msg.hours);
+
+    const bar = document.createElement('div');
+    bar.className = 'cg-bar';
+    bar.innerHTML =
+      `<button class="cg-link" type="button">📈 Графики за ${esc(period)}</button>
+       <a class="cg-link ${msg.highlight_pdf ? 'accent' : ''}" href="${pdfUrl}"
+          target="_blank" rel="noopener">📄 Выгрузить PDF</a>`;
+
+    const body = document.createElement('div');
+    body.className = 'cg-body';
+
+    const toggle = bar.querySelector('button');
+    let loaded = false;
+
+    function draw(charts) {
+      body.innerHTML = charts.length
+        ? '<div class="cg-grid">' + charts.map(chartCard).join('') + '</div>'
+        : '<div class="muted" style="font-size:12px">За этот период данных нет.</div>';
+    }
+
+    toggle.addEventListener('click', async () => {
+      const open = body.classList.toggle('open');
+      toggle.textContent = (open ? '▾ Графики за ' : '📈 Графики за ') + period;
+      if (!open || loaded) return;
+      loaded = true;
+      if (msg.charts && msg.charts.length) { draw(msg.charts); return; }
+      body.innerHTML = '<div class="muted" style="font-size:12px">Загружаю…</div>';
+      try {
+        const r = await fetch('api/charts/' + encodeURIComponent(msg.cluster) +
+                              '?hours=' + encodeURIComponent(msg.hours));
+        draw((await r.json()).charts || []);
+      } catch (e) {
+        body.innerHTML = '<div class="muted" style="font-size:12px">Не удалось: ' +
+                         esc(e.message) + '</div>';
+        loaded = false;
+      }
+      scrollToBottom();
+    });
+
+    wrap.appendChild(bar);
+    wrap.appendChild(body);
+    msgEl.appendChild(wrap);
+
+    // Просили графики явно — сразу разворачиваем
+    if (msg.mode === 'inline' && msg.charts && msg.charts.length) toggle.click();
     scrollToBottom();
   }
+
 
   // ═══ УТИЛИТЫ ════════════════════════════════════════════════════
 

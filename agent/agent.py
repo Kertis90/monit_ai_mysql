@@ -1450,6 +1450,29 @@ def parse_step_seconds(text: str) -> Optional[int]:
     return None
 
 
+# Явная просьба показать графики. Без неё графики не строятся: десять картинок
+# под каждым ответом про метрики — это шум, а не польза.
+CHART_KEYWORDS = (
+    "график", "графики", "графиком", "графиках", "диаграмм", "чарт",
+    "нарисуй", "визуал", "покажи картин", "в картинках",
+)
+
+# Просьба выгрузить отчёт
+EXPORT_KEYWORDS = (
+    "pdf", "пдф", "выгруз", "экспорт", "отчёт", "отчет", "распечат", "печат",
+)
+
+
+def detect_chart_intent(text: str) -> bool:
+    t = text.lower()
+    return any(kw in t for kw in CHART_KEYWORDS)
+
+
+def detect_export_intent(text: str) -> bool:
+    t = text.lower()
+    return any(kw in t for kw in EXPORT_KEYWORDS)
+
+
 BREAKDOWN_KEYWORDS = (
     "разбивк", "детальн", "подробн", "по интервал", "по шагам", "поминутно",
     "по минутам", "по часам", "почасов", "по секундам", "таблиц",
@@ -2104,19 +2127,24 @@ async def websocket_chat(ws: WebSocket):
                 "hours":   hours if hours > 0 else None,
             })
 
-            # Графики за тот же период, что разбирает LLM. Отправляем ДО ответа:
-            # пока модель думает, пользователь уже видит картину.
+            # Графики строим ТОЛЬКО если их попросили. Иначе шлём лёгкое
+            # предложение без данных: строка со ссылками под ответом, десять
+            # запросов в Prometheus зря не делаем.
             if cluster and hours > 0:
+                want_charts = detect_chart_intent(text)
+                want_export = detect_export_intent(text)
                 try:
-                    charts = await build_charts(cluster, hours)
-                    if charts:
-                        await ws.send_json({
-                            "type":          "charts",
-                            "cluster":       cluster["name"],
-                            "cluster_label": cluster["label"],
-                            "hours":         hours,
-                            "charts":        charts,
-                        })
+                    charts = (await build_charts(cluster, hours)
+                              if want_charts else [])
+                    await ws.send_json({
+                        "type":          "charts",
+                        "mode":          "inline" if want_charts else "offer",
+                        "highlight_pdf": want_export,
+                        "cluster":       cluster["name"],
+                        "cluster_label": cluster["label"],
+                        "hours":         hours,
+                        "charts":        charts,
+                    })
                 except Exception as e:
                     logger.error(f"Не удалось собрать графики: {e}")
 

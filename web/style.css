@@ -444,29 +444,35 @@ textarea#input:disabled { opacity: .55; }
   .hint { display: none; }
 }
 
-/* ═══ Графики в чате ═══════════════════════════════════════════════ */
-.cg-block        { margin: 14px 0 6px; }
-.cg-block-head   { font-size: 13px; color: var(--muted, #8b95a5);
-                   margin-bottom: 10px; display: flex; align-items: center; gap: 12px; }
-.cg-pdf          { margin-left: auto; color: var(--accent, #4c8dff);
-                   text-decoration: none; font-size: 12px;
-                   border: 1px solid var(--accent, #4c8dff);
-                   border-radius: 6px; padding: 3px 9px; }
-.cg-pdf:hover    { background: rgba(76, 141, 255, .12); }
+/* ═══ Графики в чате ═══════════════════════════════════════════════
+   Встроены в сообщение ответа, по умолчанию свёрнуты: раньше десять
+   картинок вываливались отдельной стеной и мешали читать ответ. */
+.cg-block        { margin: 10px 0 0; padding-top: 8px;
+                   border-top: 1px solid var(--border, #2b313c); }
+.cg-bar          { display: flex; align-items: center; gap: 14px; }
+.cg-link         { background: none; border: 0; padding: 0; cursor: pointer;
+                   font: inherit; font-size: 12px; color: var(--muted, #8b95a5);
+                   text-decoration: none; }
+.cg-link:hover   { color: var(--accent, #4c8dff); }
+.cg-link.accent  { color: var(--accent, #4c8dff); font-weight: 600; }
 
-.cg-card         { background: var(--panel, #1b1f27);
+.cg-body         { display: none; margin-top: 10px; }
+.cg-body.open    { display: block; }
+.cg-grid         { display: grid; gap: 8px;
+                   grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+
+.cg-card         { background: var(--bg, #12151b);
                    border: 1px solid var(--border, #2b313c);
-                   border-radius: 10px; padding: 10px 12px; margin-bottom: 10px; }
-.cg-head         { display: flex; align-items: baseline; gap: 10px;
-                   flex-wrap: wrap; margin-bottom: 4px; }
-.cg-title        { font-size: 13px; font-weight: 600; }
-.cg-stats        { font-size: 11px; color: var(--muted, #8b95a5); margin-left: auto; }
+                   border-radius: 8px; padding: 8px 10px; }
+.cg-head         { display: flex; align-items: baseline; gap: 8px;
+                   flex-wrap: wrap; margin-bottom: 2px; }
+.cg-title        { font-size: 12px; font-weight: 600; }
+.cg-stats        { font-size: 10px; color: var(--muted, #8b95a5); margin-left: auto; }
 
-.cg-svg          { width: 100%; height: 130px; display: block; }
-.cg-grid         { stroke: var(--border, #2b313c); stroke-width: 1; }
-.cg-lbl          { fill: var(--muted, #8b95a5); font-size: 10px;
-                   font-family: inherit; }
-.cg-line         { fill: none; stroke: var(--accent, #4c8dff); stroke-width: 2;
+.cg-svg          { width: 100%; height: 96px; display: block; }
+.cg-gridline    { stroke: var(--border, #2b313c); stroke-width: 1; }
+.cg-lbl          { fill: var(--muted, #8b95a5); font-size: 9px; font-family: inherit; }
+.cg-line         { fill: none; stroke: var(--accent, #4c8dff); stroke-width: 1.6;
                    vector-effect: non-scaling-stroke; }
 .cg-area         { fill: var(--accent, #4c8dff); opacity: .12; stroke: none; }
 
