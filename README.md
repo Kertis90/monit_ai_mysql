@@ -576,6 +576,34 @@ asyncio.run(main())
 историю за 2ч, отправляет в LLM и сохраняет диагноз — виден во вкладке
 «Алерты» веб-интерфейса и через `/alerts/history`.
 
+### Удаление ложных срабатываний
+
+Записи истории удаляются из вкладки «Алерты» кнопкой **✕ Удалить** — она видна
+только администраторам. Или через API:
+
+```bash
+# одну запись (id виден в /alerts/history)
+curl -X DELETE http://localhost:5001/api/alerts/42
+
+# все записи одного типа — когда ошибочное правило нагенерировало пачку
+curl -X DELETE 'http://localhost:5001/api/alerts?name=ReplicationLagCritical'
+```
+
+Чистить историю стоит не только ради порядка: ложные записи попадают в контекст
+ИИ при вопросах про инциденты и искажают разбор следующих проблем.
+
+Если агент недоступен, можно и напрямую в БД:
+
+```bash
+sqlite3 /opt/ai-alert-agent/alerts.db   "SELECT id, ts, alert, cluster_label FROM alerts ORDER BY ts DESC LIMIT 20;"
+sqlite3 /opt/ai-alert-agent/alerts.db "DELETE FROM alerts WHERE id IN (41, 42);"
+```
+
+⚠️ Удаление записи из истории **не гасит сам алерт**, если он всё ещё активен
+в Alertmanager — тогда он придёт снова. Сначала устраните причину (или
+исправьте правило и выполните `sudo ./manage_cluster.sh apply`), и только
+потом чистите историю.
+
 ### Реплики с намеренной задержкой (MASTER_DELAY)
 
 Если реплика поднята как «отложенная» (`CHANGE MASTER TO MASTER_DELAY=7200`),

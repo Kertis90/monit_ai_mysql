@@ -360,7 +360,7 @@ EOF
     # Перезагрузить Prometheus без рестарта
     if systemctl is-active prometheus &>/dev/null; then
         PROM_RELOAD="http://localhost:9090"
-        [[ -n "${PROMETHEUS_ROOT_PATH:-}" ]] && \n            PROM_RELOAD="${INTERNAL_BASE_URL:-http://localhost}${PROMETHEUS_ROOT_PATH}"
+        [[ -n "${PROMETHEUS_ROOT_PATH:-}" ]] && PROM_RELOAD="${INTERNAL_BASE_URL:-http://localhost}${PROMETHEUS_ROOT_PATH}"
         curl -sf -X POST "${PROM_RELOAD}/-/reload" \
              || systemctl reload prometheus || true
         log_info "Prometheus конфиг перезагружен ✓"

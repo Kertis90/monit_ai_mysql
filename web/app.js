@@ -13,6 +13,7 @@ const App = (() => {
     sessionId:     'web-' + Math.random().toString(36).slice(2, 10),
     clientId:      null,   // стабильный id браузера (localStorage)
     fingerprint:   '',     // грубый отпечаток — только как подсказка
+    isAdmin:       false,  // от /api/me — показывать ли действия админа
     clusters:      [],
     currentTab:    'chat',
     streamingEl:   null,   // элемент .msg-body куда стримятся токены
@@ -112,6 +113,7 @@ const App = (() => {
       badge.style.display = '';
       // При SSO выход делает прокси, своя кнопка только путала бы
       if (d.source !== 'sso') $('logout-btn').style.display = '';
+      state.isAdmin = !!d.is_admin;
       if (d.is_admin) $('tab-btn-access').style.display = '';
     } catch (e) {
       console.warn('Не удалось определить пользователя:', e);
@@ -494,10 +496,41 @@ const App = (() => {
           <div class="ameta">${esc(it.cluster_label || it.instance)} · ${esc((it.timestamp||'').replace('T',' ').slice(0,19))} UTC</div>
           <div class="asummary">${esc(it.summary)}</div>
           <button class="expand-link" onclick="App.toggleAnalysis(${i}, this)">▸ Анализ ИИ</button>
+          ${state.isAdmin && it.id ? `<button class="expand-link" style="margin-left:12px"
+             onclick="App.deleteAlert(${it.id})" title="Удалить ложное срабатывание">✕ Удалить</button>` : ''}
           <div class="analysis-box" id="ab-${i}">${esc(it.analysis)}</div>
         </div>`).join('');
     } catch (e) {
       el.innerHTML = `<div class="muted" style="color:var(--red)">Ошибка: ${esc(e.message)}</div>`;
+    }
+  }
+
+  async function deleteAlert(id) {
+    if (!confirm('Удалить эту запись из истории алертов?')) return;
+    try {
+      const r = await fetch('api/alerts/' + id, { method: 'DELETE' });
+      if (!r.ok) {
+        const d = await r.json().catch(() => ({}));
+        alert('Не удалось удалить: ' + (d.detail || r.status));
+        return;
+      }
+      await loadAlerts();
+    } catch (e) {
+      alert('Не удалось удалить: ' + e);
+    }
+  }
+
+  async function deleteAlertsByName(name) {
+    if (!name) return;
+    if (!confirm('Удалить ВСЕ записи алерта "' + name + '" из истории?')) return;
+    try {
+      const r = await fetch('api/alerts?name=' + encodeURIComponent(name),
+                            { method: 'DELETE' });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) { alert('Не удалось удалить: ' + (d.detail || r.status)); return; }
+      await loadAlerts();
+    } catch (e) {
+      alert('Не удалось удалить: ' + e);
     }
   }
 
@@ -658,5 +691,5 @@ const App = (() => {
   return { showTab, pickCluster, useSuggestion, toggleAnalysis,
            loadStatus, loadAlerts, refreshClusters, forgetHistory, logout,
            loadAccess, searchDirectory, grantFound, grantAgain,
-           grantManual, revokeAccess };
+           grantManual, revokeAccess, deleteAlert, deleteAlertsByName };
 })();

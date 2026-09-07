@@ -430,14 +430,45 @@ def alerts_load(limit: int) -> tuple[int, list[dict]]:
             total = conn.execute(
                 "SELECT COUNT(*) FROM alerts WHERE ts >= ?", (cutoff,)).fetchone()[0]
             rows = conn.execute(
-                "SELECT ts AS timestamp, alert, cluster, cluster_label, instance,"
-                "       severity, summary, analysis"
+                "SELECT id, ts AS timestamp, alert, cluster, cluster_label,"
+                "       instance, severity, summary, analysis"
                 "  FROM alerts WHERE ts >= ? ORDER BY ts DESC LIMIT ?",
                 (cutoff, limit)).fetchall()
         return total, [dict(r) for r in rows]
     except Exception as e:
         logger.error(f"Не удалось прочитать историю алертов: {e}")
         return len(alert_history), alert_history[:limit]
+
+
+def alerts_delete(alert_id: int) -> bool:
+    """Удалить одну запись истории. Ложные срабатывания незачем хранить:
+    они попадают в контекст ИИ и искажают разбор следующих инцидентов."""
+    if not ALERTS_DB_OK:
+        return False
+    try:
+        with closing(agent_db()) as conn, conn:
+            cur = conn.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
+        if cur.rowcount:
+            logger.info(f"Удалена запись алерта id={alert_id}")
+        return bool(cur.rowcount)
+    except Exception as e:
+        logger.error(f"Не удалось удалить алерт {alert_id}: {e}")
+        return False
+
+
+def alerts_delete_by_name(name: str) -> int:
+    """Удалить все записи одного типа — когда правило ошибочно нагенерировало
+    пачку одинаковых срабатываний."""
+    if not ALERTS_DB_OK or not name:
+        return 0
+    try:
+        with closing(agent_db()) as conn, conn:
+            cur = conn.execute("DELETE FROM alerts WHERE alert = ?", (name,))
+        logger.info(f"Удалено записей алерта {name}: {cur.rowcount}")
+        return cur.rowcount
+    except Exception as e:
+        logger.error(f"Не удалось удалить алерты {name}: {e}")
+        return 0
 
 
 
@@ -1890,6 +1921,26 @@ def api_chat_history_clear(client_id: str = ""):
     removed = chat_clear(client_id)
     ws_sessions.pop(client_id, None)
     return {"client_id": client_id, "removed": removed}
+
+
+@app.delete("/api/alerts/{alert_id}")
+def api_alert_delete(alert_id: int, request: Request):
+    """Удалить одну запись истории алертов. Только для администраторов."""
+    require_admin(request)
+    if not alerts_delete(alert_id):
+        raise HTTPException(status_code=404, detail="Запись не найдена")
+    return {"ok": True, "id": alert_id}
+
+
+@app.delete("/api/alerts")
+def api_alerts_delete_by_name(request: Request, name: str = ""):
+    """Удалить все записи одного типа — например, пачку ложных
+    ReplicationLagCritical, нагенерированных ошибочным правилом."""
+    require_admin(request)
+    if not name:
+        raise HTTPException(status_code=400, detail="Укажите параметр name")
+    removed = alerts_delete_by_name(name)
+    return {"ok": True, "alert": name, "removed": removed}
 
 @app.get("/alerts/history")
 def api_alerts(limit: int = 30):
