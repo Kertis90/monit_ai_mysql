@@ -321,6 +321,10 @@ def current_user(request: Request) -> Optional[dict]:
 
 alert_history: list[dict] = []   # запасная копия в памяти, если БД недоступна
 ws_sessions:   dict[str, list[dict]] = {}   # session_id -> messages
+# Живые WebSocket-соединения. Без их принудительного закрытия uvicorn
+# при остановке ждёт, пока клиенты отключатся сами — а вкладка чата
+# держит сокет часами, и рестарт растягивался на минуты.
+ws_clients: set = set()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2346,6 +2350,7 @@ async def websocket_chat(ws: WebSocket):
             await ws.close(code=4401)
             return
 
+    ws_clients.add(ws)
     session_id = f"ws-{id(ws)}"
     logger.info(f"WS connected: {session_id}"
                 + (f" user={ws_user['username']}" if ws_user else ""))
@@ -2480,6 +2485,7 @@ async def websocket_chat(ws: WebSocket):
         except Exception:
             pass
     finally:
+        ws_clients.discard(ws)
         # Без этого задача-читатель переживёт соединение и повиснет
         reader_task.cancel()
         try:
@@ -2932,6 +2938,18 @@ if Path(WEB_DIR).exists():
     app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
 
 
+@app.on_event("shutdown")
+async def on_shutdown():
+    """Разорвать сокеты, чтобы uvicorn не ждал клиентов при остановке."""
+    for ws in list(ws_clients):
+        try:
+            await ws.close(code=1001)   # 1001 = сервер уходит
+        except Exception:
+            pass
+    ws_clients.clear()
+    logger.info("Соединения закрыты, агент останавливается")
+
+
 if __name__ == "__main__":
     import uvicorn
     logger.info(f"MySQL AI Agent v3 | :{AGENT_PORT} | LLM={LLM_BASE_URL} model={LLM_MODEL}")
@@ -2940,4 +2958,7 @@ if __name__ == "__main__":
         refresh_db_versions()
     except Exception as e:
         logger.error(f"Версии БД не получены: {e}")
-    uvicorn.run(app, host="0.0.0.0", port=AGENT_PORT, log_level="info")
+    # timeout_graceful_shutdown обязателен: по умолчанию uvicorn ждёт
+    # закрытия соединений без ограничения времени
+    uvicorn.run(app, host="0.0.0.0", port=AGENT_PORT, log_level="info",
+                timeout_graceful_shutdown=5)

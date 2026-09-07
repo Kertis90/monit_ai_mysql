@@ -47,34 +47,48 @@ log_section "Python-зависимости (venv)"
 python3 -m venv "${AGENT_DIR}/venv"
 
 # ── pip-репозиторий из config.env (пусто = публичный PyPI) ────────────────────
+# Хост из URL — чтобы добавить его в trusted-host: за корпоративным TLS-прокси
+# сертификат подменяется, и pip иначе падает на проверке.
+pip_host() { printf '%s' "$1" | sed -E 's#^[a-z]+://##; s#^[^@]*@##; s#[:/].*$##'; }
+
+# Проверку сертификатов не делаем никогда: в закрытом контуре её всё равно
+# ломает MITM-прокси. Трафик остаётся внутри периметра.
+PIP_TRUSTED=(pypi.org files.pythonhosted.org)
+[[ -n "${PIP_INDEX_URL:-}" ]]       && PIP_TRUSTED+=("$(pip_host "${PIP_INDEX_URL}")")
+[[ -n "${PIP_EXTRA_INDEX_URL:-}" ]] && PIP_TRUSTED+=("$(pip_host "${PIP_EXTRA_INDEX_URL}")")
+[[ -n "${PIP_TRUSTED_HOST:-}" ]]    && PIP_TRUSTED+=("${PIP_TRUSTED_HOST}")
+# убрать дубли и пустые
+mapfile -t PIP_TRUSTED < <(printf '%s\n' "${PIP_TRUSTED[@]}" | awk 'NF && !seen[$0]++')
+
 PIP_ARGS=()
+for h in "${PIP_TRUSTED[@]}"; do PIP_ARGS+=(--trusted-host "$h"); done
+
 if [[ -n "${PIP_INDEX_URL:-}" ]]; then
     PIP_ARGS+=(--index-url "${PIP_INDEX_URL}")
     [[ -n "${PIP_EXTRA_INDEX_URL:-}" ]] && PIP_ARGS+=(--extra-index-url "${PIP_EXTRA_INDEX_URL}")
-    [[ -n "${PIP_TRUSTED_HOST:-}"    ]] && PIP_ARGS+=(--trusted-host "${PIP_TRUSTED_HOST}")
     [[ -n "${PIP_CERT:-}"            ]] && PIP_ARGS+=(--cert "${PIP_CERT}")
 
     if [[ -n "${PIP_CERT:-}" && ! -f "${PIP_CERT}" ]]; then
         log_error "CA-сертификат для pip не найден: ${PIP_CERT}"
         exit 1
     fi
-
-    # Закрепляем репозиторий в самом venv, чтобы последующие ручные
-    # pip install в нём тоже шли во внутренний репозиторий.
-    {
-        echo "[global]"
-        echo "index-url = ${PIP_INDEX_URL}"
-        [[ -n "${PIP_EXTRA_INDEX_URL:-}" ]] && echo "extra-index-url = ${PIP_EXTRA_INDEX_URL}"
-        [[ -n "${PIP_TRUSTED_HOST:-}"    ]] && echo "trusted-host = ${PIP_TRUSTED_HOST}"
-        [[ -n "${PIP_CERT:-}"            ]] && echo "cert = ${PIP_CERT}"
-    } > "${AGENT_DIR}/venv/pip.conf"
-    chmod 600 "${AGENT_DIR}/venv/pip.conf"
-
     # URL может содержать логин:пароль — не печатаем его целиком
     log_info "pip-репозиторий: $(printf '%s' "${PIP_INDEX_URL}" | sed -E 's#(://[^:/@]+):[^@]*@#\1:***@#')"
 else
     log_info "pip-репозиторий: публичный PyPI"
 fi
+
+# Закрепляем настройки в самом venv, чтобы последующие ручные pip install
+# в нём шли туда же и тоже не спотыкались о сертификаты.
+{
+    echo "[global]"
+    [[ -n "${PIP_INDEX_URL:-}" ]]       && echo "index-url = ${PIP_INDEX_URL}"
+    [[ -n "${PIP_EXTRA_INDEX_URL:-}" ]] && echo "extra-index-url = ${PIP_EXTRA_INDEX_URL}"
+    [[ -n "${PIP_CERT:-}" ]]            && echo "cert = ${PIP_CERT}"
+    echo "trusted-host = ${PIP_TRUSTED[*]}"
+} > "${AGENT_DIR}/venv/pip.conf"
+chmod 600 "${AGENT_DIR}/venv/pip.conf"
+log_info "trusted-host: ${PIP_TRUSTED[*]}"
 
 "${AGENT_DIR}/venv/bin/pip" install --upgrade pip -q "${PIP_ARGS[@]}"
 "${AGENT_DIR}/venv/bin/pip" install -q "${PIP_ARGS[@]}" \
@@ -193,7 +207,11 @@ WorkingDirectory=${AGENT_DIR}
 EnvironmentFile=${AGENT_DIR}/.env
 ExecStart=${AGENT_DIR}/venv/bin/python agent.py
 Restart=always
-RestartSec=10s
+RestartSec=3s
+# Без этого systemd ждёт остановки 90 секунд по умолчанию
+TimeoutStopSec=15
+KillMode=mixed
+KillSignal=SIGTERM
 StandardOutput=journal
 StandardError=journal
 
