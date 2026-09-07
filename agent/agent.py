@@ -1599,16 +1599,48 @@ def log_pick_files(files: list, since_epoch: float, until_epoch: float,
     return sorted(picked, key=lambda f: -f["mtime"])[:limit]
 
 
-def log_date_patterns(since, until) -> list:
-    """Шаблоны дат для grep. Формат метки зависит от версии и настроек,
-    поэтому отдаём оба распространённых вида."""
-    pats = []
-    day = since.replace(hour=0, minute=0, second=0, microsecond=0)
-    while day <= until and len(pats) < 10:
-        pats.append(day.strftime("%Y-%m-%d"))   # 2026-09-07 — MySQL 5.7+, syslog
-        pats.append(day.strftime("%y%m%d"))     # 260907     — старый формат MySQL
+def log_date_patterns(since, until, extra_utc=False) -> list:
+    """Шаблоны дат для grep -F.
+
+    Формат метки зависит от того, кто пишет лог, поэтому отдаём все
+    распространённые виды:
+
+      2026-09-07   ISO — slow-лог MySQL 5.7+, syslog, большинство сервисов
+      260907       старый формат MySQL (5.6 и раньше)
+      07.09.2026   логи приложения Lanbilling:
+                   «07.09.2026 17:30:01.123456 DEBUG LWP410005 [file:func] текст»
+      07/09/2026   встречается в веб-серверах и части приложений
+
+    extra_utc — добавить те же даты по UTC. Нужно для slow-лога: начиная
+    с MySQL 5.7.2 переменная log_timestamps по умолчанию UTC, то есть метки
+    в нём могут отличаться от локального времени сервера. На границе суток
+    без этого можно промахнуться на день.
+    """
+    days, day = [], since.replace(hour=0, minute=0, second=0, microsecond=0)
+    while day <= until and len(days) < 8:
+        days.append(day)
         day += datetime.timedelta(days=1)
-    return pats
+
+    if extra_utc:
+        # смещение сервера неизвестно этой функции, поэтому просто добавляем
+        # соседние сутки: разница поясов никогда не больше 14 часов
+        edge = [days[0] - datetime.timedelta(days=1),
+                days[-1] + datetime.timedelta(days=1)]
+        days = edge[:1] + days + edge[1:]
+
+    pats = []
+    for d in days:
+        pats.append(d.strftime("%Y-%m-%d"))    # 2026-09-07
+        pats.append(d.strftime("%y%m%d"))      # 260907
+        pats.append(d.strftime("%d.%m.%Y"))    # 07.09.2026
+        pats.append(d.strftime("%d/%m/%Y"))    # 07/09/2026
+    # порядок сохраняем, дубли убираем
+    seen, out = set(), []
+    for p in pats:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
 
 
 def log_reader_cmd(path: str, args: str) -> str:
@@ -1619,8 +1651,10 @@ def log_reader_cmd(path: str, args: str) -> str:
     """
     q = shlex.quote(path)
     if path.lower().endswith(".gz"):
-        return "zgrep -a -F " + args + " " + q + " 2>/dev/null"
-    return "grep -a -F " + args + " " + q + " 2>/dev/null"
+        return "LC_ALL=C zgrep -a -F " + args + " " + q + " 2>/dev/null"
+    # LC_ALL=C — grep по байтам вместо UTF-8: на гигабайтных файлах
+    # это ускоряет поиск в несколько раз
+    return "LC_ALL=C grep -a -F " + args + " " + q + " 2>/dev/null"
 
 
 async def log_grep(host: str, path: str, patterns: list,
@@ -1638,7 +1672,8 @@ async def log_grep(host: str, path: str, patterns: list,
 
 async def read_log_group(host: str, dirs: list, pattern: str, since, until,
                          title: str, extra: str = "", hint: str = "",
-                         since_epoch: float = 0, until_epoch: float = 0) -> str:
+                         since_epoch: float = 0, until_epoch: float = 0,
+                         utc_dates: bool = False) -> str:
     """Общий путь чтения: stat -> выбор файлов по времени -> grep.
 
     Одинаково работает и для slow-лога, и для логов приложения: оба
@@ -1669,7 +1704,7 @@ async def read_log_group(host: str, dirs: list, pattern: str, since, until,
         out.append("  {} — {:.1f} МБ, изменён {:%Y-%m-%d %H:%M}"
                    .format(f["path"], f["size"] / 1048576, mt))
         ok, text = await log_grep(host, f["path"],
-                                  log_date_patterns(since, until),
+                                  log_date_patterns(since, until, utc_dates),
                                   extra, per_file)
         lines = [l for l in text.splitlines() if l.strip()] if ok else []
         if not ok:
@@ -1709,6 +1744,7 @@ async def read_slow_log(cluster: dict, host: str, since, until,
         dirs.append(arch)
     return await read_log_group(
         host, dirs, pattern, since, until, "Slow-лог", extra,
+        utc_dates=True,
         hint="Записей за период нет. Возможно, slow_query_log выключен "
              "или long_query_time слишком велик.",
         since_epoch=since_epoch, until_epoch=until_epoch)
