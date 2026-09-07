@@ -576,7 +576,8 @@ def alerts_query(cluster: Optional[str] = None,
 
         sql    = ("SELECT ts AS timestamp, alert, cluster, cluster_label,"
                   "       instance, severity, summary, analysis,"
-                  "       COALESCE(source, 'prometheus') AS source"
+                  "       COALESCE(source, 'prometheus') AS source,"
+                  "       resolution, resolved_by, resolved_at"
                   "  FROM alerts WHERE ts >= ?")
         params: list = [since]
         if cluster:
@@ -604,7 +605,8 @@ def alerts_load(limit: int) -> tuple[int, list[dict]]:
             rows = conn.execute(
                 "SELECT id, ts AS timestamp, alert, cluster, cluster_label,"
                 "       instance, severity, summary, analysis,"
-                "       COALESCE(source, 'prometheus') AS source"
+                "       COALESCE(source, 'prometheus') AS source,"
+                "       resolution, resolved_by, resolved_at"
                 "  FROM alerts WHERE ts >= ? ORDER BY ts DESC LIMIT ?",
                 (cutoff, limit)).fetchall()
         return total, [dict(r) for r in rows]
@@ -736,6 +738,120 @@ USERS_DB_OK = users_init()
 #  Без неё непонятно, на каких вопросах агент промахивается, и улучшения
 #  делаются вслепую. Храним вопрос, ответ и оценку — через месяц видно,
 #  где он систематически не справляется.
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ПАМЯТЬ ИНЦИДЕНТОВ
+#  Что помогло в прошлый раз. Без этого агент на повторе выводит всё заново,
+#  хотя причина уже известна и записана дежурным.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Повтор того же алерта в этом окне не отправляется в LLM заново: разбор
+# берётся у предыдущего срабатывания. Alertmanager подавляет производные,
+# но одинаковые повторы всё равно приходят по repeat_interval.
+ALERT_DEDUP_MINUTES = int(os.environ.get("ALERT_DEDUP_MINUTES", "60"))
+
+
+def incidents_init() -> bool:
+    """Добавить поля решения к таблице алертов."""
+    if not ALERTS_DB_OK:
+        return False
+    try:
+        with closing(agent_db()) as conn, conn:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(alerts)")}
+            for col in ("resolution", "resolved_by", "resolved_at"):
+                if col not in cols:
+                    conn.execute(f"ALTER TABLE alerts ADD COLUMN {col} TEXT")
+            if "resolution" not in cols:
+                logger.info("В таблицу alerts добавлены поля решения инцидента")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_name"
+                         " ON alerts(alert, cluster)")
+        return True
+    except Exception as e:
+        logger.error(f"Поля решения не добавлены: {e}")
+        return False
+
+
+INCIDENTS_DB_OK = incidents_init()
+
+
+def alert_resolve(alert_id: int, resolution: str, by: str = "") -> bool:
+    """Записать, чем инцидент закончился."""
+    if not INCIDENTS_DB_OK or not resolution.strip():
+        return False
+    try:
+        with closing(agent_db()) as conn, conn:
+            cur = conn.execute(
+                "UPDATE alerts SET resolution = ?, resolved_by = ?,"
+                " resolved_at = ? WHERE id = ?",
+                (resolution.strip()[:4000], by,
+                 datetime.datetime.utcnow().isoformat(), alert_id))
+        if cur.rowcount:
+            logger.info(f"Записано решение инцидента id={alert_id} ({by})")
+        return bool(cur.rowcount)
+    except Exception as e:
+        logger.error(f"Не удалось записать решение: {e}")
+        return False
+
+
+def similar_incidents(alert_name: str, cluster: Optional[str] = None,
+                      limit: int = 3) -> list:
+    """Прошлые случаи ЭТОГО ЖЕ алерта, для которых записано решение.
+
+    Ищем по имени алерта: сначала на том же кластере, потом на любом —
+    решение с соседнего кластера обычно тоже подходит.
+    """
+    if not INCIDENTS_DB_OK or not alert_name:
+        return []
+    try:
+        with closing(agent_db()) as conn:
+            rows = conn.execute(
+                "SELECT ts, alert, cluster_label, resolution, resolved_by,"
+                "       CASE WHEN cluster = ? THEN 0 ELSE 1 END AS other"
+                "  FROM alerts"
+                " WHERE alert = ? AND resolution IS NOT NULL AND resolution <> ''"
+                " ORDER BY other, ts DESC LIMIT ?",
+                (cluster or "", alert_name, limit)).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.error(f"Поиск похожих инцидентов не удался: {e}")
+        return []
+
+
+def fmt_incidents(items: list, alert_name: str) -> str:
+    if not items:
+        return ""
+    lines = [f"## Чем заканчивался «{alert_name}» раньше", "",
+             "  Записи дежурных по прошлым случаям. Если причина та же —",
+             "  скажи об этом прямо и предложи проверенное решение первым.", ""]
+    for it in items:
+        ts = (it["ts"] or "")[:16].replace("T", " ")
+        who = f", записал {it['resolved_by']}" if it["resolved_by"] else ""
+        where = it["cluster_label"] or "—"
+        lines.append(f"  [{ts} UTC, {where}{who}]")
+        lines.append(f"      {it['resolution']}")
+    return "\n".join(lines)
+
+
+def recent_same_alert(alert_name: str, cluster: Optional[str],
+                      instance: str) -> Optional[dict]:
+    """Тот же алерт в окне дедупликации — чтобы не разбирать повтор заново."""
+    if not ALERTS_DB_OK or ALERT_DEDUP_MINUTES <= 0:
+        return None
+    try:
+        since = (datetime.datetime.utcnow()
+                 - datetime.timedelta(minutes=ALERT_DEDUP_MINUTES)).isoformat()
+        with closing(agent_db()) as conn:
+            row = conn.execute(
+                "SELECT id, ts, analysis FROM alerts"
+                " WHERE alert = ? AND ts >= ?"
+                "   AND COALESCE(cluster,'') = ? AND COALESCE(instance,'') = ?"
+                " ORDER BY ts DESC LIMIT 1",
+                (alert_name, since, cluster or "", instance or "")).fetchone()
+        return dict(row) if row else None
+    except Exception as e:
+        logger.error(f"Проверка повтора алерта не удалась: {e}")
+        return None
 # ══════════════════════════════════════════════════════════════════════════════
 
 def feedback_init() -> bool:
@@ -3837,12 +3953,38 @@ async def webhook(request: Request):
 
         logger.info(f"[ALERT] {name} | {cluster_label} | {severity}")
 
+        # Повтор того же алерта — не гоняем LLM заново. Alertmanager
+        # подавляет производные, но одинаковые повторы приходят
+        # по repeat_interval, и каждый стоил бы отдельного запроса.
+        dup = recent_same_alert(name, cluster["name"] if cluster else None,
+                                instance)
+        if dup:
+            logger.info(f"[ALERT] {name}: повтор, разбор взят от id={dup['id']}")
+            alerts_save({
+                "timestamp":     datetime.datetime.utcnow().isoformat(),
+                "alert":         name,
+                "cluster":       cluster["name"] if cluster else None,
+                "cluster_label": cluster_label,
+                "instance":      instance,
+                "severity":      severity,
+                "summary":       summary,
+                "analysis":      dup["analysis"],
+                "source":        "prometheus",
+            })
+            processed += 1
+            continue
+
         blocks = []
         if cluster:
             current = await collect_current(cluster)
             blocks.append(fmt_current(current))
             hist = await collect_history(cluster, 2)
             blocks.append(fmt_history(hist, cluster_label))
+        # Чем это заканчивалось раньше — если дежурный записывал решение
+        past = similar_incidents(name, cluster["name"] if cluster else None)
+        if past:
+            blocks.append(fmt_incidents(past, name))
+
         ctx = "\n\n".join(blocks) if blocks else "Метрики недоступны."
 
         prompt = f"""## Алерт
@@ -4136,6 +4278,31 @@ async def api_alert_ingest(payload: IngestAlert, request: Request):
     return {"ok": True, "alert": name, "severity": severity,
             "cluster": cluster["name"] if cluster else None,
             "source": payload.source, "analyzed": not analysis.startswith("Разбор не выполнен")}
+
+
+class ResolveRequest(BaseModel):
+    resolution: str
+
+
+@app.post("/api/alerts/{alert_id}/resolve", tags=["События"],
+          summary="Записать, чем закончился инцидент")
+def api_alert_resolve(alert_id: int, req: ResolveRequest, request: Request):
+    """Записанное решение подкладывается в разбор при повторе этого же
+    алерта — агент предложит проверенное вместо вывода с нуля."""
+    user = current_user(request) if AUTH_ENABLED else None
+    who = (user or {}).get("username", "")
+    if not alert_resolve(alert_id, req.resolution, who):
+        raise HTTPException(status_code=400,
+                            detail="Запись не найдена или решение пустое")
+    return {"ok": True, "id": alert_id}
+
+
+@app.get("/api/incidents/{alert_name}", tags=["События"],
+         summary="Как решали такой инцидент раньше")
+def api_incidents(alert_name: str, request: Request, cluster: str = ""):
+    """Прошлые случаи этого алерта с записанными решениями."""
+    items = similar_incidents(alert_name, cluster or None, limit=10)
+    return {"alert": alert_name, "total": len(items), "items": items}
 
 @app.delete("/api/alerts/{alert_id}", tags=["События"], summary="Удалить запись истории")
 def api_alert_delete(alert_id: int, request: Request):

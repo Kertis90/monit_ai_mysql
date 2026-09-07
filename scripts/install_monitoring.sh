@@ -379,7 +379,7 @@ route:
   group_by: ['alertname', 'cluster']
   group_wait: 30s
   group_interval: 5m
-  repeat_interval: 4h
+  repeat_interval: 12h
   receiver: 'ai-and-email'
   routes:
     - match: { severity: warning }
@@ -398,6 +398,31 @@ receivers:
         send_resolved: false
 
 inhibit_rules:
+  # MySQL лежит — производные алерты по тому же серверу не нужны: репликация,
+  # падение QPS и подключения отвалились именно из-за этого. Без правила
+  # каждый из них уходит в агента и тратит отдельный запрос к LLM на разбор
+  # одного и того же инцидента.
+  - source_match: { alertname: 'MySQLDown' }
+    target_match_re: { alertname: '.*' }
+    equal: ['cluster', 'instance']
+
+  # Поток репликации не работает — отставание вторично, оно следствие
+  - source_match_re: { alertname: 'Replication(IO|SQL)ThreadDown' }
+    target_match_re: { alertname: 'ReplicationLag(Warning|Critical)' }
+    equal: ['cluster', 'instance']
+
+  # Критический порог глушит предупредительный по тому же показателю
+  - source_match: { alertname: 'MySQLConnectionsCritical' }
+    target_match: { alertname: 'MySQLHighConnections' }
+    equal: ['cluster', 'instance']
+  - source_match: { alertname: 'ReplicationLagCritical' }
+    target_match: { alertname: 'ReplicationLagWarning' }
+    equal: ['cluster', 'instance']
+  - source_match: { alertname: 'DiskSpaceCritical' }
+    target_match: { alertname: 'DiskSpaceLow' }
+    equal: ['cluster', 'instance']
+
+  # Общее правило последним: critical по кластеру глушит warning
   - source_match: { severity: critical }
     target_match: { severity: warning }
     equal: ['cluster']
@@ -411,7 +436,7 @@ route:
   group_by: ['alertname', 'cluster']
   group_wait: 30s
   group_interval: 5m
-  repeat_interval: 4h
+  repeat_interval: 12h
   receiver: 'ai-agent'
 
 receivers:
@@ -421,6 +446,31 @@ receivers:
         send_resolved: false
 
 inhibit_rules:
+  # MySQL лежит — производные алерты по тому же серверу не нужны: репликация,
+  # падение QPS и подключения отвалились именно из-за этого. Без правила
+  # каждый из них уходит в агента и тратит отдельный запрос к LLM на разбор
+  # одного и того же инцидента.
+  - source_match: { alertname: 'MySQLDown' }
+    target_match_re: { alertname: '.*' }
+    equal: ['cluster', 'instance']
+
+  # Поток репликации не работает — отставание вторично, оно следствие
+  - source_match_re: { alertname: 'Replication(IO|SQL)ThreadDown' }
+    target_match_re: { alertname: 'ReplicationLag(Warning|Critical)' }
+    equal: ['cluster', 'instance']
+
+  # Критический порог глушит предупредительный по тому же показателю
+  - source_match: { alertname: 'MySQLConnectionsCritical' }
+    target_match: { alertname: 'MySQLHighConnections' }
+    equal: ['cluster', 'instance']
+  - source_match: { alertname: 'ReplicationLagCritical' }
+    target_match: { alertname: 'ReplicationLagWarning' }
+    equal: ['cluster', 'instance']
+  - source_match: { alertname: 'DiskSpaceCritical' }
+    target_match: { alertname: 'DiskSpaceLow' }
+    equal: ['cluster', 'instance']
+
+  # Общее правило последним: critical по кластеру глушит warning
   - source_match: { severity: critical }
     target_match: { severity: warning }
     equal: ['cluster']

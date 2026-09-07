@@ -534,3 +534,8 @@ textarea#input:disabled { opacity: .55; }
            color: inherit; background: none; border-radius: 5px;
            border: 1px solid var(--border, #2b313c); }
 .fb-btn:hover { color: var(--accent, #4c8dff); border-color: var(--accent, #4c8dff); }
+
+/* Записанное решение инцидента */
+.resolution { margin-top: 6px; padding: 6px 10px; font-size: 12px;
+              border-left: 3px solid var(--accent, #4c8dff);
+              background: rgba(76,141,255,.07); border-radius: 0 6px 6px 0; }

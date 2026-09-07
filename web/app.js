@@ -546,13 +546,32 @@ const App = (() => {
           <div class="ameta">${esc(it.cluster_label || it.instance)} · ${esc((it.timestamp||'').replace('T',' ').slice(0,19))} UTC</div>
           <div class="asummary">${esc(it.summary)}</div>
           <button class="expand-link" onclick="App.toggleAnalysis(${i}, this)">▸ Анализ ИИ</button>
+          ${it.id ? `<button class="expand-link" style="margin-left:12px"
+             onclick="App.resolveAlert(${it.id})"
+             title="Записать, чем закончился инцидент">✎ ${it.resolution ? 'Решение записано' : 'Записать решение'}</button>` : ''}
           ${state.isAdmin && it.id ? `<button class="expand-link" style="margin-left:12px"
              onclick="App.deleteAlert(${it.id})" title="Удалить ложное срабатывание">✕ Удалить</button>` : ''}
+          ${it.resolution ? `<div class="resolution"><b>Что помогло:</b> ${esc(it.resolution)}${
+             it.resolved_by ? ' <span class="muted">— ' + esc(it.resolved_by) + '</span>' : ''}</div>` : ''}
           <div class="analysis-box" id="ab-${i}">${esc(it.analysis)}</div>
         </div>`).join('');
     } catch (e) {
       el.innerHTML = `<div class="muted" style="color:var(--red)">Ошибка: ${esc(e.message)}</div>`;
     }
+  }
+
+  async function resolveAlert(id) {
+    const txt = prompt('Чем закончился инцидент? Что именно помогло? '
+                     + 'Запись всплывёт при следующем таком же алерте.');
+    if (!txt || !txt.trim()) return;
+    try {
+      const r = await fetch('api/alerts/' + id + '/resolve', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ resolution: txt.trim() }),
+      });
+      if (!r.ok) { alert('Не удалось сохранить'); return; }
+      await loadAlerts();
+    } catch (e) { alert('Не удалось сохранить: ' + e); }
   }
 
   async function deleteAlert(id) {
@@ -1090,5 +1109,6 @@ const App = (() => {
            loadStatus, loadAlerts, refreshClusters, forgetHistory, logout,
            loadAccess, searchDirectory, grantFound, grantAgain,
            grantManual, revokeAccess, deleteAlert, deleteAlertsByName,
+           resolveAlert,
            stopGeneration };
 })();
