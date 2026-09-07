@@ -124,6 +124,14 @@ cmd_add() {
         DELAY_C="${DELAY_C:-7200}"
         [[ "$DELAY_C" =~ ^[0-9]+$ ]] || { log_error "Задержка должна быть целым числом секунд"; exit 1; }
     fi
+    echo "  Учётка для SQL-запросов агента (только SELECT)."
+    echo "  Одна на все серверы кластера. Enter — запросы к БД отключить."
+    read -rp  "  Логин для SQL-запросов (Enter — пропустить): "      DB_USER_C
+    DB_PASS_C=""
+    if [[ -n "$DB_USER_C" ]]; then
+        read -rsp "  Пароль этой учётки: "                            DB_PASS_C
+        echo ""
+    fi
     read -rsp "  Пароль пользователя exporter в MySQL: "           EXPORTER_PASS
     echo ""
     read -rp "  Теги через запятую (напр. siberia,production): "   TAGS_STR
@@ -149,6 +157,8 @@ new_cluster = {
     "replica_ip":              "$REPLICA_IP_C",
     "replica_delay_seconds":   $DELAY_C,
     "mysql_exporter_password": "$EXPORTER_PASS",
+    "db_user":                 "$DB_USER_C",
+    "db_password":             "$DB_PASS_C",
     "enabled":                 True,
     "tags":                    $TAGS_JSON,
 }

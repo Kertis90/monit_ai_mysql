@@ -84,6 +84,22 @@ fi
     "pydantic==2.7.1" \
     "websockets==12.0"
 
+# pymysql — только если хоть у одного кластера заполнен db_user.
+# Чистый Python, без системных библиотек: в закрытый pip-репозиторий ложится.
+NEED_MYSQL=$(python3 -c "
+import json
+d = json.load(open('${SCRIPT_DIR}/../clusters.json', encoding='utf-8'))
+print('yes' if any((c.get('db_user') or '').strip() for c in d['clusters']) else 'no')
+" 2>/dev/null || echo "no")
+
+if [[ "$NEED_MYSQL" == "yes" ]]; then
+    if "${AGENT_DIR}/venv/bin/pip" install -q "${PIP_ARGS[@]}" "pymysql==1.1.0"; then
+        log_info "pymysql установлен (SQL-запросы к кластерам)"
+    else
+        log_error "Не удалось поставить pymysql — SQL-запросы работать не будут"
+    fi
+fi
+
 if [[ "${LDAP_ENABLED:-false}" == "true" ]]; then
     if "${AGENT_DIR}/venv/bin/pip" install -q "${PIP_ARGS[@]}" "ldap3==2.9.1"; then
         log_info "ldap3 установлен (LDAP-аутентификация)"

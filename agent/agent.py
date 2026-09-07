@@ -1296,6 +1296,195 @@ async def collect_history(cluster: dict, hours: float) -> dict:
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  LLM — обычный вызов и стриминг
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SQL-ЗАПРОСЫ К КЛАСТЕРАМ
+#  Только чтение. Учётка задаётся в clusters.json (db_user/db_password), одна
+#  на все серверы кластера. Прав нужно ровно SELECT — писать агент не должен
+#  ни при каких обстоятельствах, поэтому запрет проверяется до отправки.
+# ══════════════════════════════════════════════════════════════════════════════
+
+SQL_MAX_ROWS    = int(os.environ.get("SQL_MAX_ROWS", "200"))
+SQL_TIMEOUT_S   = int(os.environ.get("SQL_TIMEOUT_S", "15"))
+
+# Разрешены только читающие формы. SHOW/EXPLAIN/DESCRIBE нужны для диагностики.
+SQL_ALLOWED_HEADS = ("select", "show", "explain", "describe", "desc", "with")
+
+# Явный чёрный список — вторая линия после проверки первого слова: WITH ... может
+# в MySQL 8 содержать изменяющие конструкции, а комментарии умеют их прятать.
+SQL_FORBIDDEN = (
+    "insert", "update", "delete", "drop", "truncate", "alter", "create",
+    "rename", "replace", "grant", "revoke", "set", "call", "lock", "unlock",
+    "load", "handler", "flush", "kill", "start", "commit", "rollback",
+    "savepoint", "prepare", "execute", "outfile", "dumpfile",
+)
+
+
+def sql_strip_comments(sql: str) -> str:
+    """Убрать комментарии: без этого запрет обходится через /*!*/ и -- ."""
+    sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.S)
+    sql = re.sub(r"--[^\n]*", " ", sql)
+    sql = re.sub(r"#[^\n]*", " ", sql)
+    return sql.strip()
+
+
+def sql_validate(sql: str) -> tuple[bool, str]:
+    """(можно ли выполнять, причина отказа)."""
+    # MySQL ИСПОЛНЯЕТ содержимое /*! ... */ и /*+ ... */. Если просто вырезать
+    # комментарии перед проверкой, туда прячется что угодно — поэтому такие
+    # конструкции отклоняем целиком, до разбора.
+    if re.search(r"/\*[!+]", sql):
+        return False, "Исполняемые комментарии MySQL (/*! …) запрещены"
+
+    clean = sql_strip_comments(sql)
+    if not clean:
+        return False, "Пустой запрос"
+
+    # Несколько инструкций в одном запросе не пропускаем: точка с запятой
+    # допустима только как завершающая.
+    body = clean.rstrip(";").strip()
+    if ";" in body:
+        return False, "Разрешён только один запрос без ';' внутри"
+
+    low = body.lower()
+    head = low.split(None, 1)[0] if low.split() else ""
+    if head not in SQL_ALLOWED_HEADS:
+        return False, f"Разрешены только {', '.join(SQL_ALLOWED_HEADS).upper()}"
+
+    # Границы слова с ОБЕИХ сторон: без хвостовой границы «created» ловился
+    # как CREATE, и нормальные запросы отклонялись.
+    flat = re.sub(r"\s+", " ", low)
+    for bad in SQL_FORBIDDEN:
+        if re.search(r"(?<![a-z0-9_])" + re.escape(bad) + r"(?![a-z0-9_])", flat):
+            return False, f"Запрещённая конструкция: {bad.upper()}"
+
+    return True, ""
+
+
+def sql_add_limit(sql: str) -> str:
+    """Дописать LIMIT, если его нет — чтобы не вытащить миллион строк."""
+    body = sql_strip_comments(sql).rstrip(";").strip()
+    if re.search(r"(?<![a-z_])limit\s+\d", body, re.I):
+        return body
+    if body.lower().startswith(("show", "explain", "describe", "desc")):
+        return body           # у них LIMIT либо не нужен, либо не поддержан
+    return f"{body} LIMIT {SQL_MAX_ROWS}"
+
+
+def cluster_db_creds(cluster: dict) -> Optional[tuple]:
+    user = (cluster.get("db_user") or "").strip()
+    if not user:
+        return None
+    return user, cluster.get("db_password") or ""
+
+
+def sql_run(cluster: dict, sql: str, host: Optional[str] = None) -> dict:
+    """Выполнить читающий запрос. Возвращает {columns, rows, error, ...}."""
+    creds = cluster_db_creds(cluster)
+    if not creds:
+        return {"error": "Для этого кластера не задана учётка db_user — "
+                         "SQL-запросы отключены"}
+    ok, why = sql_validate(sql)
+    if not ok:
+        logger.warning(f"SQL отклонён ({why}): {sql[:120]}")
+        return {"error": f"Запрос отклонён: {why}"}
+
+    try:
+        import pymysql
+    except ImportError:
+        return {"error": "Не установлен pymysql — переустановите агента "
+                         "с заполненным db_user в clusters.json"}
+
+    user, password = creds
+    ip = host or cluster["primary_ip"]
+    query = sql_add_limit(sql)
+    try:
+        conn = pymysql.connect(
+            host=ip, user=user, password=password,
+            connect_timeout=SQL_TIMEOUT_S, read_timeout=SQL_TIMEOUT_S,
+            charset="utf8mb4", cursorclass=pymysql.cursors.Cursor,
+            autocommit=True)
+    except Exception as e:
+        return {"error": f"Не удалось подключиться к {ip}: {e}"}
+
+    try:
+        with conn.cursor() as cur:
+            # Страховка на стороне сервера: даже если валидатор что-то упустил,
+            # сессия не сможет писать.
+            try:
+                cur.execute("SET SESSION TRANSACTION READ ONLY")
+            except Exception:
+                pass          # на реплике может быть уже read_only
+            cur.execute(f"SET SESSION MAX_EXECUTION_TIME={SQL_TIMEOUT_S * 1000}")
+            cur.execute(query)
+            cols = [d[0] for d in (cur.description or [])]
+            rows = cur.fetchmany(SQL_MAX_ROWS)
+        return {"host": ip, "query": query, "columns": cols,
+                "rows": [list(r) for r in rows], "truncated": len(rows) >= SQL_MAX_ROWS}
+    except Exception as e:
+        return {"error": f"Ошибка выполнения на {ip}: {e}"}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def fmt_sql_result(res: dict) -> str:
+    if res.get("error"):
+        return f"## Результат SQL\n\n  {res['error']}"
+    cols, rows = res["columns"], res["rows"]
+    head = [f"## Результат SQL ({res['host']})",
+            f"  Запрос: {res['query']}", ""]
+    if not rows:
+        head.append("  Строк не найдено.")
+        return "\n".join(head)
+
+    def cell(v):
+        s = "NULL" if v is None else str(v)
+        return s[:60] + "…" if len(s) > 60 else s
+
+    widths = [max(len(c), *(len(cell(r[i])) for r in rows)) for i, c in enumerate(cols)]
+    head.append("  " + " | ".join(c.ljust(w) for c, w in zip(cols, widths)))
+    head.append("  " + "-+-".join("-" * w for w in widths))
+    for r in rows:
+        head.append("  " + " | ".join(cell(v).ljust(w) for v, w in zip(r, widths)))
+    if res.get("truncated"):
+        head.append(f"  (показаны первые {SQL_MAX_ROWS} строк)")
+    return "\n".join(head)
+
+
+# ── Версии СУБД: получаем на старте, чтобы LLM знала, о чём пишет ────────────
+DB_VERSIONS: dict = {}
+
+
+def refresh_db_versions() -> None:
+    """Спросить версию у каждого кластера. Без этого агент советует синтаксис
+    наугад: у 5.7 и 8.0 разные имена таблиц performance_schema и разный SHOW."""
+    for c in enabled_clusters():
+        if not cluster_db_creds(c):
+            continue
+        res = sql_run(c, "SELECT VERSION() AS v, @@version_comment AS c")
+        if res.get("error") or not res.get("rows"):
+            logger.warning(f"Версия БД {c['name']} не получена: "
+                           f"{res.get('error', 'пустой ответ')}")
+            continue
+        ver = str(res["rows"][0][0])
+        note = str(res["rows"][0][1]) if len(res["rows"][0]) > 1 else ""
+        DB_VERSIONS[c["name"]] = f"{ver} ({note})".strip()
+        logger.info(f"MySQL {c['label']}: {DB_VERSIONS[c['name']]}")
+
+
+def db_versions_text() -> str:
+    if not DB_VERSIONS:
+        return ""
+    lines = ["Версии MySQL (учитывай синтаксис именно этих версий):"]
+    for c in enabled_clusters():
+        v = DB_VERSIONS.get(c["name"])
+        if v:
+            lines.append(f"  {c['label']}: {v}")
+    return "\n".join(lines) if len(lines) > 1 else ""
 # ══════════════════════════════════════════════════════════════════════════════
 
 def system_prompt() -> str:
@@ -1304,6 +1493,8 @@ def system_prompt() -> str:
 
 Доступные кластеры:
 {clusters_index_text()}
+
+{db_versions_text()}
 
 Правила:
 1. Отвечай ТОЛЬКО на русском языке.
@@ -1348,7 +1539,15 @@ def system_prompt() -> str:
    в ту же минуту, ищи совпадения между колонками (рост QPS при росте iowait,
    провал CPU при падении conn). Не отвечай «есть только min/avg/max», если
    такая таблица приложена. Если её нет, а спрашивают детализацию — скажи,
-   что нужно уточнить период и шаг, например «за 3 часа с разбивкой по 5 минут»."""
+   что нужно уточнить период и шаг, например «за 3 часа с разбивкой по 5 минут».
+
+10. SQL. Если приложен блок «Результат SQL» — это реальные строки из БД,
+    опирайся на них. Версии MySQL указаны выше: предлагай синтаксис и имена
+    таблиц именно для этих версий (у 5.7 и 8.0 разные performance_schema
+    и разный SHOW). Агент умеет только ЧИТАТЬ: не предлагай ему выполнить
+    INSERT/UPDATE/DELETE/ALTER — такие запросы отклоняются. Команды на
+    изменение давай пользователю для ручного выполнения, отдельно и с
+    предупреждением."""
 
 
 def fmt_alerts(rows: list[dict], period: str, label: Optional[str] = None) -> str:
@@ -1487,6 +1686,22 @@ BREAKDOWN_KEYWORDS = (
     # min/avg/max отвечают на вопрос «сколько», но не «когда и с чем совпало».
     "статистик", "метрик", "показател", "ресурс",
 )
+
+
+# SQL прямо в сообщении: «выполни SELECT ...» или запрос в блоке ```sql
+SQL_IN_TEXT = re.compile(
+    r"```(?:sql)?\s*(.+?)```|((?:select|show|explain|describe)\s+.+)",
+    re.I | re.S)
+
+
+def extract_sql(text: str) -> Optional[str]:
+    """Вытащить запрос из сообщения, если пользователь его написал."""
+    m = SQL_IN_TEXT.search(text)
+    if not m:
+        return None
+    sql = (m.group(1) or m.group(2) or "").strip()
+    # Отсекаем случайные совпадения вида «покажи show slave status» без смысла
+    return sql if len(sql) > 10 else None
 
 
 def detect_breakdown_intent(text: str) -> bool:
@@ -1644,6 +1859,12 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
                     blocks.append(fmt_series_table(tb, cluster["label"]))
         current = await collect_current(cluster)
         blocks.append(fmt_current(current))
+
+        # Пользователь написал SQL — выполняем и кладём результат рядом
+        # с метриками. Валидатор пропустит только читающие конструкции.
+        user_sql = extract_sql(user_message)
+        if user_sql and cluster_db_creds(cluster):
+            blocks.append(fmt_sql_result(sql_run(cluster, user_sql)))
     else:
         # Обзор всех
         clusters = enabled_clusters()
@@ -2570,6 +2791,33 @@ def api_alerts_delete_by_name(request: Request, name: str = ""):
 
 
 
+
+class SqlRequest(BaseModel):
+    cluster: str
+    sql:     str
+    host:    str = ""      # пусто = primary
+
+
+@app.post("/api/query")
+def api_query(req: SqlRequest, request: Request):
+    """Читающий SQL-запрос к кластеру. Только для администраторов."""
+    require_admin(request)
+    cluster = find_cluster(req.cluster)
+    if not cluster:
+        raise HTTPException(status_code=404, detail="Кластер не найден")
+    res = sql_run(cluster, req.sql, req.host or None)
+    if res.get("error"):
+        raise HTTPException(status_code=400, detail=res["error"])
+    return res
+
+
+@app.get("/api/db/versions")
+def api_db_versions(request: Request):
+    """Версии MySQL, полученные на старте."""
+    return {"versions": DB_VERSIONS,
+            "clusters_without_creds": [
+                c["name"] for c in enabled_clusters() if not cluster_db_creds(c)]}
+
 @app.get("/api/series/{name}")
 async def api_series(name: str, hours: float = 6, step: int = 300,
                      format: str = "json"):
@@ -2687,4 +2935,9 @@ if Path(WEB_DIR).exists():
 if __name__ == "__main__":
     import uvicorn
     logger.info(f"MySQL AI Agent v3 | :{AGENT_PORT} | LLM={LLM_BASE_URL} model={LLM_MODEL}")
+    # Версии БД спрашиваем ДО старта: без них LLM советует синтаксис наугад
+    try:
+        refresh_db_versions()
+    except Exception as e:
+        logger.error(f"Версии БД не получены: {e}")
     uvicorn.run(app, host="0.0.0.0", port=AGENT_PORT, log_level="info")
