@@ -732,6 +732,100 @@ def chat_clear(client_id: str) -> int:
     except Exception as e:
         logger.error(f"Не удалось очистить историю чата: {e}")
         return 0
+
+
+def chat_restore(client_id: str) -> list[dict]:
+    """Поднять историю для LLM: последняя выжимка + всё, что после неё.
+
+    Так после рестарта агента разговор продолжается с того же места, а не
+    с обрывка последних реплик.
+    """
+    rows = chat_load(client_id, CHAT_CONTEXT_MESSAGES * 3)
+    if not rows:
+        return []
+    # индекс последней выжимки — всё, что до неё, уже в ней учтено
+    last_sum = max((k for k, m in enumerate(rows) if m["role"] == "summary"),
+                   default=None)
+    if last_sum is not None:
+        rows = rows[last_sum:]
+    return [{"role": m["role"], "content": m["content"]}
+            for m in rows][-CHAT_CONTEXT_MESSAGES:]
+
+
+async def chat_summarize(client_id: str, older: list[dict]) -> str:
+    """Сжать вытесняемую часть переписки в короткую выжимку.
+
+    Вызывается, когда история упирается в окно контекста. Без этого старые
+    сообщения просто отбрасывались, и агент «забывал» ранее выясненное —
+    например, что отставание реплики уже разобрали и оно плановое.
+    """
+    if not older:
+        return ""
+    dialog = "\n".join(
+        f"{'Пользователь' if m['role'] == 'user' else 'Агент'}: {m['content']}"
+        for m in older)[:12000]
+
+    prompt = [
+        {"role": "system",
+         "content": "Ты ведёшь конспект технической переписки по мониторингу MySQL."},
+        {"role": "user",
+         "content": (
+             "Сожми переписку ниже в выжимку до 15 строк. Сохрани только то, "
+             "что понадобится дальше: какие кластеры обсуждали, какие проблемы "
+             "нашли и чем закончилось, какие выводы уже сделаны (в том числе "
+             "«проблемы нет»), какие значения метрик назывались, что решили "
+             "сделать. Без вступлений и без воды.\n\n" + dialog)},
+    ]
+    try:
+        return (await llm_complete(prompt)).strip()
+    except Exception as e:
+        logger.error(f"Не удалось построить выжимку истории: {e}")
+        return ""
+
+
+def chat_save_summary(client_id: str, session_id: str, text: str) -> None:
+    if not text:
+        return
+    chat_save(client_id, session_id, "summary", text)
+
+
+async def chat_compact(client_id: str, session_id: str,
+                       history: list[dict]) -> list[dict]:
+    """Ужать историю до окна контекста, вытесненное — в выжимку.
+
+    Возвращает новую историю: [выжимка] + последние сообщения.
+    """
+    if len(history) <= CHAT_CONTEXT_MESSAGES:
+        return history
+
+    keep  = CHAT_CONTEXT_MESSAGES // 2          # что оставляем дословно
+    older = [m for m in history[:-keep] if m.get("role") in ("user", "assistant")]
+    tail  = history[-keep:]
+
+    digest = await chat_summarize(client_id, older)
+    if not digest:
+        # выжимка не получилась — ведём себя как раньше, просто обрезаем
+        return history[-CHAT_CONTEXT_MESSAGES:]
+
+    chat_save_summary(client_id, session_id, digest)
+    logger.info(f"История {client_id}: {len(older)} сообщений сжаты в выжимку")
+    return [{"role": "summary", "content": digest}] + tail
+
+
+def history_to_messages(history: list[dict]) -> list[dict]:
+    """Роль summary в OpenAI-совместимый API отправлять нельзя — подаём
+    её как системное сообщение с пометкой, что это конспект."""
+    out = []
+    for m in history:
+        if m.get("role") == "summary":
+            out.append({"role": "system",
+                        "content": "Конспект более ранней части разговора:\n"
+                                   + m["content"]})
+        else:
+            out.append({"role": m["role"], "content": m["content"]})
+    return out
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  РЕЕСТР КЛАСТЕРОВ
 # ══════════════════════════════════════════════════════════════════════════════
@@ -926,18 +1020,29 @@ async def collect_current(cluster: dict) -> dict:
         if repl_ip:
             rep  = await metrics_for(repl_ip)
             inst = f"{repl_ip}:9104"
-            lag, io, sql = await asyncio.gather(
+            lag, io, sql, planned = await asyncio.gather(
                 prom_query(client, f'mysql_slave_status_seconds_behind_master{{instance="{inst}"}}'),
                 prom_query(client, f'mysql_slave_status_slave_io_running{{instance="{inst}"}}'),
                 prom_query(client, f'mysql_slave_status_slave_sql_running{{instance="{inst}"}}'),
+                # Плановая задержка — из SQL_Delay самой реплики (recording rule
+                # его вычисляет и подставляет запасное значение из реестра)
+                prom_query(client, f'mysql:replica_configured_delay_seconds{{instance="{inst}"}}'),
             )
-            # Реплика может работать с намеренной задержкой (MASTER_DELAY):
-            # сырой Seconds_Behind_Master тогда всегда равен ей. Показываем
-            # обе величины раздельно, иначе LLM примет норму за аварию.
-            delay = int(cluster.get("replica_delay_seconds", 0) or 0)
-            rep["replication_planned_delay_s"] = str(delay)
-            rep["replication_lag_over_plan_s"] = (
-                "нет данных" if lag is None else str(max(float(lag) - delay, 0)))
+            # Отставание СВЕРХ плана считает Prometheus тем же правилом, что
+            # питает дашборд и алерты. Не дублируем расчёт здесь: разъехавшиеся
+            # цифры в чате и на графике — худшее, что может быть при разборе.
+            over = await prom_query(
+                client, f'mysql:replica_effective_lag_seconds{{instance="{inst}"}}')
+
+            plan_s = float(planned) if planned is not None else 0.0
+            if over is None and lag is not None:
+                # правило ещё не подгрузилось — считаем сами, чтобы не молчать
+                over = max(float(lag) - plan_s, 0)
+
+            rep["replication_planned_delay_s"]  = (
+                str(plan_s) if planned is not None else "нет данных")
+            rep["replication_lag_over_plan_s"]  = (
+                str(over) if over is not None else "нет данных")
             rep["replication_lag_raw_s"] = str(lag) if lag is not None else "нет данных"
             rep["replication_io_up"]  = str(io)  if io  is not None else "нет данных"
             rep["replication_sql_up"] = str(sql) if sql is not None else "нет данных"
@@ -961,11 +1066,9 @@ async def collect_history(cluster: dict, hours: float) -> dict:
             "row_lock_waits":  f'rate(mysql_global_status_innodb_row_lock_waits{{instance="{inst}"}}[5m])',
         }
         if repl:
-            # Отставание сверх запланированного — по нему и надо судить
-            delay = int(cluster.get("replica_delay_seconds", 0) or 0)
+            # Тот же recording rule, что у дашборда и алертов
             queries["replication_lag_over_plan_s"] = (
-                f'clamp_min(mysql_slave_status_seconds_behind_master'
-                f'{{instance="{repl}:9104"}} - {delay}, 0)')
+                f'mysql:replica_effective_lag_seconds{{instance="{repl}:9104"}}')
 
         keys    = list(queries.keys())
         results = await asyncio.gather(
@@ -996,11 +1099,32 @@ def system_prompt() -> str:
    за {ALERTS_RETENTION_DAYS} дн. Опирайся на неё: называй даты и время,
    ищи повторяющиеся и связанные инциденты. Блок с фразой «Ни одного алерта
    за этот период не было» означает именно это — не придумывай инциденты.
-7. Реплики могут работать с ЗАПЛАНИРОВАННОЙ задержкой (MASTER_DELAY):
-   replication_planned_delay_s — это норма, а не авария. Судить об
-   отставании нужно ТОЛЬКО по replication_lag_over_plan_s (сверх плана):
-   0 значит реплика идёт ровно по графику. Не предлагай "чинить" лаг,
-   равный плановой задержке."""
+
+7. ОТСТАВАНИЕ РЕПЛИКИ. Многие реплики работают с ЗАПЛАНИРОВАННОЙ задержкой
+   (MASTER_DELAY, часто 2 часа) — это защита от ошибочного DROP, а не авария.
+   В метриках три величины:
+     replication_lag_raw_s        — сырой Seconds_Behind_Master
+     replication_planned_delay_s  — запланированная задержка (SQL_Delay)
+     replication_lag_over_plan_s  — отставание СВЕРХ плана
+   Судить о здоровье репликации можно ТОЛЬКО по replication_lag_over_plan_s.
+   Пример: raw=7217, planned=7200, over_plan=17 — реплика отстаёт на 17 секунд,
+   это НОРМА. Называть это проблемой, писать про «отставание более 2 часов»
+   и предлагать чинить репликацию в такой ситуации — грубая ошибка.
+   Проблема есть, только если over_plan заметно больше нуля и растёт, либо
+   io/sql-поток не работает.
+
+8. КОНСОЛИДИРОВАННЫЙ ОТВЕТ. В контексте есть метрики и СУБД, и сервера
+   (CPU, iowait, память, диски, сеть). Не разбирай их порознь — связывай:
+     - медленные запросы и рост latency при высоком iowait и загрузке дисков
+       обычно упираются в диск, а не в сам MySQL;
+     - рост отставания реплики при высоком CPU на реплике — часто однопоточный
+       SQL-поток, а не сеть;
+     - всплеск подключений при нехватке памяти — риск OOM;
+     - если метрики сервера в норме, так и скажи: узкое место внутри СУБД.
+   Структура ответа: (1) вывод одной фразой — есть проблема или нет;
+   (2) что показывают метрики СУБД; (3) что показывают метрики сервера;
+   (4) как они связаны; (5) что делать. Если проблемы нет — так и напиши
+   в первой фразе и не выдумывай рекомендации на пустом месте."""
 
 
 def fmt_alerts(rows: list[dict], period: str, label: Optional[str] = None) -> str:
@@ -1544,8 +1668,7 @@ async def websocket_chat(ws: WebSocket):
             history = ws_sessions.get(key)
             if history is None:
                 # первое сообщение в этом процессе — поднимаем историю из БД
-                history = [{"role": m["role"], "content": m["content"]}
-                           for m in chat_load(cid, CHAT_CONTEXT_MESSAGES)] if cid else []
+                history = chat_restore(cid) if cid else []
                 ws_sessions[key] = history
 
             # 1. Собрать контекст (метрики) — сообщаем клиенту что нашли
@@ -1565,8 +1688,8 @@ async def websocket_chat(ws: WebSocket):
 
             # 2. Собрать messages
             messages = [{"role": "system", "content": system_prompt()}]
-            for m in history[-6:]:
-                messages.append(m)
+            # Выжимка вытесненной части + последние реплики дословно
+            messages += history_to_messages(history[-CHAT_CONTEXT_MESSAGES:])
             messages.append({
                 "role": "user",
                 "content": f"{context_text}\n\n## Вопрос\n\n{text}",
@@ -1586,8 +1709,9 @@ async def websocket_chat(ws: WebSocket):
             history.append({"role": "assistant", "content": answer})
             chat_save(cid, sid, "user",      text,   fp)
             chat_save(cid, sid, "assistant", answer, fp)
+            # Упёрлись в окно контекста — не выбрасываем старое, а сжимаем
             if len(history) > CHAT_CONTEXT_MESSAGES:
-                history[:] = history[-CHAT_CONTEXT_MESSAGES:]
+                history[:] = await chat_compact(cid, sid, history)
 
     except WebSocketDisconnect:
         logger.info(f"WS disconnected: {session_id}")
