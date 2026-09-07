@@ -177,7 +177,9 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now ai-alert-agent
+systemctl enable --now ai-alert-agent 2>/dev/null || true
+# на уже работающем сервисе --now ничего не делает, а .env изменился
+systemctl restart ai-alert-agent
 sleep 4
 
 # =============================================================================

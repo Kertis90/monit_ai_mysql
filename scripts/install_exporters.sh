@@ -90,7 +90,8 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now node_exporter
+systemctl enable --now node_exporter 2>/dev/null || true
+systemctl restart node_exporter      # подхватить изменившийся юнит
 sleep 2
 curl -sf http://localhost:9100/metrics | grep -q "node_cpu" && log_info "node_exporter ✓" || log_warn "node_exporter не отвечает"
 
@@ -167,7 +168,8 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now mysqld_exporter
+systemctl enable --now mysqld_exporter 2>/dev/null || true
+systemctl restart mysqld_exporter    # подхватить .my.cnf и юнит
 sleep 3
 
 MYSQL_UP=$(curl -sf http://localhost:9104/metrics | grep "^mysql_up" | awk '{print $2}' || echo "0")
