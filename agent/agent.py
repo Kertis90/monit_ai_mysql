@@ -101,7 +101,11 @@ if LDAP_REQUIRED_GROUP and LDAP_REQUIRED_GROUP not in LDAP_ALLOWED_GROUPS:
 # Вложенные группы AD: пользователь в группе, которая входит в разрешённую
 LDAP_NESTED_GROUPS    = os.environ.get("LDAP_NESTED_GROUPS", "true").lower() == "true"
 LDAP_TLS_VERIFY       = os.environ.get("LDAP_TLS_VERIFY", "true").lower() == "true"
-LDAP_TIMEOUT          = float(os.environ.get("LDAP_TIMEOUT", "8"))
+# Целое число секунд, не дробное: ldap3 на Linux кладёт receive_timeout
+# в pack('LL', ...), а struct не принимает float и падает с "required
+# argument is not an integer". Сам ldap3 ловит только socket.error,
+# поэтому ошибка вылезает наружу как отказ в аутентификации.
+LDAP_TIMEOUT          = max(1, int(float(os.environ.get("LDAP_TIMEOUT") or 8)))
 # Сервисная учётка для поиска по каталогу (выбор пользователей из списка).
 # Пользовательский bind тут не годится: доступ выдают ДО первого входа.
 LDAP_SEARCH_USER      = os.environ.get("LDAP_SEARCH_USER", "")
@@ -362,7 +366,16 @@ def ldap_authenticate(username: str, password: str) -> bool:
         conn.unbind()
         return True
     except Exception as e:
-        logger.warning(f"LDAP-аутентификация {username} не прошла: {e}")
+        # Тип исключения важен: LDAPBindError — это просто неверный пароль,
+        # а всё остальное (struct.error, LDAPSocketOpenError, LDAPException)
+        # означает неисправную настройку, и по одному тексту их не различить.
+        kind = type(e).__name__
+        if kind in ("LDAPBindError", "LDAPInvalidCredentialsResult"):
+            logger.warning(f"LDAP: неверный пароль или имя — {username}")
+        else:
+            logger.error(f"LDAP-аутентификация {username} не прошла "
+                         f"({kind}): {e}. Это сбой подключения или настройки, "
+                         f"а не пароль пользователя")
         return False
 
 
