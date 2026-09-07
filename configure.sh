@@ -135,16 +135,23 @@ norm_path ROOT_PATH
 norm_path PROMETHEUS_ROOT_PATH
 norm_path ALERTMANAGER_ROOT_PATH
 
-# Агенту достаточно пути, а Prometheus и Alertmanager нужен ПОЛНЫЙ внешний
-# адрес: по нему они строят ссылки в алертах (generatorURL, silence-ссылки).
+# Подпути хватает самого по себе: Prometheus и Alertmanager начнут отдаваться
+# под ним. Внешний адрес — необязательное дополнение: он нужен только чтобы
+# ссылки В АЛЕРТАХ (generatorURL, silence) вели наружу, а не на localhost.
 if [[ -n "$PROMETHEUS_ROOT_PATH" || -n "$ALERTMANAGER_ROOT_PATH" ]]; then
     echo ""
-    echo -e "  ${YELLOW}Prometheus/Alertmanager строят по нему ссылки в алертах${NC}"
-    ask "Внешний адрес сервера (https://...)" EXTERNAL_BASE_URL \
-        "https://$(hostname -f 2>/dev/null || echo 'monitor.company.ru')"
+    echo -e "  ${YELLOW}Необязательно: внешний адрес сервера. Нужен только для${NC}"
+    echo -e "  ${YELLOW}ссылок в алертах. Enter — пропустить, подпути и так будут${NC}"
+    echo -e "  ${YELLOW}работать.${NC}"
+    ask "Внешний адрес сервера (Enter — пропустить)" EXTERNAL_BASE_URL ""
     EXTERNAL_BASE_URL="${EXTERNAL_BASE_URL%/}"
-    PROMETHEUS_EXTERNAL_URL="${EXTERNAL_BASE_URL}${PROMETHEUS_ROOT_PATH}"
-    ALERTMANAGER_EXTERNAL_URL="${EXTERNAL_BASE_URL}${ALERTMANAGER_ROOT_PATH}"
+    if [[ -n "$EXTERNAL_BASE_URL" ]]; then
+        PROMETHEUS_EXTERNAL_URL="${EXTERNAL_BASE_URL}${PROMETHEUS_ROOT_PATH}"
+        ALERTMANAGER_EXTERNAL_URL="${EXTERNAL_BASE_URL}${ALERTMANAGER_ROOT_PATH}"
+    else
+        PROMETHEUS_EXTERNAL_URL=""
+        ALERTMANAGER_EXTERNAL_URL=""
+    fi
 else
     EXTERNAL_BASE_URL=""
     PROMETHEUS_EXTERNAL_URL=""

@@ -35,16 +35,27 @@ AM_PREFIX="${ALERTMANAGER_ROOT_PATH:-}"
 PROM_LOCAL="http://localhost:9090${PROM_PREFIX}"
 AM_LOCAL="http://localhost:9093${AM_PREFIX}"
 
+# Подпути достаточно самого по себе — как у агента. Внешний адрес нужен
+# только чтобы ссылки в алертах вели наружу, а не на localhost; без него
+# сервис всё равно корректно отдаётся под своим префиксом.
 PROM_WEB_FLAGS=""
+if [[ -n "${PROM_PREFIX}" ]]; then
+    PROM_WEB_FLAGS="--web.route-prefix=${PROM_PREFIX}/"
+    log_info "Prometheus под путём ${PROM_PREFIX} (локально ${PROM_LOCAL})"
+fi
 if [[ -n "${PROMETHEUS_EXTERNAL_URL:-}" ]]; then
-    PROM_WEB_FLAGS="--web.external-url=${PROMETHEUS_EXTERNAL_URL} --web.route-prefix=${PROM_PREFIX}/"
-    log_info "Prometheus снаружи: ${PROMETHEUS_EXTERNAL_URL} (локально ${PROM_LOCAL})"
+    PROM_WEB_FLAGS="--web.external-url=${PROMETHEUS_EXTERNAL_URL} ${PROM_WEB_FLAGS}"
+    log_info "Prometheus снаружи: ${PROMETHEUS_EXTERNAL_URL}"
 fi
 
 AM_WEB_FLAGS=""
+if [[ -n "${AM_PREFIX}" ]]; then
+    AM_WEB_FLAGS="--web.route-prefix=${AM_PREFIX}/"
+    log_info "Alertmanager под путём ${AM_PREFIX} (локально ${AM_LOCAL})"
+fi
 if [[ -n "${ALERTMANAGER_EXTERNAL_URL:-}" ]]; then
-    AM_WEB_FLAGS="--web.external-url=${ALERTMANAGER_EXTERNAL_URL} --web.route-prefix=${AM_PREFIX}/"
-    log_info "Alertmanager снаружи: ${ALERTMANAGER_EXTERNAL_URL} (локально ${AM_LOCAL})"
+    AM_WEB_FLAGS="--web.external-url=${ALERTMANAGER_EXTERNAL_URL} ${AM_WEB_FLAGS}"
+    log_info "Alertmanager снаружи: ${ALERTMANAGER_EXTERNAL_URL}"
 fi
 
 # =============================================================================

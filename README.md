@@ -672,8 +672,9 @@ server {
 ### Агент на подпути (`/ai-agent/`)
 
 Если агент живёт не в корне, укажите подпуть в `./configure.sh`
-(вопрос «ROOT_PATH агента») — он попадёт в `.env` агента и страница начнёт
-строить свои ссылки от него.
+(секция «Обратный прокси») — он попадёт в `.env` агента и страница начнёт
+строить свои ссылки от него. Там же рядом спрашиваются подпути для Prometheus
+и Alertmanager — все три задаются одинаково, одним путём.
 
 ```bash
 ROOT_PATH="/ai-agent"      # в config.env
@@ -706,12 +707,22 @@ location /ai-agent/ws {
 
 ### Prometheus и Alertmanager на подпутях
 
-Тот же принцип. В `./configure.sh` (секция «Обратный прокси») укажите подпути и
-внешний адрес сервера — мастер соберёт из них полные URL:
+Задаются ровно так же, как подпуть агента — одним путём в той же секции
+мастера:
 
 ```bash
 PROMETHEUS_ROOT_PATH="/prometheus"
 ALERTMANAGER_ROOT_PATH="/alertmanager"
+```
+
+Этого достаточно: сервисы начнут отдаваться под своим префиксом, а скрипты
+выведут из него все внутренние адреса.
+
+**Внешний адрес — необязательное дополнение.** Он нужен только чтобы ссылки
+*в самих алертах* (`generatorURL`, ссылка на silence) вели наружу, а не на
+`localhost`. Мастер спрашивает его следом, Enter — пропустить:
+
+```bash
 EXTERNAL_BASE_URL="https://monitor.company.ru"
 # → PROMETHEUS_EXTERNAL_URL="https://monitor.company.ru/prometheus"
 # → ALERTMANAGER_EXTERNAL_URL="https://monitor.company.ru/alertmanager"
@@ -720,8 +731,10 @@ EXTERNAL_BASE_URL="https://monitor.company.ru"
 `install_monitoring.sh` добавит в systemd-юниты:
 
 ```
---web.external-url=https://monitor.company.ru/prometheus  --web.route-prefix=/prometheus/
---web.external-url=https://monitor.company.ru/alertmanager --web.route-prefix=/alertmanager/
+# только подпуть:
+--web.route-prefix=/prometheus/
+# подпуть + внешний адрес:
+--web.external-url=https://monitor.company.ru/prometheus --web.route-prefix=/prometheus/
 ```
 
 **Сервисы отдают себя под своим путём**, а не в корне. Поэтому nginx префикс
