@@ -10,6 +10,9 @@
     "mysql_exporter_password": "пароль пользователя exporter в MySQL",
     "db_user":     "учётка для SQL-запросов агента (только SELECT). Одна на все серверы кластера. Пусто = запросы отключены",
     "db_password": "пароль этой учётки",
+    "slow_log_path":     "путь к slow-логу MySQL на сервере БД",
+    "app_log_dirs":      "каталоги логов приложения (Lanbilling): текущий и архивный, через запятую",
+    "app_log_pattern":   "маска файлов логов приложения, например *.log*",
     "enabled":     "true/false — включить/отключить мониторинг",
     "tags":        "произвольные метки для группировки"
   },
@@ -24,6 +27,9 @@
       "mysql_exporter_password": "ExporterPass_kmr!",
       "db_user":                 "ai_agent",
       "db_password":             "AiAgentPass_kmr!",
+      "slow_log_path":           "/var/log/mysql/slow.log",
+      "app_log_dirs":            "/var/log/lanbilling,/var/log/lanbilling/archive",
+      "app_log_pattern":         "*.log*",
       "enabled":                 true,
       "tags":                    ["siberia", "production"]
     },
@@ -37,6 +43,9 @@
       "mysql_exporter_password": "ExporterPass_nsk!",
       "db_user":                 "ai_agent",
       "db_password":             "AiAgentPass_nsk!",
+      "slow_log_path":           "/var/log/mysql/slow.log",
+      "app_log_dirs":            "/var/log/lanbilling,/var/log/lanbilling/archive",
+      "app_log_pattern":         "*.log*",
       "enabled":                 true,
       "tags":                    ["siberia", "production"]
     }
