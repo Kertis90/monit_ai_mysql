@@ -686,6 +686,21 @@ const App = (() => {
            String(d.getMinutes()).padStart(2, '0');
   }
 
+  // Для длинных периодов одного времени мало — нужна дата
+  function fmtTick(ts, spanSec) {
+    const d = new Date(ts * 1000);
+    const hm = String(d.getHours()).padStart(2, '0') + ':' +
+               String(d.getMinutes()).padStart(2, '0');
+    if (spanSec > 36 * 3600) {
+      return String(d.getDate()).padStart(2, '0') + '.' +
+             String(d.getMonth() + 1).padStart(2, '0') + ' ' + hm;
+    }
+    if (spanSec < 600) {   // меньше 10 минут — показываем секунды
+      return hm + ':' + String(d.getSeconds()).padStart(2, '0');
+    }
+    return hm;
+  }
+
   function sparkSvg(chart, w, h) {
     const pts = chart.points;
     if (!pts.length) return '';
@@ -716,11 +731,20 @@ const App = (() => {
                <text x="${padL - 6}" y="${(y + 3).toFixed(1)}" class="cg-lbl"
                      text-anchor="end">${esc(fmtNum(v))}</text>`;
     }
-    const tAxis = `<text x="${padL}" y="${h - 5}" class="cg-lbl">${esc(fmtTime(x0))}</text>
-                   <text x="${w - padR}" y="${h - 5}" class="cg-lbl"
-                         text-anchor="end">${esc(fmtTime(x1))}</text>`;
+    // Четыре отметки вместо двух: по двум крайним нельзя понять масштаб,
+    // а на коротком периоде они ещё и совпадали (обе показывали 7:41).
+    const span = x1 - x0;
+    let tAxis = '';
+    for (let k = 0; k <= 3; k++) {
+      const ts = x0 + span * (k / 3);
+      const x  = px(ts);
+      const anchor = k === 0 ? 'start' : k === 3 ? 'end' : 'middle';
+      tAxis += `<text x="${x.toFixed(1)}" y="${h - 5}" class="cg-lbl"
+                      text-anchor="${anchor}">${esc(fmtTick(ts, span))}</text>`;
+    }
 
-    return `<svg viewBox="0 0 ${w} ${h}" class="cg-svg" preserveAspectRatio="none"
+    // preserveAspectRatio="none" растягивал и текст подписей — убрано.
+    return `<svg viewBox="0 0 ${w} ${h}" class="cg-svg"
                  role="img" aria-label="${esc(chart.title)}">
               ${grid}
               <path d="${area}" class="cg-area"/>
@@ -748,9 +772,14 @@ const App = (() => {
     const period = msg.hours >= 24
       ? (msg.hours / 24).toFixed(1).replace('.0', '') + ' сут'
       : msg.hours + ' ч';
+    // Реальный охват данных: если он короче запрошенного периода, это видно
+    const all = msg.charts.flatMap(c => c.points.map(p => p[0]));
+    const t0 = Math.min(...all), t1 = Math.max(...all);
+    const range = all.length
+      ? ` (${fmtTick(t0, t1 - t0)} — ${fmtTick(t1, t1 - t0)})` : '';
     wrap.innerHTML =
       `<div class="cg-block-head">
-         <b>${esc(msg.cluster_label)}</b> · за ${esc(period)}
+         <b>${esc(msg.cluster_label)}</b> · за ${esc(period)}${esc(range)}
          <a class="cg-pdf" href="report?cluster=${encodeURIComponent(msg.cluster)}&hours=${encodeURIComponent(msg.hours)}"
             target="_blank" rel="noopener">📄 Отчёт PDF</a>
        </div>` + msg.charts.map(chartCard).join('');

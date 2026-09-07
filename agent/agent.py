@@ -29,7 +29,8 @@ from pathlib import Path
 from typing import Optional, AsyncGenerator
 from fastapi import (FastAPI, Request, Response, HTTPException,
                      WebSocket, WebSocketDisconnect)
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import (HTMLResponse, JSONResponse,
+                               RedirectResponse, PlainTextResponse)
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -1314,7 +1315,15 @@ def system_prompt() -> str:
    Структура ответа: (1) вывод одной фразой — есть проблема или нет;
    (2) что показывают метрики СУБД; (3) что показывают метрики сервера;
    (4) как они связаны; (5) что делать. Если проблемы нет — так и напиши
-   в первой фразе и не выдумывай рекомендации на пустом месте."""
+   в первой фразе и не выдумывай рекомендации на пустом месте.
+
+9. ДЕТАЛЬНАЯ СТАТИСТИКА. Если приложен блок «Детальная статистика … шаг N» —
+   это реальные значения по интервалам, а не агрегаты. Пользуйся им: называй
+   конкретное время всплесков, показывай, что происходило с ресурсами ОС
+   в ту же минуту, ищи совпадения между колонками (рост QPS при росте iowait,
+   провал CPU при падении conn). Не отвечай «есть только min/avg/max», если
+   такая таблица приложена. Если её нет, а спрашивают детализацию — скажи,
+   что нужно уточнить период и шаг, например «за 3 часа с разбивкой по 5 минут»."""
 
 
 def fmt_alerts(rows: list[dict], period: str, label: Optional[str] = None) -> str:
@@ -1370,6 +1379,158 @@ def fmt_history(h: dict, label: str) -> str:
     return "\n".join(lines)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  ДЕТАЛЬНАЯ СТАТИСТИКА ПО ИНТЕРВАЛАМ
+#  min/avg/max прячут форму нагрузки: по ним не видно, когда именно был всплеск
+#  и совпал ли он с ростом iowait. Здесь отдаём ряд по шагам как таблицу.
+#  Сами данные хранит Prometheus (retention из PROMETHEUS_RETENTION), мы их
+#  только читаем и прореживаем до запрошенного шага.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Больше строк LLM всё равно не осмыслит, а контекст выест. При превышении
+# шаг увеличивается автоматически, и об этом пишется в заголовке таблицы.
+SERIES_MAX_ROWS = int(os.environ.get("SERIES_MAX_ROWS", "200"))
+
+# Что показываем в детальной таблице: ресурсы ОС + основное по СУБД
+SERIES_SPECS = [
+    ("CPU%",     '100-(avg by(instance)(rate(node_cpu_seconds_total'
+                 '{{mode="idle",instance="{node}"}}[{w}]))*100)'),
+    ("iowait%",  'avg by(instance)(rate(node_cpu_seconds_total'
+                 '{{mode="iowait",instance="{node}"}}[{w}]))*100'),
+    ("MEM%",     '100*(1-(node_memory_MemAvailable_bytes{{instance="{node}"}}'
+                 '/node_memory_MemTotal_bytes{{instance="{node}"}}))'),
+    ("LA1",      'node_load1{{instance="{node}"}}'),
+    ("diskR/s",  'sum(rate(node_disk_read_bytes_total{{instance="{node}"}}[{w}]))'),
+    ("diskW/s",  'sum(rate(node_disk_written_bytes_total{{instance="{node}"}}[{w}]))'),
+    ("netRX/s",  'sum(rate(node_network_receive_bytes_total'
+                 '{{instance="{node}",device!~"lo|veth.*"}}[{w}]))'),
+    ("QPS",      'rate(mysql_global_status_queries{{instance="{inst}"}}[{w}])'),
+    ("slow/s",   'rate(mysql_global_status_slow_queries{{instance="{inst}"}}[{w}])'),
+    ("conn",     'mysql_global_status_threads_connected{{instance="{inst}"}}'),
+]
+
+
+def parse_step_seconds(text: str) -> Optional[int]:
+    """Шаг разбивки из фразы: «по 5 минут», «поминутно», «по часам»."""
+    t = text.lower()
+    m = re.search(r'(?:по|шаг[ом]*|интервал[ом]*|разбивк\w*\s+по)\s+(\d+)\s*'
+                  r'(секунд|сек|минут|мин|час)', t)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        if unit.startswith(("секунд", "сек")):
+            return max(n, 15)
+        if unit.startswith(("минут", "мин")):
+            return n * 60
+        return n * 3600
+    if "поминутно" in t or "по минутам" in t:
+        return 60
+    if "по часам" in t or "почасов" in t:
+        return 3600
+    if "по секундам" in t:
+        return 15
+    return None
+
+
+BREAKDOWN_KEYWORDS = (
+    "разбивк", "детальн", "подробн", "по интервал", "по шагам", "поминутно",
+    "по минутам", "по часам", "почасов", "по секундам", "таблиц",
+    "по точкам", "сырые данные", "raw", "каждые",
+)
+
+
+def detect_breakdown_intent(text: str) -> bool:
+    t = text.lower()
+    return any(kw in t for kw in BREAKDOWN_KEYWORDS) or parse_step_seconds(t) is not None
+
+
+async def collect_series_table(cluster: dict, hours: float,
+                               step_s: int) -> dict:
+    """Ряды всех показателей на общей сетке времени."""
+    prim = cluster["primary_ip"]
+    ctx  = {"inst": f"{prim}:9104", "node": f"{prim}:9100"}
+
+    # Шаг не может быть мельче реальности и не должен раздувать таблицу
+    points = int(hours * 3600 / max(step_s, 15))
+    if points > SERIES_MAX_ROWS:
+        step_s = int(hours * 3600 / SERIES_MAX_ROWS)
+        # округляем вверх до целых минут — «по 7 минут» читается странно
+        step_s = max(int((step_s + 59) // 60) * 60, 60)
+        adjusted = True
+    else:
+        adjusted = False
+
+    # Окно rate() берём равным шагу, но не меньше 1 минуты, иначе на редкой
+    # сетке rate посчитается по одной точке и даст пустоту
+    w = f"{max(step_s, 60)}s"
+
+    end   = datetime.datetime.utcnow()
+    start = end - datetime.timedelta(hours=hours)
+
+    async def one(client, expr):
+        try:
+            r = await client.get(
+                f"{PROMETHEUS_URL}/api/v1/query_range",
+                params={"query": expr, "start": start.isoformat() + "Z",
+                        "end": end.isoformat() + "Z", "step": str(step_s)},
+                timeout=30.0)
+            d = r.json()
+            if d.get("status") != "success" or not d["data"]["result"]:
+                return {}
+            return {int(float(v[0])): float(v[1])
+                    for v in d["data"]["result"][0]["values"]}
+        except Exception as e:
+            logger.error(f"Ряд не получен: {e}")
+            return {}
+
+    async with httpx.AsyncClient() as client:
+        series = await asyncio.gather(
+            *[one(client, expr.format(w=w, **ctx)) for _, expr in SERIES_SPECS])
+
+    names = [n for n, _ in SERIES_SPECS]
+    stamps = sorted({t for s in series for t in s})
+    return {"step_s": step_s, "adjusted": adjusted, "hours": hours,
+            "names": names, "stamps": stamps, "series": series}
+
+
+def fmt_series_table(data: dict, label: str) -> str:
+    names, stamps, series = data["names"], data["stamps"], data["series"]
+    if not stamps:
+        return (f"## Детальная статистика {label}\n\n"
+                f"  За этот период данных нет.")
+
+    step_min = data["step_s"] / 60
+    step_txt = (f"{step_min:.0f} мин" if step_min >= 1
+                else f"{data['step_s']} с")
+    head = [f"## Детальная статистика {label}: шаг {step_txt}, "
+            f"период {data['hours']:g} ч, точек {len(stamps)}"]
+    if data["adjusted"]:
+        head.append("  (шаг увеличен: запрошенный дал бы слишком длинную "
+                    "таблицу для одного ответа)")
+    head.append("  Время в UTC. Пустая ячейка — метрики за этот момент нет.")
+    head.append("")
+
+    def cell(v):
+        if v is None:
+            return "—"
+        if abs(v) >= 1e6:
+            return f"{v/1e6:.1f}M"
+        if abs(v) >= 1e3:
+            return f"{v/1e3:.1f}k"
+        return f"{v:.1f}" if abs(v) < 100 else f"{v:.0f}"
+
+    widths = [max(len(n), 8) for n in names]
+    # ширина колонки времени та же, что у строк данных, иначе шапка едет
+    head.append("  " + "время".ljust(12) +
+                " ".join(n.rjust(w) for n, w in zip(names, widths)))
+    rows = []
+    for ts in stamps:
+        t = datetime.datetime.utcfromtimestamp(ts).strftime("%d.%m %H:%M")
+        rows.append("  " + t.ljust(12) +
+                    " ".join(cell(s.get(ts)).rjust(w)
+                             for s, w in zip(series, widths)))
+    return "\n".join(head + rows)
+
+
 async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], float]:
     """Определить кластер и временное окно, собрать контекст метрик."""
     cluster = detect_cluster_in_text(user_message)
@@ -1380,6 +1541,12 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
         if hours > 0:
             hist = await collect_history(cluster, hours)
             blocks.append(fmt_history(hist, cluster["label"]))
+            # Просили разбивку по интервалам — агрегатов недостаточно:
+            # по min/avg/max не видно, когда был всплеск и с чем он совпал
+            if detect_breakdown_intent(user_message):
+                step  = parse_step_seconds(user_message) or 300
+                table = await collect_series_table(cluster, hours, step)
+                blocks.append(fmt_series_table(table, cluster["label"]))
         current = await collect_current(cluster)
         blocks.append(fmt_current(current))
     else:
@@ -2256,6 +2423,49 @@ def api_alerts_delete_by_name(request: Request, name: str = ""):
     removed = alerts_delete_by_name(name)
     return {"ok": True, "alert": name, "removed": removed}
 
+
+
+@app.get("/api/series/{name}")
+async def api_series(name: str, hours: float = 6, step: int = 300,
+                     format: str = "json"):
+    """Детальная статистика по интервалам: ресурсы ОС + основное по СУБД.
+
+    step — шаг в секундах (300 = 5 минут). Если точек получается больше
+    SERIES_MAX_ROWS, шаг увеличивается автоматически — это видно в ответе.
+    format=csv отдаёт таблицу для выгрузки в Excel.
+    """
+    cluster = find_cluster(name)
+    if not cluster:
+        raise HTTPException(status_code=404, detail="Кластер не найден")
+
+    data = await collect_series_table(cluster, max(hours, 0.1), max(step, 15))
+
+    if format == "csv":
+        head = "time," + ",".join(data["names"])
+        rows = [head]
+        for ts in data["stamps"]:
+            t = datetime.datetime.utcfromtimestamp(ts).isoformat() + "Z"
+            rows.append(t + "," + ",".join(
+                ("" if s.get(ts) is None else f"{s[ts]:.3f}")
+                for s in data["series"]))
+        return PlainTextResponse(
+            "\n".join(rows), media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition":
+                     f'attachment; filename="{cluster["name"]}-series.csv"'})
+
+    return {
+        "cluster":       cluster["name"],
+        "cluster_label": cluster["label"],
+        "hours":         data["hours"],
+        "step_seconds":  data["step_s"],
+        "step_adjusted": data["adjusted"],
+        "columns":       ["time"] + data["names"],
+        "rows": [
+            [datetime.datetime.utcfromtimestamp(ts).isoformat() + "Z"] +
+            [s.get(ts) for s in data["series"]]
+            for ts in data["stamps"]
+        ],
+    }
 
 @app.get("/api/charts/{name}")
 async def api_charts(name: str, hours: float = 6, keys: str = ""):

@@ -92,6 +92,18 @@
            String(d.getMinutes()).padStart(2, '0');
   }
 
+  function fmtTick(ts, spanSec) {
+    const d = new Date(ts * 1000);
+    const hm = String(d.getHours()).padStart(2, '0') + ':' +
+               String(d.getMinutes()).padStart(2, '0');
+    if (spanSec > 36 * 3600) {
+      return String(d.getDate()).padStart(2, '0') + '.' +
+             String(d.getMonth() + 1).padStart(2, '0') + ' ' + hm;
+    }
+    if (spanSec < 600) return hm + ':' + String(d.getSeconds()).padStart(2, '0');
+    return hm;
+  }
+
   // Тот же рисовальщик, что в чате: инлайновый SVG, без библиотек —
   // в закрытом контуре CDN недоступен, а печать всё равно идёт из браузера.
   function svgChart(chart, w, h) {
@@ -124,14 +136,22 @@
               '" class="lbl" text-anchor="end">' + esc(fmtNum(v)) + '</text>';
     }
 
-    return '<svg viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none" ' +
+    // preserveAspectRatio="none" растягивал подписи — убрано
+    const span = x1 - x0;
+    let ticks = '';
+    for (let k = 0; k <= 3; k++) {
+      const ts = x0 + span * (k / 3), tx = px(ts);
+      const anchor = k === 0 ? 'start' : k === 3 ? 'end' : 'middle';
+      ticks += '<text x="' + tx.toFixed(1) + '" y="' + (h - 5) +
+               '" class="lbl" text-anchor="' + anchor + '">' +
+               esc(fmtTick(ts, span)) + '</text>';
+    }
+
+    return '<svg viewBox="0 0 ' + w + ' ' + h + '" ' +
            'role="img" aria-label="' + esc(chart.title) + '">' + grid +
            '<path d="' + area + '" class="area"/>' +
            '<path d="' + line + '" class="line"/>' +
-           '<text x="' + padL + '" y="' + (h - 5) + '" class="lbl">' +
-           esc(fmtTime(x0)) + '</text>' +
-           '<text x="' + (w - padR) + '" y="' + (h - 5) +
-           '" class="lbl" text-anchor="end">' + esc(fmtTime(x1)) + '</text></svg>';
+           ticks + '</svg>';
   }
 
   function periodLabel(h) {
