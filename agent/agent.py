@@ -1385,7 +1385,10 @@ def cluster_db_creds(cluster: dict) -> Optional[tuple]:
 
 
 def sql_run(cluster: dict, sql: str, host: Optional[str] = None) -> dict:
-    """Выполнить читающий запрос. Возвращает {columns, rows, error, ...}."""
+    """Выполнить читающий запрос напрямую по TCP.
+
+    Для режима через SSH есть sql_run_ssh; выбор делает sql_execute.
+    """
     creds = cluster_db_creds(cluster)
     if not creds:
         return {"error": "Для этого кластера не задана учётка db_user — "
@@ -1436,11 +1439,96 @@ def sql_run(cluster: dict, sql: str, host: Optional[str] = None) -> dict:
             pass
 
 
+
+# ── Режим «SQL через SSH» ────────────────────────────────────────────────────
+# Подключились по SSH, выполнили запрос клиентом mysql на самом сервере, вышли.
+# Порт 3306 наружу открывать не нужно, а учётка может быть 'ai_agent'@'localhost'.
+
+def cluster_via_ssh(cluster: dict) -> bool:
+    """Ходить ли в этот кластер через SSH, а не напрямую по TCP."""
+    v = cluster.get("db_via_ssh")
+    if v is None:
+        v = os.environ.get("DB_VIA_SSH", "false")
+    return str(v).strip().lower() in ("1", "true", "yes")
+
+
+def parse_mysql_batch(text: str) -> tuple:
+    """Разобрать вывод `mysql -B`: TSV, первая строка — заголовки.
+
+    В batch-режиме клиент экранирует управляющие символы внутри значений,
+    поэтому строки не «разъезжаются», но обратные слэши надо развернуть.
+    """
+    lines = text.split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines:
+        return [], []
+
+    def unesc(v):
+        if v == "NULL":
+            return None
+        return (v.replace("\\t", "\t").replace("\\n", "\n")
+                 .replace("\\0", "\0").replace("\\\\", "\\"))
+
+    cols = lines[0].split("\t")
+    rows = [[unesc(c) for c in ln.split("\t")] for ln in lines[1:]]
+    return cols, rows
+
+
+async def sql_run_ssh(cluster: dict, sql: str,
+                      host: Optional[str] = None) -> dict:
+    """Читающий запрос через клиент mysql на самом сервере."""
+    ok, why = sql_validate(sql)
+    if not ok:
+        logger.warning("SQL отклонён (%s): %s", why, sql[:120])
+        return {"error": "Запрос отклонён: " + why}
+
+    ip = host or cluster["primary_ip"]
+    query = sql_add_limit(sql)
+    creds = cluster_db_creds(cluster)
+
+    # -B: табличный вывод через табуляцию, с заголовками
+    # --connect-timeout / MAX_EXECUTION_TIME ограничивают зависание
+    parts = ["mysql", "-B", "--connect-timeout=" + str(SQL_TIMEOUT_S)]
+    env = {}
+    if creds:
+        user, password = creds
+        parts += ["-u", shlex.quote(user), "-h", "127.0.0.1"]
+        if password:
+            # пароль в MYSQL_PWD, а не в аргументах: в ps его увидели бы все
+            env["MYSQL_PWD"] = password
+    # без creds полагаемся на ~/.my.cnf учётки, под которой заходим по SSH
+
+    stmt = "SET SESSION MAX_EXECUTION_TIME={}; {}".format(
+        SQL_TIMEOUT_S * 1000, query)
+    parts += ["-e", shlex.quote(stmt)]
+    cmd = " ".join(parts)
+
+    ok, out = await log_ssh(ip, cmd, ok_codes=(0,), env=env)
+    if not ok:
+        # пароль в текст ошибки не попадает: он шёл переменной окружения
+        return {"error": "Ошибка выполнения на {}: {}".format(ip, out[:300])}
+
+    cols, rows = parse_mysql_batch(out)
+    return {"host": ip, "query": query, "columns": cols,
+            "rows": rows[:SQL_MAX_ROWS],
+            "truncated": len(rows) > SQL_MAX_ROWS, "via": "ssh"}
+
+async def sql_execute(cluster: dict, sql: str,
+                      host: Optional[str] = None) -> dict:
+    """Единая точка входа: сама выбирает режим — напрямую или через SSH."""
+    if cluster_via_ssh(cluster):
+        return await sql_run_ssh(cluster, sql, host)
+    # pymysql блокирующий, поэтому уводим его из цикла событий
+    return await asyncio.to_thread(sql_run, cluster, sql, host)
+
+
 def fmt_sql_result(res: dict) -> str:
     if res.get("error"):
         return f"## Результат SQL\n\n  {res['error']}"
     cols, rows = res["columns"], res["rows"]
-    head = [f"## Результат SQL ({res['host']})",
+    via = " через SSH" if res.get("via") == "ssh" else ""
+    head = [f"## Результат SQL ({res['host']}{via})",
             f"  Запрос: {res['query']}", ""]
     if not rows:
         head.append("  Строк не найдено.")
@@ -1464,13 +1552,13 @@ def fmt_sql_result(res: dict) -> str:
 DB_VERSIONS: dict = {}
 
 
-def refresh_db_versions() -> None:
+async def refresh_db_versions() -> None:
     """Спросить версию у каждого кластера. Без этого агент советует синтаксис
     наугад: у 5.7 и 8.0 разные имена таблиц performance_schema и разный SHOW."""
     for c in enabled_clusters():
         if not cluster_db_creds(c):
             continue
-        res = sql_run(c, "SELECT VERSION() AS v, @@version_comment AS c")
+        res = await sql_execute(c, "SELECT VERSION() AS v, @@version_comment AS c")
         if res.get("error") or not res.get("rows"):
             logger.warning(f"Версия БД {c['name']} не получена: "
                            f"{res.get('error', 'пустой ответ')}")
@@ -1517,8 +1605,17 @@ LOG_SSH_PORT    = os.environ.get("SSH_PORT", "22")
 LOG_SSH_KEY     = os.environ.get("SSH_KEY", "")
 
 
-async def log_ssh(host: str, remote_cmd: str) -> tuple:
-    """Выполнить готовую команду на сервере. Возвращает (успех, вывод)."""
+async def log_ssh(host: str, remote_cmd: str, ok_codes: tuple = (0, 1),
+                  env: Optional[dict] = None) -> tuple:
+    """Выполнить готовую команду на сервере. Возвращает (успех, вывод).
+
+    ok_codes — какие коды возврата считать успехом. У grep код 1 означает
+    «ничего не найдено» и ошибкой не является, а у mysql — именно ошибку,
+    поэтому вызывающий указывает свой набор.
+
+    env — переменные для удалённой команды. Через них передаётся пароль
+    (MYSQL_PWD): в аргументах командной строки он был бы виден всем в ps.
+    """
     if not LOG_SSH_USER:
         return False, ("Не задан SSH_USER — чтение логов недоступно. "
                        "Заполните его в config.env и переустановите агента.")
@@ -1527,6 +1624,11 @@ async def log_ssh(host: str, remote_cmd: str) -> tuple:
             "-p", str(LOG_SSH_PORT)]
     if LOG_SSH_KEY:
         argv += ["-i", LOG_SSH_KEY]
+    if env:
+        # SendEnv требует настройки на сервере, поэтому подставляем
+        # присваивание прямо в команду — значение экранировано
+        prefix = " ".join(k + "=" + shlex.quote(str(v)) for k, v in env.items())
+        remote_cmd = prefix + " " + remote_cmd
     argv += [LOG_SSH_USER + "@" + host, remote_cmd]
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -1535,13 +1637,12 @@ async def log_ssh(host: str, remote_cmd: str) -> tuple:
         out, err = await asyncio.wait_for(proc.communicate(),
                                           timeout=LOG_SSH_TIMEOUT + 10)
     except asyncio.TimeoutError:
-        return False, "Таймаут при чтении логов на " + host
+        return False, "Таймаут при выполнении команды на " + host
     except Exception as e:
         return False, "Не удалось подключиться к {}: {}".format(host, e)
 
     text = out.decode("utf-8", "replace")
-    # grep возвращает 1, когда ничего не нашёл — это не ошибка
-    if proc.returncode not in (0, 1):
+    if proc.returncode not in ok_codes:
         msg = err.decode("utf-8", "replace").strip()
         return False, msg or "Команда вернула код {}".format(proc.returncode)
     return True, text
@@ -1877,8 +1978,8 @@ def detect_diagnose_intent(text: str) -> bool:
     return any(kw in t for kw in DIAG_KEYWORDS)
 
 
-def run_diagnostics(cluster: dict, host: Optional[str] = None,
-                    keys: Optional[list] = None) -> list:
+async def run_diagnostics(cluster: dict, host: Optional[str] = None,
+                          keys: Optional[list] = None) -> list:
     """Выполнить диагностический набор. Недоступные запросы пропускаются:
     sys.innodb_lock_waits и часть представлений есть не во всех сборках."""
     if not cluster_db_creds(cluster):
@@ -1887,7 +1988,7 @@ def run_diagnostics(cluster: dict, host: Optional[str] = None,
     for q in DIAG_QUERIES:
         if keys and q["key"] not in keys:
             continue
-        res = sql_run(cluster, q["sql"], host)
+        res = await sql_execute(cluster, q["sql"], host)
         if res.get("error"):
             # необязательные молча пропускаем — иначе половина отчёта
             # состояла бы из «нет доступа к sys»
@@ -2327,14 +2428,14 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
         # с метриками. Валидатор пропустит только читающие конструкции.
         user_sql = extract_sql(user_message)
         if user_sql and cluster_db_creds(cluster):
-            blocks.append(fmt_sql_result(sql_run(cluster, user_sql)))
+            blocks.append(fmt_sql_result(await sql_execute(cluster, user_sql)))
 
         # Просят разобраться, почему медленно — собираем диагностический
         # набор сами, по каждому серверу. Советовать «посмотрите
         # performance_schema» бессмысленно, если можно просто посмотреть.
         if detect_diagnose_intent(user_message) and cluster_db_creds(cluster):
             for ip, role in cluster_hosts(cluster):
-                diag = run_diagnostics(cluster, ip)
+                diag = await run_diagnostics(cluster, ip)
                 if diag:
                     blocks.append(fmt_diagnostics(
                         diag, f"{cluster['label']} · {role}", ip))
@@ -3331,13 +3432,13 @@ class SqlRequest(BaseModel):
 
 
 @app.post("/api/query")
-def api_query(req: SqlRequest, request: Request):
+async def api_query(req: SqlRequest, request: Request):
     """Читающий SQL-запрос к кластеру. Только для администраторов."""
     require_admin(request)
     cluster = find_cluster(req.cluster)
     if not cluster:
         raise HTTPException(status_code=404, detail="Кластер не найден")
-    res = sql_run(cluster, req.sql, req.host or None)
+    res = await sql_execute(cluster, req.sql, req.host or None)
     if res.get("error"):
         raise HTTPException(status_code=400, detail=res["error"])
     return res
@@ -3345,7 +3446,8 @@ def api_query(req: SqlRequest, request: Request):
 
 
 @app.get("/api/diagnose/{name}")
-def api_diagnose(name: str, request: Request, host: str = "", keys: str = ""):
+async def api_diagnose(name: str, request: Request, host: str = "",
+                       keys: str = ""):
     """Диагностический набор по кластеру. Требует прав администратора."""
     require_admin(request)
     cluster = find_cluster(name)
@@ -3364,7 +3466,7 @@ def api_diagnose(name: str, request: Request, host: str = "", keys: str = ""):
             {"host": ip, "role": role,
              "checks": [{"key": d["key"], "title": d["title"],
                          "result": d["result"]}
-                        for d in run_diagnostics(cluster, ip, wanted)]}
+                        for d in await run_diagnostics(cluster, ip, wanted)]}
             for ip, role in hosts
         ],
     }
@@ -3507,7 +3609,7 @@ if __name__ == "__main__":
     logger.info(f"MySQL AI Agent v3 | :{AGENT_PORT} | LLM={LLM_BASE_URL} model={LLM_MODEL}")
     # Версии БД спрашиваем ДО старта: без них LLM советует синтаксис наугад
     try:
-        refresh_db_versions()
+        asyncio.run(refresh_db_versions())
     except Exception as e:
         logger.error(f"Версии БД не получены: {e}")
     # timeout_graceful_shutdown обязателен: по умолчанию uvicorn ждёт
