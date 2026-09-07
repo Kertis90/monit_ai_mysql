@@ -97,13 +97,20 @@ log_info "Зависимости установлены"
 # =============================================================================
 log_section "Конфигурация агента (.env)"
 # =============================================================================
+# Подпуть задан -> агент ходит в Prometheus через nginx, без порта
+if [[ -n "${PROMETHEUS_ROOT_PATH:-}" ]]; then
+    PROM_URL_FOR_AGENT="${INTERNAL_BASE_URL:-http://localhost}${PROMETHEUS_ROOT_PATH}"
+else
+    PROM_URL_FOR_AGENT="http://localhost:9090"
+fi
+
 cat > "${AGENT_DIR}/.env" << EOF
 LLM_BASE_URL=${LLM_BASE_URL}
 LLM_API_KEY=${LLM_API_KEY}
 LLM_MODEL=${LLM_MODEL}
 LLM_MAX_TOKENS=${LLM_MAX_TOKENS}
 LLM_TEMPERATURE=${LLM_TEMPERATURE}
-PROMETHEUS_URL=http://localhost:9090${PROMETHEUS_ROOT_PATH:-}
+PROMETHEUS_URL=${PROM_URL_FOR_AGENT}
 AGENT_PORT=${AGENT_PORT}
 ROOT_PATH=${ROOT_PATH:-}
 REGISTRY_PATH=${AGENT_DIR}/clusters.json

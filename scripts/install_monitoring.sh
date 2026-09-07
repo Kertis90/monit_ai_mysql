@@ -12,12 +12,57 @@ log_warn()    { echo -e "${YELLOW}[WARN]${NC}  $1"; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
 log_section() { echo -e "\n${BLUE}══ $1 ══${NC}"; }
 
+CLEAN_MODE=false
+for arg in "$@"; do
+    case "$arg" in
+        --clean|--reset) CLEAN_MODE=true ;;
+        -h|--help)
+            echo "Использование: $0 [--clean]"
+            echo "  --clean   удалить сгенерированные конфиги и создать заново"
+            echo ""
+            echo "Удаляются ТОЛЬКО файлы, которые создаёт этот скрипт."
+            echo "Не трогаются: /var/lib/prometheus (метрики),"
+            echo "              /var/lib/grafana/grafana.db (пользователи Grafana),"
+            echo "              /opt/ai-alert-agent/alerts.db (алерты, чаты, доступы)."
+            exit 0 ;;
+    esac
+done
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="${SCRIPT_DIR}/../config.env"
 [[ -f "$CONFIG" ]] || { log_error "config.env не найден — запустите сначала ./configure.sh"; exit 1; }
 source "$CONFIG"
 [[ $EUID -ne 0 ]] && { log_error "Нужен root (sudo)"; exit 1; }
 
+
+# ── Режим --clean: снести сгенерированные конфиги и создать заново ───────────
+# Нужен, когда конфиг «разъехался» и сервис не стартует: чинить по кусочкам
+# дольше, чем переложить всё из config.env и clusters.json с нуля.
+
+if [[ "$CLEAN_MODE" == "true" ]]; then
+    log_section "Очистка конфигов (--clean)"
+
+    # Останавливаем, чтобы сервисы не держали старые файлы и не писали в них
+    for svc in prometheus alertmanager grafana-server; do
+        systemctl stop "$svc" 2>/dev/null || true
+    done
+
+    rm -f /etc/prometheus/prometheus.yml
+    rm -f /etc/prometheus/rules/*.yml
+    rm -f /etc/alertmanager/alertmanager.yml
+    rm -f /etc/systemd/system/prometheus.service
+    rm -f /etc/systemd/system/alertmanager.service
+
+    # Grafana: только НАШ провижининг. grafana.db с пользователями и вручную
+    # созданными дашбордами не трогаем.
+    rm -f /etc/grafana/provisioning/datasources/prometheus.yml
+    rm -f /etc/grafana/provisioning/dashboards/mysql_monit.yml
+    rm -f /var/lib/grafana/dashboards/*.json
+
+    systemctl daemon-reload
+    log_info "Сгенерированные конфиги удалены — будут созданы заново"
+    log_warn "Метрики, grafana.db и alerts.db сохранены"
+fi
 # Зеркала: подменяется только домен, путь достраивается как на оригинале
 GITHUB_BASE_URL="${GITHUB_BASE_URL:-https://github.com}"; GITHUB_BASE_URL="${GITHUB_BASE_URL%/}"
 GRAFANA_COM_URL="${GRAFANA_COM_URL:-https://grafana.com}"; GRAFANA_COM_URL="${GRAFANA_COM_URL%/}"
@@ -32,8 +77,19 @@ GRAFANA_COM_URL="${GRAFANA_COM_URL:-https://grafana.com}"; GRAFANA_COM_URL="${GR
 # префикс не срезает, а все внутренние адреса включают его.
 PROM_PREFIX="${PROMETHEUS_ROOT_PATH:-}"
 AM_PREFIX="${ALERTMANAGER_ROOT_PATH:-}"
-PROM_LOCAL="http://localhost:9090${PROM_PREFIX}"
-AM_LOCAL="http://localhost:9093${AM_PREFIX}"
+# Когда задан подпуть, снаружи и изнутри ходим через nginx — без порта.
+# Без подпутей nginx маршрутизировать не по чему, поэтому идём прямо в порт.
+INTERNAL_BASE_URL="${INTERNAL_BASE_URL:-http://localhost}"
+if [[ -n "$PROM_PREFIX" ]]; then
+    PROM_LOCAL="${INTERNAL_BASE_URL}${PROM_PREFIX}"
+else
+    PROM_LOCAL="http://localhost:9090"
+fi
+if [[ -n "$AM_PREFIX" ]]; then
+    AM_LOCAL="${INTERNAL_BASE_URL}${AM_PREFIX}"
+else
+    AM_LOCAL="http://localhost:9093"
+fi
 
 # Подпути достаточно самого по себе — как у агента. Внешний адрес нужен
 # только чтобы ссылки в алертах вели наружу, а не на localhost; без него
@@ -286,7 +342,16 @@ curl -sf "${PROM_LOCAL}/-/healthy" >/dev/null && log_info "Prometheus ✓" || lo
 # =============================================================================
 log_section "3/4 Alertmanager v${ALERTMANAGER_VERSION}"
 # =============================================================================
-id alertmanager &>/dev/null || useradd -r -s /sbin/nologin alertmanager
+# Группа сервиса задаётся отдельно: в нашем контуре это reguser, а не
+# одноимённая группа, которую создал бы useradd по умолчанию.
+AM_GROUP="${ALERTMANAGER_GROUP:-reguser}"
+getent group "$AM_GROUP" >/dev/null || {
+    groupadd -r "$AM_GROUP"
+    log_info "Создана группа ${AM_GROUP}"
+}
+id alertmanager &>/dev/null || useradd -r -s /sbin/nologin -g "$AM_GROUP" alertmanager
+# Учётка могла существовать с прежней группой — приводим к нужной
+usermod -g "$AM_GROUP" alertmanager 2>/dev/null || true
 mkdir -p /etc/alertmanager /var/lib/alertmanager
 
 if ! command -v alertmanager &>/dev/null; then
@@ -362,7 +427,7 @@ EOF
 log_warn "Email не настроен — алерты идут только в AI-агента"
 fi
 
-chown -R alertmanager:alertmanager /etc/alertmanager /var/lib/alertmanager
+chown -R "alertmanager:${AM_GROUP}" /etc/alertmanager /var/lib/alertmanager
 
 # heredoc без кавычек — нужен для ${AM_WEB_FLAGS}; поэтому \\ вместо \
 cat > /etc/systemd/system/alertmanager.service << EOF
@@ -371,7 +436,7 @@ Description=Alertmanager
 After=network.target
 [Service]
 User=alertmanager
-Group=alertmanager
+Group=${AM_GROUP}
 ExecStart=/usr/local/bin/alertmanager \\
   --config.file=/etc/alertmanager/alertmanager.yml \\
   --storage.path=/var/lib/alertmanager \\

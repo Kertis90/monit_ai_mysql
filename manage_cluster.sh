@@ -259,6 +259,10 @@ with open(sys.argv[1], encoding='utf-8') as f:
 prom_prefix = (sys.argv[3] if len(sys.argv) > 3 else "").rstrip("/")
 am_prefix   = (sys.argv[4] if len(sys.argv) > 4 else "").rstrip("/")
 
+# При заданном подпуте ходим через nginx — без порта; иначе прямо в порт.
+prom_target = "localhost" if prom_prefix else "localhost:9090"
+am_target   = "localhost" if am_prefix   else "localhost:9093"
+
 clusters = [c for c in data['clusters'] if c.get('enabled', True)]
 
 scrape_configs = []
@@ -325,7 +329,7 @@ config = f"""global:
 alerting:
   alertmanagers:
     - static_configs:
-        - targets: ['localhost:9093']{am_path_line}
+        - targets: ['{am_target}']{am_path_line}
 
 rule_files:
   - /etc/prometheus/rules/*.yml
@@ -334,7 +338,7 @@ scrape_configs:
 
   - job_name: 'prometheus'{prom_path_line}
     static_configs:
-      - targets: ['localhost:9090']
+      - targets: ['{prom_target}']
 {scrape_block}
 """
 # encoding явно: при locale C запись кириллицы в метках иначе падает
@@ -355,7 +359,9 @@ EOF
 
     # Перезагрузить Prometheus без рестарта
     if systemctl is-active prometheus &>/dev/null; then
-        curl -sf -X POST "http://localhost:9090${PROMETHEUS_ROOT_PATH:-}/-/reload" \
+        PROM_RELOAD="http://localhost:9090"
+        [[ -n "${PROMETHEUS_ROOT_PATH:-}" ]] && \n            PROM_RELOAD="${INTERNAL_BASE_URL:-http://localhost}${PROMETHEUS_ROOT_PATH}"
+        curl -sf -X POST "${PROM_RELOAD}/-/reload" \
              || systemctl reload prometheus || true
         log_info "Prometheus конфиг перезагружен ✓"
     else

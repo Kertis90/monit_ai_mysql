@@ -304,6 +304,15 @@ sudo ./scripts/install_all.sh
 но **все конфиги перегенерируются из `config.env` и `clusters.json`**, юниты
 переписываются, сервисы перезапускаются.
 
+Если конфиги «разъехались» и сервис не стартует — добавьте `--clean`:
+
+```bash
+sudo ./scripts/install_all.sh --clean
+```
+
+Тогда сгенерированные конфиги сначала удаляются, а потом создаются заново.
+Данные (метрики, `grafana.db`, `alerts.db`) при этом сохраняются.
+
 Порядок внутри: `install_monitoring.sh` → `install_agent.sh` → `manage_cluster.sh apply`.
 `apply` идёт последним не случайно — он перезаписывает `prometheus.yml` целиком.
 
@@ -317,6 +326,11 @@ sudo ./scripts/install_all.sh
 | Датасорс и дашборды Grafana | Дашборды, созданные вручную в Grafana |
 | `/opt/ai-alert-agent/.env`, `agent.py`, `web/` | Пароль Grafana (сбрасывается на значение из `config.env`) |
 | systemd-юниты всех сервисов | |
+
+Учётная запись Alertmanager создаётся как `alertmanager:reguser`
+(группа задаётся переменной `ALERTMANAGER_GROUP`, по умолчанию `reguser`).
+Если группы нет, скрипт её создаёт; если учётка уже была в другой группе —
+переводит в нужную.
 
 Пароль локального админа, `AUTH_SECRET` и выданные доступы не теряются:
 первые два лежат в `config.env`, третьи — в `alerts.db`.
@@ -783,9 +797,22 @@ sudo ./manage_cluster.sh apply          # prometheus.yml с metrics_path
 sudo ./scripts/install_agent.sh         # PROMETHEUS_URL агента
 ```
 
+**Внутренние обращения тоже идут через nginx — без порта.** Раз подпути уже
+настроены в nginx, скрипты обращаются к сервисам по `http://localhost/prometheus`,
+а не `http://localhost:9090/prometheus`. Это касается датасорса Grafana,
+`PROMETHEUS_URL` агента, health-проверок, перезагрузки конфига и целей скрейпа
+(`targets: ['localhost']`). Хост настраивается переменной `INTERNAL_BASE_URL`
+в `config.env` (по умолчанию `http://localhost`).
+
+Без подпутей маршрутизировать в nginx не по чему, поэтому используется прямой
+адрес с портом — прежнее поведение.
+
+⚠️ Следствие: **nginx должен работать и знать про эти location до запуска
+скриптов.** Иначе health-проверки не пройдут — сервис живой, но по адресу
+через nginx недоступен.
+
 Alertmanager шлёт вебхуки агенту на `localhost:${AGENT_PORT}/webhook` — этот
-адрес от префиксов не зависит. Если снаружи всё ходит только через nginx, порты
-9090/9093 можно закрыть в firewalld.
+адрес от префиксов не зависит. Порты 9090/9093 можно закрыть в firewalld.
 
 Две самые частые ошибки:
 
@@ -1039,6 +1066,35 @@ Community-дашборды при этом остаются: их можно д�
 
 **Панели пишут «Datasource not found» или `${DS_PROMETHEUS}`** — дашборд
 импортирован без привязки датасорса. Перезалейте: `sudo ./scripts/install_monitoring.sh`.
+
+**Grafana не стартует / `Grafana-Server Init Failed`** — быстрее всего снести
+сгенерированные конфиги и создать заново:
+
+```bash
+sudo ./scripts/install_monitoring.sh --clean
+```
+
+Режим `--clean` останавливает Prometheus, Alertmanager и Grafana, удаляет
+**только то, что создаёт этот скрипт** (`prometheus.yml`, правила,
+`alertmanager.yml`, systemd-юниты, наш провижининг Grafana и дашборды из
+`/var/lib/grafana/dashboards`) и раскладывает всё заново из `config.env`
+и `clusters.json`.
+
+Не трогаются: метрики в `/var/lib/prometheus`, `grafana.db` с пользователями
+и вручную созданными дашбордами, `alerts.db` с алертами, чатами и доступами.
+
+То же для всего стека сразу: `sudo ./scripts/install_all.sh --clean`.
+
+Если и после этого не стартует — причина не в наших файлах:
+
+```bash
+journalctl -u grafana-server -n 40 --no-pager | grep -A3 -i "init failed\|error"
+ls -la /var/lib/grafana/          # права: должно быть grafana:grafana
+df -h /var/lib/grafana            # место на диске
+ss -tlnp | grep :3000             # порт не занят другим процессом
+```
+
+Ниже — частные случаи.
 
 **`Grafana-Server Init Failed`** — Grafana не стартует, если провижининг-файл
 невалиден, ссылается на несуществующий каталог или в этом каталоге лежит битый

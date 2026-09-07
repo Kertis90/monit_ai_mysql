@@ -16,8 +16,20 @@ GREEN='\033[0;32m'; RED='\033[0;31m'; BOLD='\033[1m'; NC='\033[0m'
     echo -e "${RED}config.env не найден — сначала запустите ./configure.sh${NC}"; exit 1; }
 [[ $EUID -ne 0 ]] && { echo -e "${RED}Нужен root (sudo)${NC}"; exit 1; }
 
+# --clean пробрасывается дальше: полная перезапись конфигов стека
+CLEAN_ARG=""
+for arg in "$@"; do
+    case "$arg" in
+        --clean|--reset) CLEAN_ARG="--clean" ;;
+        -h|--help)
+            echo "Использование: $0 [--clean]"
+            echo "  --clean   снести сгенерированные конфиги и создать заново"
+            exit 0 ;;
+    esac
+done
+
 echo -e "${BOLD}[1/3] Установка Prometheus + Alertmanager + Grafana...${NC}"
-bash "${SCRIPT_DIR}/install_monitoring.sh"
+bash "${SCRIPT_DIR}/install_monitoring.sh" ${CLEAN_ARG}
 
 echo -e "${BOLD}[2/3] Установка AI Agent...${NC}"
 bash "${SCRIPT_DIR}/install_agent.sh"
