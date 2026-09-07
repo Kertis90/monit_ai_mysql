@@ -1,0 +1,26 @@
+# Конфигурация с секретами: LLM-токен, пароль Grafana, хеш пароля админа,
+# AUTH_SECRET, пароль сервисной учётки LDAP. В репозиторий не попадает.
+config.env
+config.env.*
+!config.env.example
+
+# Базы агента: алерты, история чатов, список доступов
+*.db
+*.db-wal
+*.db-shm
+
+# Сборка релизов
+dist/
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Редакторы и ОС
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
