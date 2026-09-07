@@ -887,9 +887,17 @@ curl -X DELETE 'http://localhost:5001/chat/history?client_id=<uuid>'
 
 ```json
 "slow_log_path":   "/var/log/mysql/slow.log",
-"app_log_dirs":    "/var/log/lanbilling,/var/log/lanbilling/archive",
+"app_log_dirs":    "/var/log/billing,/var/log/billing/archive_logs",
 "app_log_pattern": "*.log*"
 ```
+
+`slow_log_path` — путь к **текущему** логу. Ротированные соседи
+(`slow.log.1`, `slow.log-20260907.gz`) подхватываются автоматически: из пути
+берётся каталог и маска `slow.log*`. Если архивы slow-лога лежат отдельно,
+добавьте необязательный `slow_log_archive_dir`.
+
+Сжатые файлы читаются **`zgrep` напрямую** — распаковывать на диск не нужно.
+Маска `*.log*` ловит и текущие `app.log`, и архивные `app.log.2.gz`.
 
 **Как читается, чтобы не подавиться гигабайтами.** Файл целиком не читается
 никогда:
@@ -900,8 +908,8 @@ curl -X DELETE 'http://localhost:5001/chat/history?client_id=<uuid>'
 2. Выбираются файлы, изменённые внутри запрошенного окна, **плюс один
    предыдущий**: при ротации по размеру запись за начало периода обычно
    оказывается в нём.
-3. `grep -F` по датам с `tail -n` (`LOG_MAX_LINES`, 400). Архивы `.gz`
-   читаются через `zgrep`.
+3. `grep -F` по датам с `tail -n` (`LOG_MAX_LINES`, 400); для `.gz` —
+   `zgrep`, тоже без распаковки.
 
 **Часовой пояс.** Период приводится к времени **сервера БД**, а не сервера
 мониторинга: метки в логах пишутся в локальном поясе, и разница дала бы grep

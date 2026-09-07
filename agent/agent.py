@@ -1616,13 +1616,24 @@ def log_date_patterns(since, until) -> list:
     return pats
 
 
+def log_reader_cmd(path: str, args: str) -> str:
+    """Команда чтения под формат файла.
+
+    Сжатые логи читаем zgrep — он работает с .gz напрямую, распаковывать
+    файл на диск не нужно.
+    """
+    q = shlex.quote(path)
+    if path.lower().endswith(".gz"):
+        return "zgrep -a -F " + args + " " + q + " 2>/dev/null"
+    return "grep -a -F " + args + " " + q + " 2>/dev/null"
+
+
 async def log_grep(host: str, path: str, patterns: list,
                    extra: str = "", max_lines: int = 0) -> tuple:
     """grep по файлу с ограничением вывода — файл целиком не читаем."""
     max_lines = max_lines or LOG_MAX_LINES
     args = " ".join("-e " + shlex.quote(p) for p in patterns)
-    reader = "zgrep" if path.endswith((".gz", ".bz2", ".xz")) else "grep"
-    cmd = reader + " -a -F " + args + " " + shlex.quote(path) + " 2>/dev/null"
+    cmd = log_reader_cmd(path, args)
     if extra:
         # дополнительный фильтр тоже фиксированной строкой, не регуляркой
         cmd += " | grep -a -F -i " + shlex.quote(extra)
@@ -1630,50 +1641,31 @@ async def log_grep(host: str, path: str, patterns: list,
     return await log_ssh(host, cmd)
 
 
-async def read_slow_log(cluster: dict, host: str, since, until,
-                        extra: str = "") -> str:
-    """Кусок slow-лога MySQL за период."""
-    path = (cluster.get("slow_log_path") or "/var/log/mysql/slow.log").strip()
-    ok, out = await log_grep(host, path, log_date_patterns(since, until),
-                             extra, LOG_MAX_LINES)
-    if not ok:
-        return "### Slow-лог " + host + ": " + out
-    lines = [l for l in out.splitlines() if l.strip()]
-    if not lines:
-        return ("### Slow-лог " + host + " (" + path + ")\n"
-                "  За период записей не найдено. Возможно, slow_query_log "
-                "выключен или long_query_time слишком велик.")
-    head = ["### Slow-лог {} ({}) — строк: {}".format(host, path, len(lines))]
-    head += ["  " + l for l in lines[:LOG_MAX_LINES]]
-    return "\n".join(head)
+async def read_log_group(host: str, dirs: list, pattern: str, since, until,
+                         title: str, extra: str = "", hint: str = "") -> str:
+    """Общий путь чтения: stat -> выбор файлов по времени -> grep.
 
-
-async def read_app_log(cluster: dict, host: str, since, until,
-                       extra: str = "") -> str:
-    """Логи приложения: сначала stat, выбор файлов по времени, потом grep."""
-    dirs = [d.strip() for d in (cluster.get("app_log_dirs") or "").split(",")
-            if d.strip()]
-    if not dirs:
-        return ""
-    pattern = (cluster.get("app_log_pattern") or "*.log*").strip()
-
+    Одинаково работает и для slow-лога, и для логов приложения: оба
+    ротируются, и нужный кусок может оказаться в архиве.
+    """
     files = await log_list_files(host, dirs, pattern)
     if not files:
-        return ("### Логи приложения " + host + "\n"
+        return ("### " + title + " " + host + "\n"
                 "  В каталогах " + ", ".join(dirs) +
                 " файлов по маске " + pattern + " нет.")
 
     picked = log_pick_files(files, since, until)
     if not picked:
         newest = datetime.datetime.fromtimestamp(files[0]["mtime"])
-        return ("### Логи приложения " + host + "\n"
+        return ("### " + title + " " + host + "\n"
                 "  Файлов за этот период нет. Всего найдено {}, самый свежий "
                 "изменён {:%Y-%m-%d %H:%M}.".format(len(files), newest))
 
-    out = ["### Логи приложения " + host,
+    out = ["### " + title + " " + host,
            "  Просмотрено файлов: {} из {} (выбраны по времени изменения)"
            .format(len(picked), len(files))]
     per_file = max(LOG_MAX_LINES // len(picked), 40)
+    found_any = False
     for f in picked:
         mt = datetime.datetime.fromtimestamp(f["mtime"])
         out.append("  {} — {:.1f} МБ, изменён {:%Y-%m-%d %H:%M}"
@@ -1687,8 +1679,51 @@ async def read_app_log(cluster: dict, host: str, since, until,
         elif not lines:
             out.append("      совпадений за период нет")
         else:
+            found_any = True
             out += ["      " + l[:300] for l in lines]
+    if not found_any and hint:
+        out.append("  " + hint)
     return "\n".join(out)
+
+
+def log_dir_and_pattern(path: str) -> tuple:
+    """Из пути к текущему логу — каталог и маска с учётом ротации.
+
+    /var/log/mysql/slow.log -> ('/var/log/mysql', 'slow.log*'), чтобы
+    подхватились slow.log.1, slow.log-20260907.gz и прочие ротированные.
+    """
+    path = path.strip().rstrip("/")
+    directory = os.path.dirname(path) or "/var/log"
+    base = os.path.basename(path) or "slow.log"
+    return directory, base + "*"
+
+
+async def read_slow_log(cluster: dict, host: str, since, until,
+                        extra: str = "") -> str:
+    """Slow-лог MySQL за период. Ротированные файлы тоже просматриваются."""
+    raw = (cluster.get("slow_log_path") or "/var/log/mysql/slow.log").strip()
+    directory, pattern = log_dir_and_pattern(raw)
+    dirs = [directory]
+    # архив slow-лога может лежать в отдельном каталоге
+    arch = (cluster.get("slow_log_archive_dir") or "").strip()
+    if arch and arch not in dirs:
+        dirs.append(arch)
+    return await read_log_group(
+        host, dirs, pattern, since, until, "Slow-лог", extra,
+        hint="Записей за период нет. Возможно, slow_query_log выключен "
+             "или long_query_time слишком велик.")
+
+
+async def read_app_log(cluster: dict, host: str, since, until,
+                       extra: str = "") -> str:
+    """Логи приложения: текущие и архивные, включая tar.gz."""
+    dirs = [d.strip() for d in (cluster.get("app_log_dirs") or "").split(",")
+            if d.strip()]
+    if not dirs:
+        return ""
+    pattern = (cluster.get("app_log_pattern") or "*.log*").strip()
+    return await read_log_group(host, dirs, pattern, since, until,
+                                "Логи приложения", extra)
 
 
 LOG_KEYWORDS = (
