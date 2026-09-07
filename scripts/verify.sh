@@ -28,8 +28,8 @@ check "AI Agent"       "systemctl is-active ai-alert-agent"
 echo ""
 
 echo -e "${CYAN}► HTTP${NC}"
-check "Prometheus healthy"   "curl -sf http://localhost:9090/-/healthy"
-check "Alertmanager healthy" "curl -sf http://localhost:9093/-/healthy"
+check "Prometheus healthy"   "curl -sf http://localhost:9090${PROMETHEUS_ROOT_PATH:-}/-/healthy"
+check "Alertmanager healthy" "curl -sf http://localhost:9093${ALERTMANAGER_ROOT_PATH:-}/-/healthy"
 check "Grafana healthy"      "curl -sf http://localhost:3000/api/health"
 check "AI Agent /health"     "curl -sf http://localhost:${AGENT_PORT}/health"
 check "AI Agent веб-UI"      "curl -sf http://localhost:${AGENT_PORT}/ | grep -q 'MySQL AI Agent'"
@@ -81,7 +81,7 @@ CLUSTERS=$(curl -sf "http://localhost:${AGENT_PORT}/clusters" 2>/dev/null | \
     python3 -c "import json,sys;d=json.load(sys.stdin);print(len(d['clusters']))" 2>/dev/null || echo "0")
 echo -e "  Кластеров в реестре: ${BOLD}${CLUSTERS}${NC}"
 
-TARGETS=$(curl -sf "http://localhost:9090/api/v1/targets" 2>/dev/null)
+TARGETS=$(curl -sf "http://localhost:9090${PROMETHEUS_ROOT_PATH:-}/api/v1/targets" 2>/dev/null)
 if [[ -n "$TARGETS" ]]; then
     echo "$TARGETS" | python3 -c "
 import json, sys

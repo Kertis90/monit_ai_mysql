@@ -6,6 +6,7 @@
     "description": "произвольное описание",
     "primary_ip":  "IP primary-сервера",
     "replica_ip":  "IP replica-сервера (пусто если нет)",
+    "replica_delay_seconds": "запланированное отставание реплики в секундах (MASTER_DELAY). 0 = реплика догоняет primary в реальном времени",
     "mysql_exporter_password": "пароль пользователя exporter в MySQL",
     "enabled":     "true/false — включить/отключить мониторинг",
     "tags":        "произвольные метки для группировки"
@@ -17,6 +18,7 @@
       "description":             "Основная БД торговой площадки Кемерово",
       "primary_ip":              "10.1.0.1",
       "replica_ip":              "10.1.0.2",
+      "replica_delay_seconds":   7200,
       "mysql_exporter_password": "ExporterPass_kmr!",
       "enabled":                 true,
       "tags":                    ["siberia", "production"]
@@ -27,6 +29,7 @@
       "description":             "Основная БД торговой площадки Новосибирск",
       "primary_ip":              "10.2.0.1",
       "replica_ip":              "10.2.0.2",
+      "replica_delay_seconds":   7200,
       "mysql_exporter_password": "ExporterPass_nsk!",
       "enabled":                 true,
       "tags":                    ["siberia", "production"]

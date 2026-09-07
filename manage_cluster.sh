@@ -116,6 +116,14 @@ cmd_add() {
     read -rp "  Описание (кратко): "                               DESCRIPTION
     read -rp "  IP primary-сервера MySQL: "                        PRIMARY_IP_C
     read -rp "  IP replica-сервера (Enter — пропустить): "         REPLICA_IP_C
+    DELAY_C=0
+    if [[ -n "$REPLICA_IP_C" ]]; then
+        echo "  Запланированное отставание реплики (MASTER_DELAY), сек."
+        echo "  0 — реплика идёт в реальном времени, 7200 — отстаёт на 2 часа"
+        read -rp "  Задержка реплики, сек [7200]: "                   DELAY_C
+        DELAY_C="${DELAY_C:-7200}"
+        [[ "$DELAY_C" =~ ^[0-9]+$ ]] || { log_error "Задержка должна быть целым числом секунд"; exit 1; }
+    fi
     read -rsp "  Пароль пользователя exporter в MySQL: "           EXPORTER_PASS
     echo ""
     read -rp "  Теги через запятую (напр. siberia,production): "   TAGS_STR
@@ -139,6 +147,7 @@ new_cluster = {
     "description":             "$DESCRIPTION",
     "primary_ip":              "$PRIMARY_IP_C",
     "replica_ip":              "$REPLICA_IP_C",
+    "replica_delay_seconds":   $DELAY_C,
     "mysql_exporter_password": "$EXPORTER_PASS",
     "enabled":                 True,
     "tags":                    $TAGS_JSON,
@@ -214,6 +223,10 @@ for c in d['clusters']:
         print(f"  Описание:  {c.get('description','')}")
         print(f"  Primary:   {c['primary_ip']}:9104")
         print(f"  Replica:   {c.get('replica_ip','—')}")
+        if c.get('replica_ip'):
+            d_s = int(c.get('replica_delay_seconds', 0) or 0)
+            human = f"{d_s // 3600} ч {d_s % 3600 // 60} мин" if d_s else "нет (реальное время)"
+            print(f"  Задержка:  {human}" + (f" ({d_s} с)" if d_s else ""))
         print(f"  Статус:    {'✓ enabled' if c.get('enabled',True) else '✗ disabled'}")
         print(f"  Теги:      {', '.join(c.get('tags',[]))}")
         break
@@ -234,11 +247,17 @@ cmd_apply() {
     fi
 
     # Генерируем scrape_configs из реестра
-    python3 - "$REGISTRY" "$PROM_CFG" << 'EOF'
+    # Если Prometheus/Alertmanager отдают себя под своим путём, это влияет
+    # на собственный scrape-таргет и на адрес Alertmanager в конфиге.
+    python3 - "$REGISTRY" "$PROM_CFG" \
+             "${PROMETHEUS_ROOT_PATH:-}" "${ALERTMANAGER_ROOT_PATH:-}" << 'EOF'
 import json, sys
 
-with open(sys.argv[1]) as f:
+with open(sys.argv[1], encoding='utf-8') as f:
     data = json.load(f)
+
+prom_prefix = (sys.argv[3] if len(sys.argv) > 3 else "").rstrip("/")
+am_prefix   = (sys.argv[4] if len(sys.argv) > 4 else "").rstrip("/")
 
 clusters = [c for c in data['clusters'] if c.get('enabled', True)]
 
@@ -290,6 +309,13 @@ for c in clusters:
 
 scrape_block = "\n".join(scrape_configs)
 
+# Prometheus под своим путём отдаёт метрики на <префикс>/metrics
+prom_path_line = (f"\n    metrics_path: '{prom_prefix}/metrics'"
+                  if prom_prefix else "")
+# и Alertmanager тогда доступен по <префикс>, а не в корне
+am_path_line   = (f"\n      path_prefix: '{am_prefix}/'"
+                  if am_prefix else "")
+
 config = f"""global:
   scrape_interval:     15s
   evaluation_interval: 15s
@@ -299,26 +325,38 @@ config = f"""global:
 alerting:
   alertmanagers:
     - static_configs:
-        - targets: ['localhost:9093']
+        - targets: ['localhost:9093']{am_path_line}
 
 rule_files:
   - /etc/prometheus/rules/*.yml
 
 scrape_configs:
 
-  - job_name: 'prometheus'
+  - job_name: 'prometheus'{prom_path_line}
     static_configs:
       - targets: ['localhost:9090']
 {scrape_block}
 """
-with open(sys.argv[2], 'w') as f:
+# encoding явно: при locale C запись кириллицы в метках иначе падает
+with open(sys.argv[2], 'w', encoding='utf-8') as f:
     f.write(config)
 print(f"Сгенерировано {len(clusters)} кластеров")
 EOF
 
+    # ── Recording rules: эффективный лаг реплик ───────────────────────────────
+    # Реплики могут работать с намеренной задержкой (replica_delay_seconds).
+    # Генератор считает отставание СВЕРХ запланированного — по нему алертим.
+    GEN="${SCRIPT_DIR}/scripts/gen_replication_rules.py"
+    if [[ -f "$GEN" ]]; then
+        python3 "$GEN" "$REGISTRY" "${RULES_DIR}/replication_delay.yml"
+    else
+        log_warn "gen_replication_rules.py не найден — правила лага реплик не обновлены"
+    fi
+
     # Перезагрузить Prometheus без рестарта
     if systemctl is-active prometheus &>/dev/null; then
-        curl -sf -X POST http://localhost:9090/-/reload || systemctl reload prometheus || true
+        curl -sf -X POST "http://localhost:9090${PROMETHEUS_ROOT_PATH:-}/-/reload" \
+             || systemctl reload prometheus || true
         log_info "Prometheus конфиг перезагружен ✓"
     else
         log_warn "Prometheus не запущен"

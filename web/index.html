@@ -18,6 +18,11 @@
   <span class="hbadge" id="ws-badge">подключение…</span>
   <div class="spacer"></div>
   <span class="hint">Enter — отправить · Shift+Enter — новая строка</span>
+  <span class="hbadge" id="forget-btn" title="Удалить сохранённую переписку этого браузера"
+        style="cursor:pointer" onclick="App.forgetHistory()">Очистить историю</span>
+  <span class="hbadge" id="user-badge" style="display:none"></span>
+  <span class="hbadge" id="logout-btn" title="Выйти"
+        style="cursor:pointer;display:none" onclick="App.logout()">Выйти</span>
 </header>
 
 <div class="layout">
@@ -39,6 +44,8 @@
       <div class="tab active" data-tab="chat"   onclick="App.showTab('chat')">💬 Чат</div>
       <div class="tab"        data-tab="status" onclick="App.showTab('status')">📊 Статус</div>
       <div class="tab"        data-tab="alerts" onclick="App.showTab('alerts')">🔔 Алерты <span class="alert-count" id="alert-count"></span></div>
+      <div class="tab" data-tab="access" id="tab-btn-access" style="display:none"
+           onclick="App.showTab('access')">🔑 Доступы</div>
     </nav>
 
     <!-- ── ЧАТ ── -->
@@ -78,6 +85,45 @@
     <section id="tab-alerts" class="tab-pane alerts-pane" hidden>
       <div id="alerts-content"><div class="muted">Загрузка…</div></div>
       <button class="ghost-btn" onclick="App.loadAlerts()">↻ Обновить</button>
+    </section>
+
+    <section id="tab-access" class="tab-pane" hidden>
+      <h3 style="margin:0 0 4px">Кто может входить в систему</h3>
+      <p class="muted" style="margin:0 0 18px;font-size:13px">
+        Доменной учётной записи мало — вход разрешён только тем, кто есть
+        в этом списке. Локальный администратор входит всегда.
+      </p>
+
+      <div id="dir-search-box">
+        <div style="display:flex;gap:8px;margin-bottom:10px">
+          <input id="dir-query" type="text" placeholder="Поиск в каталоге: фамилия, логин или почта"
+                 style="flex:1;padding:9px 12px;border-radius:8px;border:1px solid var(--border,#2b313c);
+                        background:var(--bg,#12151b);color:inherit;font:inherit">
+          <button class="ghost-btn" onclick="App.searchDirectory()">Найти</button>
+        </div>
+        <div id="dir-results"></div>
+      </div>
+
+      <div id="manual-add" style="margin:14px 0 22px">
+        <div class="muted" style="font-size:12px;margin-bottom:6px">
+          Или добавить по логину вручную (для SSO/OIDC без поиска по каталогу):
+        </div>
+        <div style="display:flex;gap:8px">
+          <input id="manual-login" type="text" placeholder="логин"
+                 style="flex:1;padding:9px 12px;border-radius:8px;border:1px solid var(--border,#2b313c);
+                        background:var(--bg,#12151b);color:inherit;font:inherit">
+          <select id="manual-role" style="padding:9px;border-radius:8px;
+                  border:1px solid var(--border,#2b313c);background:var(--bg,#12151b);color:inherit">
+            <option value="user">пользователь</option>
+            <option value="admin">администратор</option>
+          </select>
+          <button class="ghost-btn" onclick="App.grantManual()">Выдать доступ</button>
+        </div>
+      </div>
+
+      <h4 style="margin:0 0 10px">Выданные доступы</h4>
+      <div id="access-list"><div class="muted">Загрузка…</div></div>
+      <button class="ghost-btn" onclick="App.loadAccess()">↻ Обновить</button>
     </section>
   </main>
 </div>

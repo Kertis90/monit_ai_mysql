@@ -17,12 +17,19 @@ import datetime
 import asyncio
 import re
 import sqlite3
+import secrets
+import hmac
+import hashlib
+import base64
+import time
+import urllib.parse
 import httpx
 from contextlib import closing
 from pathlib import Path
 from typing import Optional, AsyncGenerator
-from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi import (FastAPI, Request, Response, HTTPException,
+                     WebSocket, WebSocketDisconnect)
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -52,6 +59,71 @@ ROOT_PATH       = "" if ROOT_PATH == "/" else ROOT_PATH
 ALERTS_DB_PATH        = os.environ.get("ALERTS_DB_PATH", "/opt/ai-alert-agent/alerts.db")
 ALERTS_RETENTION_DAYS = int(os.environ.get("ALERTS_RETENTION_DAYS", "30"))
 
+# История чатов: та же БД. Пользователь опознаётся по client_id из localStorage
+# браузера (см. web/app.js), логина в системе нет.
+CHATS_RETENTION_DAYS  = int(os.environ.get("CHATS_RETENTION_DAYS", "30"))
+CHAT_CONTEXT_MESSAGES = int(os.environ.get("CHAT_CONTEXT_MESSAGES", "16"))
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  АУТЕНТИФИКАЦИЯ
+#  Три источника, проверяются в этом порядке: SSO-заголовок от доверенного
+#  прокси → LDAP/AD → локальный админ. Любой можно выключить.
+# ══════════════════════════════════════════════════════════════════════════════
+
+AUTH_ENABLED            = os.environ.get("AUTH_ENABLED", "true").lower() == "true"
+AUTH_ADMIN_USER         = os.environ.get("AUTH_ADMIN_USER", "admin")
+AUTH_ADMIN_PASSWORD_HASH = os.environ.get("AUTH_ADMIN_PASSWORD_HASH", "")
+AUTH_SESSION_TTL_HOURS  = float(os.environ.get("AUTH_SESSION_TTL_HOURS", "12"))
+# Секрет подписи сессионных cookie. Если не задан — генерируем на старте,
+# но тогда сессии инвалидируются при каждом рестарте агента.
+AUTH_SECRET             = os.environ.get("AUTH_SECRET", "") or secrets.token_hex(32)
+AUTH_COOKIE             = "mysql_ai_session"
+
+# ── LDAP / Active Directory ──────────────────────────────────────────────────
+LDAP_ENABLED          = os.environ.get("LDAP_ENABLED", "false").lower() == "true"
+LDAP_URL              = os.environ.get("LDAP_URL", "")
+# Шаблон для bind: {username} подставляется. Для AD обычно достаточно UPN:
+#   {username}@company.ru      либо   COMPANY\{username}
+LDAP_BIND_TEMPLATE    = os.environ.get("LDAP_BIND_TEMPLATE", "{username}")
+LDAP_BASE_DN          = os.environ.get("LDAP_BASE_DN", "")
+LDAP_USER_FILTER      = os.environ.get("LDAP_USER_FILTER", "(sAMAccountName={username})")
+LDAP_REQUIRED_GROUP   = os.environ.get("LDAP_REQUIRED_GROUP", "")
+LDAP_TLS_VERIFY       = os.environ.get("LDAP_TLS_VERIFY", "true").lower() == "true"
+LDAP_TIMEOUT          = float(os.environ.get("LDAP_TIMEOUT", "8"))
+# Сервисная учётка для поиска по каталогу (выбор пользователей из списка).
+# Пользовательский bind тут не годится: доступ выдают ДО первого входа.
+LDAP_SEARCH_USER      = os.environ.get("LDAP_SEARCH_USER", "")
+LDAP_SEARCH_PASSWORD  = os.environ.get("LDAP_SEARCH_PASSWORD", "")
+LDAP_SEARCH_FILTER    = os.environ.get(
+    "LDAP_SEARCH_FILTER",
+    "(&(objectClass=user)(|(sAMAccountName=*{query}*)"
+    "(displayName=*{query}*)(mail=*{query}*)))")
+
+# ── SSO через доверенный обратный прокси ─────────────────────────────────────
+# nginx с Kerberos/SAML/oauth2-proxy аутентифицирует пользователя и передаёт
+# его имя заголовком. Заголовку можно верить ТОЛЬКО если запрос пришёл с
+# известного адреса — иначе кто угодно подставит себе любое имя.
+SSO_ENABLED           = os.environ.get("SSO_ENABLED", "false").lower() == "true"
+SSO_HEADER            = os.environ.get("SSO_HEADER", "X-Remote-User")
+SSO_TRUSTED_PROXIES   = [p.strip() for p in
+                         os.environ.get("SSO_TRUSTED_PROXIES", "127.0.0.1,::1").split(",")
+                         if p.strip()]
+SSO_LOGOUT_URL        = os.environ.get("SSO_LOGOUT_URL", "")
+
+# ── OIDC / OAuth2 (встроенный) ───────────────────────────────────────────────
+OIDC_ENABLED        = os.environ.get("OIDC_ENABLED", "false").lower() == "true"
+OIDC_ISSUER         = os.environ.get("OIDC_ISSUER", "")
+OIDC_CLIENT_ID      = os.environ.get("OIDC_CLIENT_ID", "")
+OIDC_CLIENT_SECRET  = os.environ.get("OIDC_CLIENT_SECRET", "")
+# Должен совпадать с зарегистрированным у провайдера. За прокси вычислить
+# его автоматически нельзя — схему и хост подменяет nginx.
+OIDC_REDIRECT_URL   = os.environ.get("OIDC_REDIRECT_URL", "")
+OIDC_SCOPES         = os.environ.get("OIDC_SCOPES", "openid profile email")
+# Какое поле userinfo считать логином. Для AD/Entra обычно preferred_username
+OIDC_USERNAME_CLAIM = os.environ.get("OIDC_USERNAME_CLAIM", "preferred_username")
+OIDC_TLS_VERIFY     = os.environ.get("OIDC_TLS_VERIFY", "true").lower() == "true"
+OIDC_BUTTON_TEXT    = os.environ.get("OIDC_BUTTON_TEXT", "Войти через SSO")
+
 AUTH_HEADER = LLM_API_KEY if LLM_API_KEY.startswith("Bearer ") else f"Bearer {LLM_API_KEY}"
 
 logging.basicConfig(
@@ -66,6 +138,180 @@ app = FastAPI(title="MySQL AI Agent v3", version="3.0.0", root_path=ROOT_PATH)
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  АУТЕНТИФИКАЦИЯ: пароли, сессии, источники
+# ══════════════════════════════════════════════════════════════════════════════
+
+PBKDF2_ITERATIONS = 200_000
+
+
+def hash_password(password: str, salt: str = "", iterations: int = PBKDF2_ITERATIONS) -> str:
+    """pbkdf2_sha256$<итераций>$<соль>$<хеш>. Только stdlib, без bcrypt."""
+    salt = salt or secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
+                             salt.encode("utf-8"), iterations)
+    return f"pbkdf2_sha256${iterations}${salt}${dk.hex()}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        algo, iterations, salt, digest = stored.split("$")
+        if algo != "pbkdf2_sha256":
+            return False
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
+                                 salt.encode("utf-8"), int(iterations))
+        # сравнение постоянного времени — не даём подбирать хеш по таймингу
+        return hmac.compare_digest(dk.hex(), digest)
+    except Exception:
+        return False
+
+
+# ── Сессия: подписанный cookie, состояние на сервере не хранится ─────────────
+
+def make_session(username: str, source: str) -> str:
+    exp     = int(time.time() + AUTH_SESSION_TTL_HOURS * 3600)
+    payload = f"{username}|{source}|{exp}"
+    sig     = hmac.new(AUTH_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{payload}|{sig}".encode()).decode()
+
+
+def read_session(token: str) -> Optional[dict]:
+    try:
+        raw = base64.urlsafe_b64decode(token.encode()).decode()
+        username, source, exp, sig = raw.rsplit("|", 3)
+        expected = hmac.new(AUTH_SECRET.encode(),
+                            f"{username}|{source}|{exp}".encode(),
+                            hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        if int(exp) < time.time():
+            return None
+        return {"username": username, "source": source, "expires": int(exp)}
+    except Exception:
+        return None
+
+
+# ── Источник 1: SSO-заголовок от доверенного прокси ──────────────────────────
+
+def sso_username(request: Request) -> Optional[str]:
+    if not SSO_ENABLED:
+        return None
+    peer = request.client.host if request.client else ""
+    if peer not in SSO_TRUSTED_PROXIES:
+        # Критично: без этой проверки любой клиент подставит себе чужое имя
+        logger.warning(f"SSO-заголовок с недоверенного адреса {peer} — игнорирую")
+        return None
+    user = (request.headers.get(SSO_HEADER) or "").strip()
+    return user or None
+
+
+# ── Источник 2: LDAP / Active Directory ──────────────────────────────────────
+
+def ldap_authenticate(username: str, password: str) -> bool:
+    if not (LDAP_ENABLED and LDAP_URL and username and password):
+        return False
+    try:
+        from ldap3 import Server, Connection, Tls, ALL, SUBTREE
+        import ssl as _ssl
+    except ImportError:
+        logger.error("LDAP включён, но пакет ldap3 не установлен. "
+                     "Поставьте: /opt/ai-alert-agent/venv/bin/pip install ldap3")
+        return False
+    try:
+        tls = Tls(validate=_ssl.CERT_REQUIRED if LDAP_TLS_VERIFY else _ssl.CERT_NONE)
+        server = Server(LDAP_URL, get_info=ALL, tls=tls,
+                        connect_timeout=LDAP_TIMEOUT)
+        bind_dn = LDAP_BIND_TEMPLATE.format(username=username)
+
+        conn = Connection(server, user=bind_dn, password=password,
+                          auto_bind=True, receive_timeout=LDAP_TIMEOUT)
+
+        # Проверка членства в группе — если она задана
+        if LDAP_REQUIRED_GROUP:
+            if not LDAP_BASE_DN:
+                logger.error("LDAP_REQUIRED_GROUP задан, но LDAP_BASE_DN пуст")
+                conn.unbind()
+                return False
+            flt = ("(&" + LDAP_USER_FILTER.format(username=username) +
+                   f"(memberOf={LDAP_REQUIRED_GROUP}))")
+            conn.search(LDAP_BASE_DN, flt, search_scope=SUBTREE, attributes=["cn"])
+            allowed = bool(conn.entries)
+            conn.unbind()
+            if not allowed:
+                logger.warning(f"LDAP: {username} не состоит в {LDAP_REQUIRED_GROUP}")
+            return allowed
+
+        conn.unbind()
+        return True
+    except Exception as e:
+        logger.warning(f"LDAP-аутентификация {username} не прошла: {e}")
+        return False
+
+
+# ── Источник 3: локальный админ ──────────────────────────────────────────────
+
+def local_authenticate(username: str, password: str) -> bool:
+    if not AUTH_ADMIN_PASSWORD_HASH:
+        return False
+    # сравниваем имя тоже за постоянное время
+    user_ok = hmac.compare_digest(username or "", AUTH_ADMIN_USER)
+    pass_ok = verify_password(password or "", AUTH_ADMIN_PASSWORD_HASH)
+    return user_ok and pass_ok
+
+
+ERR_BAD_CREDS = "Неверный логин или пароль"
+ERR_NO_ACCESS = ("Учётная запись найдена, но доступ к системе не выдан. "
+                 "Обратитесь к администратору.")
+
+
+def authenticate(username: str, password: str) -> tuple[Optional[str], str]:
+    """(источник, ошибка). Источник None — вход отклонён.
+
+    Локальный админ проверяется первым и не требует записи в списке доступов:
+    это bootstrap-учётка, которой список и наполняют.
+    """
+    if local_authenticate(username, password):
+        return "local", ""
+
+    if ldap_authenticate(username, password):
+        # Пароль в домене верный — но этого мало, нужен выданный доступ
+        if not user_allowed(username):
+            logger.warning(f"LDAP-вход {username}: доступ не выдан")
+            return None, ERR_NO_ACCESS
+        return "ldap", ""
+
+    return None, ERR_BAD_CREDS
+
+
+def sso_denied(request: Request) -> bool:
+    """Прокси аутентифицировал пользователя, но доступ ему не выдавали."""
+    name = sso_username(request)
+    return bool(name) and not user_allowed(name)
+
+
+def current_user(request: Request) -> Optional[dict]:
+    """Пользователь запроса: сначала SSO, затем сессионный cookie."""
+    name = sso_username(request)
+    if name:
+        if not user_allowed(name):
+            logger.warning(f"SSO-вход {name}: доступ не выдан")
+            return None
+        return {"username": name, "source": "sso"}
+    token = request.cookies.get(AUTH_COOKIE, "")
+    if not token:
+        return None
+    sess = read_session(token)
+    if not sess:
+        return None
+
+    # Подписи и срока мало: доступ могли отозвать уже после выдачи cookie.
+    # Локальный админ — исключение, его в списке доступов нет по определению.
+    if sess.get("source") != "local" and not user_allowed(sess["username"]):
+        logger.warning(f"Сессия {sess['username']}: доступ отозван — вход закрыт")
+        return None
+    return sess
+
 alert_history: list[dict] = []   # запасная копия в памяти, если БД недоступна
 ws_sessions:   dict[str, list[dict]] = {}   # session_id -> messages
 
@@ -76,7 +322,7 @@ ws_sessions:   dict[str, list[dict]] = {}   # session_id -> messages
 #  pip-зависимостей не требует. Записи старше ALERTS_RETENTION_DAYS удаляются.
 # ══════════════════════════════════════════════════════════════════════════════
 
-def alerts_db() -> sqlite3.Connection:
+def agent_db() -> sqlite3.Connection:
     conn = sqlite3.connect(ALERTS_DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     return conn
@@ -91,7 +337,7 @@ def alerts_cutoff() -> str:
 def alerts_init() -> bool:
     try:
         Path(ALERTS_DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-        with closing(alerts_db()) as conn, conn:
+        with closing(agent_db()) as conn, conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS alerts (
                     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -127,7 +373,7 @@ def alerts_save(rec: dict) -> None:
     if not ALERTS_DB_OK:
         return
     try:
-        with closing(alerts_db()) as conn, conn:
+        with closing(agent_db()) as conn, conn:
             conn.execute(
                 "INSERT INTO alerts (ts, alert, cluster, cluster_label,"
                 " instance, severity, summary, analysis)"
@@ -167,7 +413,7 @@ def alerts_query(cluster: Optional[str] = None,
         sql += " ORDER BY ts DESC LIMIT ?"
         params.append(limit)
 
-        with closing(alerts_db()) as conn:
+        with closing(agent_db()) as conn:
             return [dict(r) for r in conn.execute(sql, params).fetchall()]
     except Exception as e:
         logger.error(f"Не удалось выбрать алерты для чата: {e}")
@@ -180,7 +426,7 @@ def alerts_load(limit: int) -> tuple[int, list[dict]]:
         return len(alert_history), alert_history[:limit]
     try:
         cutoff = alerts_cutoff()
-        with closing(alerts_db()) as conn:
+        with closing(agent_db()) as conn:
             total = conn.execute(
                 "SELECT COUNT(*) FROM alerts WHERE ts >= ?", (cutoff,)).fetchone()[0]
             rows = conn.execute(
@@ -194,6 +440,298 @@ def alerts_load(limit: int) -> tuple[int, list[dict]]:
         return len(alert_history), alert_history[:limit]
 
 
+
+
+def ldap_search_users(query: str, limit: int = 25) -> list[dict]:
+    """Поиск по каталогу для выбора кандидатов на доступ.
+
+    Нужна сервисная учётка (LDAP_SEARCH_USER): пользовательский bind тут
+    не подходит — админ выбирает людей до того, как они впервые вошли.
+    """
+    if not (LDAP_ENABLED and LDAP_URL and LDAP_BASE_DN):
+        return []
+    if not LDAP_SEARCH_USER:
+        logger.error("Поиск по каталогу требует сервисной учётки LDAP_SEARCH_USER")
+        return []
+    q = (query or "").strip()
+    if len(q) < 2:
+        return []
+    try:
+        from ldap3 import Server, Connection, Tls, ALL, SUBTREE
+        from ldap3.utils.conv import escape_filter_chars
+        import ssl as _ssl
+    except ImportError:
+        logger.error("Поиск по каталогу требует пакета ldap3")
+        return []
+    try:
+        safe = escape_filter_chars(q)      # защита от инъекции в LDAP-фильтр
+        tls = Tls(validate=_ssl.CERT_REQUIRED if LDAP_TLS_VERIFY else _ssl.CERT_NONE)
+        server = Server(LDAP_URL, get_info=ALL, tls=tls, connect_timeout=LDAP_TIMEOUT)
+        conn = Connection(server, user=LDAP_SEARCH_USER,
+                          password=LDAP_SEARCH_PASSWORD, auto_bind=True,
+                          receive_timeout=LDAP_TIMEOUT)
+        flt = LDAP_SEARCH_FILTER.replace("{query}", safe)
+        conn.search(LDAP_BASE_DN, flt, search_scope=SUBTREE,
+                    attributes=["sAMAccountName", "userPrincipalName",
+                                "displayName", "cn", "mail"],
+                    size_limit=limit)
+        out = []
+        for e in conn.entries:
+            def attr(name):
+                v = getattr(e, name, None)
+                return str(v) if v and str(v) != "[]" else ""
+            login = attr("sAMAccountName") or attr("userPrincipalName")
+            if not login:
+                continue
+            out.append({
+                "username":     norm_username(login),
+                "display_name": attr("displayName") or attr("cn") or login,
+                "email":        attr("mail"),
+            })
+        conn.unbind()
+        return out
+    except Exception as e:
+        logger.error(f"Поиск по каталогу не удался: {e}")
+        return []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  СПИСОК ДОСТУПОВ
+#  Успешная проверка пароля в домене — ещё не право входа. Пользователь должен
+#  быть заранее выдан администратором (таблица users). Локальный админ — это
+#  bootstrap-учётка, она в списке не нуждается.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def users_init() -> bool:
+    if not ALERTS_DB_OK:
+        return False
+    try:
+        with closing(agent_db()) as conn, conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    username     TEXT PRIMARY KEY,
+                    display_name TEXT,
+                    email        TEXT,
+                    role         TEXT NOT NULL DEFAULT 'user',
+                    enabled      INTEGER NOT NULL DEFAULT 1,
+                    granted_by   TEXT,
+                    granted_at   TEXT
+                )
+            """)
+        return True
+    except Exception as e:
+        logger.error(f"Таблица доступов недоступна: {e}")
+        return False
+
+
+USERS_DB_OK = users_init()
+
+
+def norm_username(name: str) -> str:
+    """Приводит к единому виду: домен-префикс отбрасывается, регистр нижний."""
+    n = (name or "").strip()
+    if "\\" in n:
+        n = n.split("\\", 1)[1]
+    return n.lower()
+
+
+def user_get(username: str) -> Optional[dict]:
+    if not USERS_DB_OK:
+        return None
+    try:
+        with closing(agent_db()) as conn:
+            row = conn.execute(
+                "SELECT username, display_name, email, role, enabled,"
+                "       granted_by, granted_at"
+                "  FROM users WHERE username = ?",
+                (norm_username(username),)).fetchone()
+        return dict(row) if row else None
+    except Exception as e:
+        logger.error(f"Не удалось прочитать доступ {username}: {e}")
+        return None
+
+
+def user_allowed(username: str) -> bool:
+    """Есть ли у доменного/SSO/OIDC пользователя право входа."""
+    u = user_get(username)
+    return bool(u and u["enabled"])
+
+
+def users_list() -> list[dict]:
+    if not USERS_DB_OK:
+        return []
+    try:
+        with closing(agent_db()) as conn:
+            rows = conn.execute(
+                "SELECT username, display_name, email, role, enabled,"
+                "       granted_by, granted_at FROM users"
+                " ORDER BY enabled DESC, username").fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.error(f"Не удалось получить список доступов: {e}")
+        return []
+
+
+def user_grant(username: str, display_name: str = "", email: str = "",
+               role: str = "user", granted_by: str = "") -> bool:
+    if not USERS_DB_OK:
+        return False
+    uname = norm_username(username)
+    if not uname:
+        return False
+    if role not in ("user", "admin"):
+        role = "user"
+    try:
+        with closing(agent_db()) as conn, conn:
+            conn.execute(
+                "INSERT INTO users (username, display_name, email, role,"
+                "                   enabled, granted_by, granted_at)"
+                " VALUES (?, ?, ?, ?, 1, ?, ?)"
+                " ON CONFLICT(username) DO UPDATE SET"
+                "   display_name = excluded.display_name,"
+                "   email        = excluded.email,"
+                "   role         = excluded.role,"
+                "   enabled      = 1,"
+                "   granted_by   = excluded.granted_by,"
+                "   granted_at   = excluded.granted_at",
+                (uname, display_name, email, role, granted_by,
+                 datetime.datetime.utcnow().isoformat()))
+        logger.info(f"Доступ выдан: {uname} (роль {role}, выдал {granted_by})")
+        return True
+    except Exception as e:
+        logger.error(f"Не удалось выдать доступ {uname}: {e}")
+        return False
+
+
+def user_revoke(username: str, by: str = "") -> bool:
+    """Отзыв мягкий: запись остаётся, чтобы был виден факт выдачи и отзыва."""
+    if not USERS_DB_OK:
+        return False
+    try:
+        with closing(agent_db()) as conn, conn:
+            cur = conn.execute("UPDATE users SET enabled = 0 WHERE username = ?",
+                               (norm_username(username),))
+        if cur.rowcount:
+            logger.info(f"Доступ отозван: {norm_username(username)} (отозвал {by})")
+        return bool(cur.rowcount)
+    except Exception as e:
+        logger.error(f"Не удалось отозвать доступ: {e}")
+        return False
+
+
+def user_delete(username: str) -> bool:
+    if not USERS_DB_OK:
+        return False
+    try:
+        with closing(agent_db()) as conn, conn:
+            cur = conn.execute("DELETE FROM users WHERE username = ?",
+                               (norm_username(username),))
+        return bool(cur.rowcount)
+    except Exception as e:
+        logger.error(f"Не удалось удалить запись доступа: {e}")
+        return False
+
+
+def is_admin(user: Optional[dict]) -> bool:
+    """Локальный админ — всегда админ; доменный — по роли в списке доступов."""
+    if not user:
+        return False
+    if user.get("source") == "local":
+        return True
+    rec = user_get(user.get("username", ""))
+    return bool(rec and rec["enabled"] and rec["role"] == "admin")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ХРАНИЛИЩЕ ЧАТОВ
+#  Та же SQLite. Пользователь опознаётся по client_id — стабильному
+#  идентификатору из localStorage браузера (web/app.js). Логина в системе нет,
+#  поэтому история приватна ровно в той мере, в какой приватен сам браузер.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def chats_cutoff() -> str:
+    return (datetime.datetime.utcnow()
+            - datetime.timedelta(days=CHATS_RETENTION_DAYS)).isoformat()
+
+
+def chats_init() -> bool:
+    if not ALERTS_DB_OK:
+        return False
+    try:
+        with closing(agent_db()) as conn, conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    client_id   TEXT NOT NULL,
+                    session_id  TEXT,
+                    ts          TEXT NOT NULL,
+                    role        TEXT NOT NULL,
+                    content     TEXT NOT NULL,
+                    fingerprint TEXT
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_client_ts"
+                         " ON chat_messages(client_id, ts)")
+            conn.execute("DELETE FROM chat_messages WHERE ts < ?", (chats_cutoff(),))
+        logger.info(f"История чатов: {ALERTS_DB_PATH}, хранение {CHATS_RETENTION_DAYS} дн.")
+        return True
+    except Exception as e:
+        logger.error(f"Хранилище чатов недоступно: {e}. "
+                     f"История чатов будет только в памяти.")
+        return False
+
+
+CHATS_DB_OK = chats_init()
+
+
+def chat_save(client_id: str, session_id: str, role: str,
+              content: str, fingerprint: str = "") -> None:
+    if not CHATS_DB_OK or not client_id:
+        return
+    try:
+        with closing(agent_db()) as conn, conn:
+            conn.execute(
+                "INSERT INTO chat_messages"
+                " (client_id, session_id, ts, role, content, fingerprint)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (client_id, session_id,
+                 datetime.datetime.utcnow().isoformat(),
+                 role, content, fingerprint))
+            conn.execute("DELETE FROM chat_messages WHERE ts < ?", (chats_cutoff(),))
+    except Exception as e:
+        logger.error(f"Не удалось сохранить сообщение чата: {e}")
+
+
+def chat_load(client_id: str, limit: int = 40) -> list[dict]:
+    """Последние сообщения пользователя в хронологическом порядке."""
+    if not CHATS_DB_OK or not client_id:
+        return []
+    try:
+        with closing(agent_db()) as conn:
+            rows = conn.execute(
+                "SELECT ts, role, content FROM chat_messages"
+                "  WHERE client_id = ? AND ts >= ?"
+                "  ORDER BY ts DESC, id DESC LIMIT ?",
+                (client_id, chats_cutoff(), limit)).fetchall()
+        # из БД пришло от новых к старым — разворачиваем для показа и для LLM
+        return [{"role": r["role"], "content": r["content"], "ts": r["ts"]}
+                for r in reversed(rows)]
+    except Exception as e:
+        logger.error(f"Не удалось прочитать историю чата: {e}")
+        return []
+
+
+def chat_clear(client_id: str) -> int:
+    if not CHATS_DB_OK or not client_id:
+        return 0
+    try:
+        with closing(agent_db()) as conn, conn:
+            cur = conn.execute("DELETE FROM chat_messages WHERE client_id = ?",
+                               (client_id,))
+            return cur.rowcount
+    except Exception as e:
+        logger.error(f"Не удалось очистить историю чата: {e}")
+        return 0
 # ══════════════════════════════════════════════════════════════════════════════
 #  РЕЕСТР КЛАСТЕРОВ
 # ══════════════════════════════════════════════════════════════════════════════
@@ -393,7 +931,14 @@ async def collect_current(cluster: dict) -> dict:
                 prom_query(client, f'mysql_slave_status_slave_io_running{{instance="{inst}"}}'),
                 prom_query(client, f'mysql_slave_status_slave_sql_running{{instance="{inst}"}}'),
             )
-            rep["replication_lag_s"]  = str(lag) if lag is not None else "нет данных"
+            # Реплика может работать с намеренной задержкой (MASTER_DELAY):
+            # сырой Seconds_Behind_Master тогда всегда равен ей. Показываем
+            # обе величины раздельно, иначе LLM примет норму за аварию.
+            delay = int(cluster.get("replica_delay_seconds", 0) or 0)
+            rep["replication_planned_delay_s"] = str(delay)
+            rep["replication_lag_over_plan_s"] = (
+                "нет данных" if lag is None else str(max(float(lag) - delay, 0)))
+            rep["replication_lag_raw_s"] = str(lag) if lag is not None else "нет данных"
             rep["replication_io_up"]  = str(io)  if io  is not None else "нет данных"
             rep["replication_sql_up"] = str(sql) if sql is not None else "нет данных"
             out["replica"] = rep
@@ -416,8 +961,11 @@ async def collect_history(cluster: dict, hours: float) -> dict:
             "row_lock_waits":  f'rate(mysql_global_status_innodb_row_lock_waits{{instance="{inst}"}}[5m])',
         }
         if repl:
-            queries["replication_lag_s"] = \
-                f'mysql_slave_status_seconds_behind_master{{instance="{repl}:9104"}}'
+            # Отставание сверх запланированного — по нему и надо судить
+            delay = int(cluster.get("replica_delay_seconds", 0) or 0)
+            queries["replication_lag_over_plan_s"] = (
+                f'clamp_min(mysql_slave_status_seconds_behind_master'
+                f'{{instance="{repl}:9104"}} - {delay}, 0)')
 
         keys    = list(queries.keys())
         results = await asyncio.gather(
@@ -447,7 +995,12 @@ def system_prompt() -> str:
 6. Если приложен блок «Алерты за …» — это реальная история срабатываний
    за {ALERTS_RETENTION_DAYS} дн. Опирайся на неё: называй даты и время,
    ищи повторяющиеся и связанные инциденты. Блок с фразой «Ни одного алерта
-   за этот период не было» означает именно это — не придумывай инциденты."""
+   за этот период не было» означает именно это — не придумывай инциденты.
+7. Реплики могут работать с ЗАПЛАНИРОВАННОЙ задержкой (MASTER_DELAY):
+   replication_planned_delay_s — это норма, а не авария. Судить об
+   отставании нужно ТОЛЬКО по replication_lag_over_plan_s (сверх плана):
+   0 значит реплика идёт ровно по графику. Не предлагай "чинить" лаг,
+   равный плановой задержке."""
 
 
 def fmt_alerts(rows: list[dict], period: str, label: Optional[str] = None) -> str:
@@ -522,7 +1075,7 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
         lines = ["## Краткий статус всех кластеров\n"]
         for s in results:
             p   = s["primary"]
-            lag = s.get("replica", {}).get("replication_lag_s", "—")
+            lag = s.get("replica", {}).get("replication_lag_over_plan_s", "—")
             lines.append(
                 f"  {s['cluster_label']:20} up={p.get('mysql_up','?')}  "
                 f"QPS={p.get('qps','?')}  slow={p.get('slow_qps','?')}/s  "
@@ -607,11 +1160,337 @@ async def llm_complete(messages: list[dict]) -> str:
 #  WEBSOCKET ЧАТ
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  OIDC (Authorization Code Flow + PKCE)
+#  Подпись ID-токена не проверяем: вместо этого личность берём с userinfo,
+#  запрошенного по TLS напрямую у провайдера с полученным access-токеном.
+#  Так не нужен JWKS/JWT-разбор, а доверие опирается на TLS к issuer.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# state -> (code_verifier, срок годности). Поток живёт секунды, процесс один.
+_oidc_states: dict[str, tuple[str, float]] = {}
+_OIDC_STATE_TTL = 600
+
+
+def _oidc_states_gc() -> None:
+    now = time.time()
+    for k in [k for k, (_, exp) in _oidc_states.items() if exp < now]:
+        _oidc_states.pop(k, None)
+
+
+async def oidc_discover() -> dict:
+    """Метаданные провайдера. Кешируем — конфиг меняется редко."""
+    global _OIDC_META
+    if _OIDC_META:
+        return _OIDC_META
+    url = OIDC_ISSUER.rstrip("/") + "/.well-known/openid-configuration"
+    async with httpx.AsyncClient(timeout=10, verify=OIDC_TLS_VERIFY) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        _OIDC_META = r.json()
+    return _OIDC_META
+
+
+_OIDC_META: dict = {}
+
+
+def _pkce_pair() -> tuple[str, str]:
+    verifier  = secrets.token_urlsafe(64)[:96]
+    digest    = hashlib.sha256(verifier.encode()).digest()
+    challenge = base64.urlsafe_b64encode(digest).decode().rstrip("=")
+    return verifier, challenge
+
+
+async def oidc_exchange_code(code: str, verifier: str, redirect_uri: str) -> dict:
+    meta = await oidc_discover()
+    data = {
+        "grant_type":    "authorization_code",
+        "code":          code,
+        "redirect_uri":  redirect_uri,
+        "client_id":     OIDC_CLIENT_ID,
+        "code_verifier": verifier,
+    }
+    if OIDC_CLIENT_SECRET:
+        data["client_secret"] = OIDC_CLIENT_SECRET
+    async with httpx.AsyncClient(timeout=15, verify=OIDC_TLS_VERIFY) as client:
+        r = await client.post(meta["token_endpoint"], data=data)
+        r.raise_for_status()
+        return r.json()
+
+
+async def oidc_userinfo(access_token: str) -> dict:
+    meta = await oidc_discover()
+    endpoint = meta.get("userinfo_endpoint")
+    if not endpoint:
+        raise RuntimeError("Провайдер не сообщил userinfo_endpoint")
+    async with httpx.AsyncClient(timeout=15, verify=OIDC_TLS_VERIFY) as client:
+        r = await client.get(endpoint,
+                             headers={"Authorization": f"Bearer {access_token}"})
+        r.raise_for_status()
+        return r.json()
+
+
+def oidc_redirect_uri(request: Request) -> str:
+    """Явный OIDC_REDIRECT_URL надёжнее: за прокси схема и хост подменяются."""
+    if OIDC_REDIRECT_URL:
+        return OIDC_REDIRECT_URL
+    prefix = (request.scope.get("root_path") or ROOT_PATH).rstrip("/")
+    return str(request.base_url).rstrip("/") + prefix + "/auth/oidc/callback"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ЗАЩИТА ЗАПРОСОВ
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Открытые пути: страница входа, её API, статика и health для мониторинга
+PUBLIC_PATHS = {"/login", "/api/login", "/api/logout", "/health",
+                # без этих двух OIDC уйдёт в бесконечный редирект:
+                # чтобы войти, до них надо дойти без сессии
+                "/auth/oidc/login", "/auth/oidc/callback"}
+
+
+def _is_public(path: str) -> bool:
+    return path in PUBLIC_PATHS or path.startswith("/static/")
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    if not AUTH_ENABLED:
+        return await call_next(request)
+
+    path = request.url.path
+    if _is_public(path):
+        return await call_next(request)
+
+    # Вебхук зовёт Alertmanager, который не умеет логиниться.
+    # Пускаем только с локального адреса.
+    if path == "/webhook":
+        peer = request.client.host if request.client else ""
+        if peer in ("127.0.0.1", "::1", "localhost"):
+            return await call_next(request)
+        logger.warning(f"Вебхук с внешнего адреса {peer} отклонён")
+        return JSONResponse({"detail": "Forbidden"}, status_code=403)
+
+    user = current_user(request)
+    if not user:
+        # Браузеру — редирект на форму, API-клиенту — честный 401
+        denied = sso_denied(request)
+        accept = request.headers.get("accept", "")
+        if "text/html" in accept:
+            prefix = (request.scope.get("root_path") or ROOT_PATH).rstrip("/")
+            # denied=1 — чтобы форма объяснила, что дело не в пароле
+            return RedirectResponse(f"{prefix}/login" + ("?denied=1" if denied else ""),
+                                    status_code=302)
+        return JSONResponse({"detail": ERR_NO_ACCESS if denied else "Требуется вход"},
+                            status_code=403 if denied else 401)
+
+    request.state.user = user
+    return await call_next(request)
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/api/login")
+def api_login(req: LoginRequest, response: Response):
+    if not AUTH_ENABLED:
+        return {"ok": True, "username": "anonymous", "source": "disabled"}
+
+    source, err = authenticate(req.username.strip(), req.password)
+    if not source:
+        logger.warning(f"Неудачный вход: {req.username!r} — {err}")
+        # 403 для «доступ не выдан»: учётка верна, не хватает прав
+        code = 403 if err == ERR_NO_ACCESS else 401
+        raise HTTPException(status_code=code, detail=err)
+
+    token = make_session(req.username.strip(), source)
+    response.set_cookie(
+        AUTH_COOKIE, token,
+        max_age=int(AUTH_SESSION_TTL_HOURS * 3600),
+        httponly=True,      # недоступен из JS — защита от XSS-кражи сессии
+        samesite="lax",
+        path="/",
+    )
+    logger.info(f"Вход: {req.username} (источник: {source})")
+    return {"ok": True, "username": req.username.strip(), "source": source}
+
+
+@app.post("/api/logout")
+def api_logout(response: Response):
+    response.delete_cookie(AUTH_COOKIE, path="/")
+    return {"ok": True, "sso_logout_url": SSO_LOGOUT_URL or None}
+
+
+@app.get("/api/me")
+def api_me(request: Request):
+    if not AUTH_ENABLED:
+        return {"authenticated": True, "username": "anonymous", "source": "disabled"}
+    user = current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Требуется вход")
+    return {"authenticated": True, "is_admin": is_admin(user), **user}
+
+
+# ── OIDC: вход и возврат от провайдера ───────────────────────────────────────
+
+@app.get("/auth/oidc/login")
+async def oidc_login(request: Request):
+    if not (OIDC_ENABLED and OIDC_ISSUER and OIDC_CLIENT_ID):
+        raise HTTPException(status_code=404, detail="OIDC не настроен")
+    try:
+        meta = await oidc_discover()
+    except Exception as e:
+        logger.error(f"OIDC discovery не удался: {e}")
+        raise HTTPException(status_code=502, detail="Провайдер OIDC недоступен")
+
+    _oidc_states_gc()
+    verifier, challenge = _pkce_pair()
+    state = secrets.token_urlsafe(32)
+    _oidc_states[state] = (verifier, time.time() + _OIDC_STATE_TTL)
+
+    params = {
+        "response_type":         "code",
+        "client_id":             OIDC_CLIENT_ID,
+        "redirect_uri":          oidc_redirect_uri(request),
+        "scope":                 OIDC_SCOPES,
+        "state":                 state,
+        "code_challenge":        challenge,
+        "code_challenge_method": "S256",
+    }
+    return RedirectResponse(
+        meta["authorization_endpoint"] + "?" + urllib.parse.urlencode(params),
+        status_code=302)
+
+
+@app.get("/auth/oidc/callback")
+async def oidc_callback(request: Request, code: str = "", state: str = "",
+                        error: str = ""):
+    prefix = (request.scope.get("root_path") or ROOT_PATH).rstrip("/")
+
+    def back(reason: str):
+        return RedirectResponse(f"{prefix}/login?oidc_error=" +
+                                urllib.parse.quote(reason), status_code=302)
+
+    if error:
+        return back(error)
+    if not code or not state:
+        return back("Провайдер не вернул код авторизации")
+
+    _oidc_states_gc()
+    entry = _oidc_states.pop(state, None)      # state одноразовый — защита от CSRF
+    if not entry:
+        return back("Cессия входа истекла, попробуйте ещё раз")
+    verifier, _ = entry
+
+    try:
+        tokens = await oidc_exchange_code(code, verifier, oidc_redirect_uri(request))
+        info   = await oidc_userinfo(tokens["access_token"])
+    except Exception as e:
+        logger.error(f"OIDC: обмен кода не удался: {e}")
+        return back("Не удалось получить данные пользователя")
+
+    raw_name = str(info.get(OIDC_USERNAME_CLAIM) or info.get("email") or "").strip()
+    if not raw_name:
+        logger.error(f"OIDC: в userinfo нет поля {OIDC_USERNAME_CLAIM}")
+        return back("Провайдер не сообщил имя пользователя")
+
+    username = norm_username(raw_name)
+    if not user_allowed(username):
+        logger.warning(f"OIDC-вход {username}: доступ не выдан")
+        return RedirectResponse(f"{prefix}/login?denied=1", status_code=302)
+
+    token = make_session(username, "oidc")
+    resp  = RedirectResponse(f"{prefix}/" if prefix else "/", status_code=302)
+    resp.set_cookie(AUTH_COOKIE, token,
+                    max_age=int(AUTH_SESSION_TTL_HOURS * 3600),
+                    httponly=True, samesite="lax", path="/")
+    logger.info(f"Вход: {username} (источник: oidc)")
+    return resp
+
+
+# ── Управление доступами (только для админов) ────────────────────────────────
+
+def require_admin(request: Request) -> dict:
+    if not AUTH_ENABLED:
+        return {"username": "anonymous", "source": "disabled"}
+    user = current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Требуется вход")
+    if not is_admin(user):
+        raise HTTPException(status_code=403, detail="Требуются права администратора")
+    return user
+
+
+class GrantRequest(BaseModel):
+    username: str
+    display_name: str = ""
+    email: str = ""
+    role: str = "user"
+
+
+@app.get("/api/users")
+def api_users(request: Request):
+    require_admin(request)
+    return {"items": users_list(),
+            "ldap_search": bool(LDAP_ENABLED and LDAP_SEARCH_USER)}
+
+
+@app.post("/api/users")
+def api_users_grant(req: GrantRequest, request: Request):
+    admin = require_admin(request)
+    if not user_grant(req.username, req.display_name, req.email,
+                      req.role, admin.get("username", "")):
+        raise HTTPException(status_code=400, detail="Не удалось выдать доступ")
+    return {"ok": True, "username": norm_username(req.username)}
+
+
+@app.delete("/api/users/{username}")
+def api_users_revoke(username: str, request: Request, hard: bool = False):
+    admin = require_admin(request)
+    ok = user_delete(username) if hard else user_revoke(username,
+                                                        admin.get("username", ""))
+    if not ok:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    return {"ok": True, "username": norm_username(username), "hard": hard}
+
+
+@app.get("/api/directory/search")
+def api_directory_search(request: Request, q: str = "", limit: int = 25):
+    """Поиск в AD, чтобы выдавать доступ выбором из списка, а не вводом руками."""
+    require_admin(request)
+    found   = ldap_search_users(q, min(limit, 100))
+    granted = {u["username"] for u in users_list() if u["enabled"]}
+    for f in found:
+        f["already_granted"] = f["username"] in granted
+    return {"items": found, "query": q}
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page(request: Request):
+    path = Path(WEB_DIR) / "login.html"
+    if not path.exists():
+        return HTMLResponse("<h1>login.html не найден</h1>", status_code=500)
+    prefix = (request.scope.get("root_path") or ROOT_PATH).rstrip("/")
+    html = path.read_text(encoding="utf-8")
+    html = html.replace('<base href="/">', f'<base href="{prefix}/">', 1)
+    # Подсказка на форме: если включён только SSO, пароль вводить незачем
+    html = html.replace("{{SSO_ONLY}}", "true" if (SSO_ENABLED and not
+                        (LDAP_ENABLED or AUTH_ADMIN_PASSWORD_HASH)) else "false")
+    html = html.replace("{{OIDC_ENABLED}}",
+                        "true" if (OIDC_ENABLED and OIDC_ISSUER and OIDC_CLIENT_ID)
+                        else "false")
+    html = html.replace("{{OIDC_BUTTON_TEXT}}", OIDC_BUTTON_TEXT)
+    return HTMLResponse(html)
+
+
 @app.websocket("/ws")
 async def websocket_chat(ws: WebSocket):
     """
     Протокол:
-      Клиент → {"type": "message", "text": "...", "session_id": "..."}
+      Клиент → {"type": "message", "text": "...", "session_id": "...",
+                "client_id": "...", "fingerprint": "..."}
       Сервер → {"type": "context",  "cluster": "...", "hours": N}   — что определил агент
       Сервер → {"type": "token",    "text": "..."}                  — стриминг токенов
       Сервер → {"type": "done"}                                     — конец ответа
@@ -619,8 +1498,21 @@ async def websocket_chat(ws: WebSocket):
       Клиент → {"type": "ping"} / Сервер → {"type": "pong"}
     """
     await ws.accept()
+
+    # HTTP-middleware на WebSocket не распространяется — проверяем отдельно.
+    # У WebSocket те же .cookies/.headers/.client, поэтому current_user подходит.
+    ws_user = None
+    if AUTH_ENABLED:
+        ws_user = current_user(ws)
+        if not ws_user:
+            await ws.send_json({"type": "error",
+                                "text": "Сессия истекла — обновите страницу и войдите."})
+            await ws.close(code=4401)
+            return
+
     session_id = f"ws-{id(ws)}"
-    logger.info(f"WS connected: {session_id}")
+    logger.info(f"WS connected: {session_id}"
+                + (f" user={ws_user['username']}" if ws_user else ""))
 
     try:
         while True:
@@ -643,7 +1535,18 @@ async def websocket_chat(ws: WebSocket):
             if not text:
                 continue
 
-            history = ws_sessions.setdefault(sid, [])
+            # Пользователь опознаётся по client_id из localStorage браузера.
+            # Если его нет (старый клиент) — работаем как раньше, по session_id.
+            cid = str(msg.get("client_id") or "").strip()[:128]
+            fp  = str(msg.get("fingerprint") or "").strip()[:128]
+            key = cid or sid
+
+            history = ws_sessions.get(key)
+            if history is None:
+                # первое сообщение в этом процессе — поднимаем историю из БД
+                history = [{"role": m["role"], "content": m["content"]}
+                           for m in chat_load(cid, CHAT_CONTEXT_MESSAGES)] if cid else []
+                ws_sessions[key] = history
 
             # 1. Собрать контекст (метрики) — сообщаем клиенту что нашли
             try:
@@ -681,8 +1584,10 @@ async def websocket_chat(ws: WebSocket):
             # 4. Сохранить историю (без огромного контекста метрик)
             history.append({"role": "user",      "content": text})
             history.append({"role": "assistant", "content": answer})
-            if len(history) > 16:
-                history[:] = history[-16:]
+            chat_save(cid, sid, "user",      text,   fp)
+            chat_save(cid, sid, "assistant", answer, fp)
+            if len(history) > CHAT_CONTEXT_MESSAGES:
+                history[:] = history[-CHAT_CONTEXT_MESSAGES:]
 
     except WebSocketDisconnect:
         logger.info(f"WS disconnected: {session_id}")
@@ -841,6 +1746,26 @@ async def api_all_status():
     results  = await asyncio.gather(*[collect_current(c) for c in clusters])
     return {"clusters": results}
 
+
+
+@app.get("/chat/history")
+def api_chat_history(client_id: str = "", limit: int = 50):
+    """История чата конкретного браузера (client_id из localStorage)."""
+    if not client_id:
+        raise HTTPException(status_code=400, detail="client_id обязателен")
+    items = chat_load(client_id, limit)
+    return {"client_id": client_id, "total": len(items), "items": items,
+            "retention_days": CHATS_RETENTION_DAYS, "persistent": CHATS_DB_OK}
+
+
+@app.delete("/chat/history")
+def api_chat_history_clear(client_id: str = ""):
+    """Забыть историю этого браузера."""
+    if not client_id:
+        raise HTTPException(status_code=400, detail="client_id обязателен")
+    removed = chat_clear(client_id)
+    ws_sessions.pop(client_id, None)
+    return {"client_id": client_id, "removed": removed}
 
 @app.get("/alerts/history")
 def api_alerts(limit: int = 30):

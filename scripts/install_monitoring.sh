@@ -28,16 +28,23 @@ GRAFANA_COM_URL="${GRAFANA_COM_URL:-https://grafana.com}"; GRAFANA_COM_URL="${GR
 # nginx срезает префикс (proxy_pass со слэшем на конце), поэтому route-prefix
 # оставляем корневым: сервисы продолжают отвечать в корне. external-url нужен
 # им, чтобы редиректы и ссылки в алертах указывали на внешний адрес.
+# Сервисы отдают себя ПОД своим путём (route-prefix = подпуть), поэтому nginx
+# префикс не срезает, а все внутренние адреса включают его.
+PROM_PREFIX="${PROMETHEUS_ROOT_PATH:-}"
+AM_PREFIX="${ALERTMANAGER_ROOT_PATH:-}"
+PROM_LOCAL="http://localhost:9090${PROM_PREFIX}"
+AM_LOCAL="http://localhost:9093${AM_PREFIX}"
+
 PROM_WEB_FLAGS=""
 if [[ -n "${PROMETHEUS_EXTERNAL_URL:-}" ]]; then
-    PROM_WEB_FLAGS="--web.external-url=${PROMETHEUS_EXTERNAL_URL} --web.route-prefix=/"
-    log_info "Prometheus снаружи: ${PROMETHEUS_EXTERNAL_URL}"
+    PROM_WEB_FLAGS="--web.external-url=${PROMETHEUS_EXTERNAL_URL} --web.route-prefix=${PROM_PREFIX}/"
+    log_info "Prometheus снаружи: ${PROMETHEUS_EXTERNAL_URL} (локально ${PROM_LOCAL})"
 fi
 
 AM_WEB_FLAGS=""
 if [[ -n "${ALERTMANAGER_EXTERNAL_URL:-}" ]]; then
-    AM_WEB_FLAGS="--web.external-url=${ALERTMANAGER_EXTERNAL_URL} --web.route-prefix=/"
-    log_info "Alertmanager снаружи: ${ALERTMANAGER_EXTERNAL_URL}"
+    AM_WEB_FLAGS="--web.external-url=${ALERTMANAGER_EXTERNAL_URL} --web.route-prefix=${AM_PREFIX}/"
+    log_info "Alertmanager снаружи: ${ALERTMANAGER_EXTERNAL_URL} (локально ${AM_LOCAL})"
 fi
 
 # =============================================================================
@@ -72,7 +79,7 @@ fi
 
 # Базовый конфиг (кластеры добавит manage_cluster.sh apply)
 if [[ ! -f /etc/prometheus/prometheus.yml ]]; then
-cat > /etc/prometheus/prometheus.yml << 'EOF'
+cat > /etc/prometheus/prometheus.yml << EOF
 global:
   scrape_interval:     15s
   evaluation_interval: 15s
@@ -80,13 +87,15 @@ global:
 alerting:
   alertmanagers:
     - static_configs:
-        - targets: ['localhost:9093']
+        - targets: ['localhost:9093']${AM_PREFIX:+
+      path_prefix: '${AM_PREFIX}/'}
 
 rule_files:
   - /etc/prometheus/rules/*.yml
 
 scrape_configs:
-  - job_name: 'prometheus'
+  - job_name: 'prometheus'${PROM_PREFIX:+
+    metrics_path: '${PROM_PREFIX}/metrics'}
     static_configs:
       - targets: ['localhost:9090']
 EOF
@@ -171,19 +180,24 @@ groups:
         annotations:
           summary: "SQL thread упал — {{ $labels.cluster_label }}"
 
+      # ВНИМАНИЕ: считаем отставание СВЕРХ запланированного MASTER_DELAY.
+      # mysql:replica_effective_lag_seconds генерирует manage_cluster.sh apply
+      # из поля replica_delay_seconds в clusters.json. Алертить по сырому
+      # mysql_slave_status_seconds_behind_master нельзя: у отложенной реплики
+      # он всегда равен задержке, и алерт горел бы непрерывно.
       - alert: ReplicationLagWarning
-        expr: mysql_slave_status_seconds_behind_master > 10
+        expr: mysql:replica_effective_lag_seconds > 10
         for: 2m
         labels: { severity: warning }
         annotations:
-          summary: "Лаг {{ $value | printf \"%.0f\" }}s — {{ $labels.cluster_label }}"
+          summary: "Реплика отстала на {{ $value | printf \"%.0f\" }}s сверх плана — {{ $labels.cluster_label }}"
 
       - alert: ReplicationLagCritical
-        expr: mysql_slave_status_seconds_behind_master > 60
+        expr: mysql:replica_effective_lag_seconds > 60
         for: 2m
         labels: { severity: critical }
         annotations:
-          summary: "КРИТИЧНО лаг {{ $value | printf \"%.0f\" }}s — {{ $labels.cluster_label }}"
+          summary: "КРИТИЧНО: реплика отстала на {{ $value | printf \"%.0f\" }}s сверх плана — {{ $labels.cluster_label }}"
 
       - alert: ReplicaNotReadOnly
         expr: mysql_global_variables_read_only{role="replica"} == 0
@@ -256,7 +270,7 @@ systemctl daemon-reload
 systemctl enable --now prometheus 2>/dev/null || true
 systemctl restart prometheus      # подхватить изменившийся ExecStart
 sleep 3
-curl -sf http://localhost:9090/-/healthy >/dev/null && log_info "Prometheus ✓" || log_error "Prometheus не отвечает"
+curl -sf "${PROM_LOCAL}/-/healthy" >/dev/null && log_info "Prometheus ✓" || log_error "Prometheus не отвечает"
 
 # =============================================================================
 log_section "3/4 Alertmanager v${ALERTMANAGER_VERSION}"
@@ -361,7 +375,7 @@ systemctl daemon-reload
 systemctl enable --now alertmanager 2>/dev/null || true
 systemctl restart alertmanager      # подхватить изменившийся ExecStart
 sleep 2
-curl -sf http://localhost:9093/-/healthy >/dev/null && log_info "Alertmanager ✓" || log_error "Alertmanager не отвечает"
+curl -sf "${AM_LOCAL}/-/healthy" >/dev/null && log_info "Alertmanager ✓" || log_error "Alertmanager не отвечает"
 
 # =============================================================================
 log_section "4/4 Grafana"
@@ -383,14 +397,14 @@ EOF
 fi
 
 mkdir -p /etc/grafana/provisioning/datasources
-cat > /etc/grafana/provisioning/datasources/prometheus.yml << 'EOF'
+cat > /etc/grafana/provisioning/datasources/prometheus.yml << EOF
 apiVersion: 1
 datasources:
   - name: Prometheus
     type: prometheus
     uid: prometheus          # фиксированный uid — на него ссылаются наши дашборды
     access: proxy
-    url: http://localhost:9090
+    url: ${PROM_LOCAL}
     isDefault: true
     jsonData:
       timeInterval: "15s"

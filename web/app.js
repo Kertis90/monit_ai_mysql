@@ -11,6 +11,8 @@ const App = (() => {
     wsReady:       false,
     reconnectMs:   1000,
     sessionId:     'web-' + Math.random().toString(36).slice(2, 10),
+    clientId:      null,   // стабильный id браузера (localStorage)
+    fingerprint:   '',     // грубый отпечаток — только как подсказка
     clusters:      [],
     currentTab:    'chat',
     streamingEl:   null,   // элемент .msg-body куда стримятся токены
@@ -19,6 +21,112 @@ const App = (() => {
   };
 
   const $ = (id) => document.getElementById(id);
+
+  // ═══ ИДЕНТИФИКАЦИЯ БРАУЗЕРА ════════════════════════════
+
+  // Логина в системе нет, поэтому история чата привязана к браузеру.
+  // Основной идентификатор — случайный UUID в localStorage: он стабилен между
+  // перезагрузками и уникален. Чистый отпечаток для этого не годится: на
+  // одинаковых корпоративных машинах он совпадает, и пользователи увидели бы
+  // чужую переписку. Отпечаток храним рядом только как диагностическую метку.
+  const CLIENT_KEY = 'mysql-ai-agent.client_id';
+
+  function loadClientId() {
+    let id = null;
+    try { id = localStorage.getItem(CLIENT_KEY); } catch (e) { /* приватный режим */ }
+    if (!id) {
+      id = (crypto.randomUUID ? crypto.randomUUID()
+                              : 'c-' + Math.random().toString(36).slice(2) + Date.now());
+      try { localStorage.setItem(CLIENT_KEY, id); } catch (e) { /* не сохранится */ }
+    }
+    return id;
+  }
+
+  function browserFingerprint() {
+    const parts = [
+      navigator.userAgent, navigator.language,
+      (navigator.languages || []).join(','),
+      screen.width + 'x' + screen.height + 'x' + (screen.colorDepth || ''),
+      new Date().getTimezoneOffset(),
+      navigator.hardwareConcurrency || '',
+      navigator.platform || '',
+    ].join('|');
+    // короткий стабильный хеш (FNV-1a) — не криптография, просто метка
+    let h = 0x811c9dc5;
+    for (let i = 0; i < parts.length; i++) {
+      h ^= parts.charCodeAt(i);
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h.toString(16).padStart(8, '0');
+  }
+
+  async function restoreHistory() {
+    try {
+      const r = await fetch('chat/history?limit=50&client_id=' +
+                            encodeURIComponent(state.clientId));
+      if (!r.ok) return;
+      const d = await r.json();
+      if (!d.items || !d.items.length) return;
+
+      for (const m of d.items) {
+        addMsg(m.role === 'user' ? 'user' : 'assistant',
+               m.content,
+               m.role === 'user' ? 'Вы' : 'AI Agent');
+      }
+      const div = document.createElement('div');
+      div.className = 'muted';
+      div.style.cssText = 'text-align:center;padding:8px 0;font-size:12px';
+      div.textContent = '— продолжение сохранённой переписки —';
+      $('messages').appendChild(div);
+      scrollToBottom();
+    } catch (e) {
+      console.warn('История чата недоступна:', e);
+    }
+  }
+
+  async function forgetHistory() {
+    if (!confirm('Удалить сохранённую историю чата для этого браузера?')) return;
+    try {
+      await fetch('chat/history?client_id=' + encodeURIComponent(state.clientId),
+                  { method: 'DELETE' });
+      $('messages').innerHTML = '';
+      addAssistantMsg('История очищена.');
+    } catch (e) {
+      addAssistantMsg('Не удалось очистить историю: ' + e);
+    }
+  }
+
+  // ═══ АУТЕНТИФИКАЦИЯ ════════════════════════════════════════════
+
+  async function loadUser() {
+    try {
+      const r = await fetch('api/me');
+      if (r.status === 401) { location.href = new URL('login', document.baseURI).href; return; }
+      if (!r.ok) return;
+      const d = await r.json();
+      if (d.source === 'disabled') return;   // аутентификация выключена
+
+      const badge = $('user-badge');
+      badge.textContent = d.username + (d.source === 'sso' ? ' · SSO'
+                                      : d.source === 'ldap' ? ' · LDAP' : '');
+      badge.style.display = '';
+      // При SSO выход делает прокси, своя кнопка только путала бы
+      if (d.source !== 'sso') $('logout-btn').style.display = '';
+      if (d.is_admin) $('tab-btn-access').style.display = '';
+    } catch (e) {
+      console.warn('Не удалось определить пользователя:', e);
+    }
+  }
+
+  async function logout() {
+    try {
+      const r = await fetch('api/logout', { method: 'POST' });
+      const d = await r.json().catch(() => ({}));
+      location.href = d.sso_logout_url || new URL('login', document.baseURI).href;
+    } catch (e) {
+      location.href = new URL('login', document.baseURI).href;
+    }
+  }
 
   // ═══ WEBSOCKET ══════════════════════════════════════════════════
 
@@ -158,7 +266,9 @@ const App = (() => {
     state.ws.send(JSON.stringify({
       type:       'message',
       text:       text,
-      session_id: state.sessionId,
+      session_id:  state.sessionId,
+      client_id:   state.clientId,
+      fingerprint: state.fingerprint,
     }));
   }
 
@@ -397,6 +507,114 @@ const App = (() => {
     btn.textContent = open ? '▾ Скрыть' : '▸ Анализ ИИ';
   }
 
+  // ═══ УПРАВЛЕНИЕ ДОСТУПАМИ (только для админов) ══════════════════
+
+  async function loadAccess() {
+    const box = $('access-list');
+    box.innerHTML = '<div class="muted">Загрузка…</div>';
+    try {
+      const r = await fetch('api/users');
+      if (r.status === 403) {
+        box.innerHTML = '<div class="muted">Нужны права администратора.</div>';
+        return;
+      }
+      const d = await r.json();
+
+      // Поиск по каталогу доступен только с сервисной учёткой LDAP
+      $('dir-search-box').style.display = d.ldap_search ? '' : 'none';
+
+      if (!d.items.length) {
+        box.innerHTML = '<div class="muted">Пока никому не выдан. ' +
+                        'Войти сможет только локальный администратор.</div>';
+        return;
+      }
+      box.innerHTML = d.items.map(u => `
+        <div class="alert-item" style="display:flex;align-items:center;gap:12px">
+          <div style="flex:1">
+            <div><b>${esc(u.username)}</b>${u.role === 'admin'
+                 ? ' <span class="ctx-chip">админ</span>' : ''}${!u.enabled
+                 ? ' <span class="ctx-chip">отозван</span>' : ''}</div>
+            <div class="muted" style="font-size:12px">
+              ${esc(u.display_name || '')}${u.email ? ' · ' + esc(u.email) : ''}
+              ${u.granted_by ? ' · выдал ' + esc(u.granted_by) : ''}
+              ${u.granted_at ? ' · ' + esc(String(u.granted_at).slice(0, 10)) : ''}
+            </div>
+          </div>
+          ${u.enabled
+            ? `<button class="ghost-btn" onclick="App.revokeAccess('${esc(u.username)}')">Отозвать</button>`
+            : `<button class="ghost-btn" onclick="App.grantAgain('${esc(u.username)}','${esc(u.role)}')">Вернуть</button>`}
+        </div>`).join('');
+    } catch (e) {
+      box.innerHTML = '<div class="muted">Не удалось загрузить список: ' + esc(e) + '</div>';
+    }
+  }
+
+  async function searchDirectory() {
+    const q   = $('dir-query').value.trim();
+    const box = $('dir-results');
+    if (q.length < 2) { box.innerHTML = '<div class="muted">Введите хотя бы 2 символа.</div>'; return; }
+    box.innerHTML = '<div class="muted">Ищу в каталоге…</div>';
+    try {
+      const r = await fetch('api/directory/search?q=' + encodeURIComponent(q));
+      const d = await r.json();
+      if (!d.items.length) { box.innerHTML = '<div class="muted">Никого не найдено.</div>'; return; }
+      box.innerHTML = d.items.map(u => `
+        <div class="alert-item" style="display:flex;align-items:center;gap:12px">
+          <div style="flex:1">
+            <div><b>${esc(u.username)}</b></div>
+            <div class="muted" style="font-size:12px">
+              ${esc(u.display_name || '')}${u.email ? ' · ' + esc(u.email) : ''}</div>
+          </div>
+          ${u.already_granted
+            ? '<span class="ctx-chip">уже выдан</span>'
+            : `<button class="ghost-btn" onclick="App.grantFound('${esc(u.username)}','${esc(u.display_name || '')}','${esc(u.email || '')}')">Выдать доступ</button>`}
+        </div>`).join('');
+    } catch (e) {
+      box.innerHTML = '<div class="muted">Поиск не удался: ' + esc(e) + '</div>';
+    }
+  }
+
+  async function grant(payload) {
+    const r = await fetch('api/users', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      alert('Не удалось выдать доступ: ' + (d.detail || r.status));
+      return;
+    }
+    await loadAccess();
+    await searchDirectoryIfOpen();
+  }
+
+  async function searchDirectoryIfOpen() {
+    if ($('dir-query').value.trim().length >= 2) await searchDirectory();
+  }
+
+  function grantFound(username, displayName, email) {
+    grant({ username, display_name: displayName, email, role: 'user' });
+  }
+
+  function grantAgain(username, role) {
+    grant({ username, role: role || 'user' });
+  }
+
+  function grantManual() {
+    const login = $('manual-login').value.trim();
+    if (!login) return;
+    grant({ username: login, role: $('manual-role').value });
+    $('manual-login').value = '';
+  }
+
+  async function revokeAccess(username) {
+    if (!confirm('Отозвать доступ у ' + username + '?')) return;
+    const r = await fetch('api/users/' + encodeURIComponent(username), { method: 'DELETE' });
+    if (!r.ok) { alert('Не удалось отозвать доступ'); return; }
+    await loadAccess();
+  }
+
   // ═══ УТИЛИТЫ ════════════════════════════════════════════════════
 
   function esc(s) {
@@ -409,6 +627,13 @@ const App = (() => {
   // ═══ ИНИЦИАЛИЗАЦИЯ ══════════════════════════════════════════════
 
   function init() {
+    // Опознаём браузер до всего остального: от clientId зависит история
+    state.clientId    = loadClientId();
+    state.fingerprint = browserFingerprint();
+
+    loadUser();
+
+    restoreHistory();
     connect();
     refreshClusters();
     setInterval(refreshClusters, 60000);
@@ -431,5 +656,7 @@ const App = (() => {
 
   // Публичный API для onclick в HTML
   return { showTab, pickCluster, useSuggestion, toggleAnalysis,
-           loadStatus, loadAlerts, refreshClusters };
+           loadStatus, loadAlerts, refreshClusters, forgetHistory, logout,
+           loadAccess, searchDirectory, grantFound, grantAgain,
+           grantManual, revokeAccess };
 })();

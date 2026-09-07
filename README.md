@@ -19,7 +19,8 @@
 9. [Алерты](#алерты)
 10. [Обновление настроек LLM](#обновление-настроек-llm)
 11. [HTTPS / WSS через nginx](#https--wss-через-nginx)
-12. [Диагностика проблем](#диагностика-проблем)
+12. [Аутентификация](#аутентификация)
+13. [Диагностика проблем](#диагностика-проблем)
 
 ---
 
@@ -168,6 +169,9 @@ chmod +x configure.sh manage_cluster.sh scripts/*.sh
   Описание (кратко): Основная БД торговой площадки Кемерово
   IP primary-сервера MySQL: 10.1.0.1
   IP replica-сервера (Enter — пропустить): 10.1.0.2
+  Запланированное отставание реплики (MASTER_DELAY), сек.
+  0 — реплика идёт в реальном времени, 7200 — отстаёт на 2 часа
+  Задержка реплики, сек [7200]: 7200
   Пароль пользователя exporter в MySQL: ********
   Теги через запятую (напр. siberia,production): siberia,production
 ```
@@ -420,7 +424,7 @@ asyncio.run(main())
 | MySQLHighRowLockWaits | > 10/s | warning |
 | MySQLQPSDropped | падение QPS > 50% за 10 мин | warning |
 | ReplicationIOThreadDown / SQLThreadDown | thread не работает | critical |
-| ReplicationLagWarning / Critical | > 10s / > 60s | warning / critical |
+| ReplicationLagWarning / Critical | отставание **сверх плана** > 10s / > 60s | warning / critical |
 | ReplicaNotReadOnly | реплика принимает запись | critical |
 | HighCPUUsage / HighMemoryUsage | > 85% / > 90% | warning |
 | DiskSpaceLow / Critical | < 15% / < 5% | warning / critical |
@@ -430,6 +434,94 @@ asyncio.run(main())
 **warning** → только AI-агент. При алерте агент собирает текущие метрики +
 историю за 2ч, отправляет в LLM и сохраняет диагноз — виден во вкладке
 «Алерты» веб-интерфейса и через `/alerts/history`.
+
+### Реплики с намеренной задержкой (MASTER_DELAY)
+
+Если реплика поднята как «отложенная» (`CHANGE MASTER TO MASTER_DELAY=7200`),
+её `Seconds_Behind_Master` **всегда** равен этой задержке. Алертить по нему
+нельзя — `ReplicationLagCritical` горел бы непрерывно, а AI-агент на каждое
+срабатывание тратил бы запрос к LLM на разбор несуществующей аварии.
+
+Задержка задаётся у каждого кластера в [clusters.json](clusters.json)
+(спрашивается в `./manage_cluster.sh add`):
+
+```json
+{
+  "name": "kemerovo",
+  "replica_ip": "10.1.0.2",
+  "replica_delay_seconds": 7200,
+  ...
+}
+```
+
+`./manage_cluster.sh apply` генерирует из этого поля
+`/etc/prometheus/rules/replication_delay.yml` с двумя recording rules:
+
+| Метрика | Смысл |
+|---------|-------|
+| `mysql:replica_effective_lag_seconds` | отставание **сверх** плановой задержки — по ней алерты и дашборд |
+| `mysql:replica_configured_delay_seconds` | сама плановая задержка — пунктиром на графике |
+
+Алерты и дашборд используют первую: `0` значит реплика идёт ровно по графику,
+`3600` — отстала на час сверх положенного. `replica_delay_seconds: 0` (или
+отсутствие поля в старом реестре) даёт прежнее поведение — алерты по сырому
+отставанию.
+
+В чате агент показывает обе величины раздельно (`replication_planned_delay_s`
+и `replication_lag_over_plan_s`), а в системном промпте есть правило не считать
+плановую задержку аварией.
+
+⚠️ Порядок важен: `install_monitoring.sh` кладёт алерты, которые ссылаются на
+`mysql:replica_effective_lag_seconds`, а саму метрику создаёт `apply`. До
+первого `apply` эти два алерта просто не срабатывают (пустой результат), ложных
+срабатываний не будет, но и реальный лаг не поймается — не забудьте
+`sudo ./manage_cluster.sh apply`.
+
+### Сохранение чатов по пользователям
+
+Переписка сохраняется в ту же SQLite (`/opt/ai-alert-agent/alerts.db`, таблица
+`chat_messages`) и восстанавливается при следующем открытии страницы — раньше
+история жила только в памяти процесса и терялась даже при F5.
+
+**Как опознаётся пользователь.** Логина в системе нет, поэтому история привязана
+к браузеру: при первом заходе `web/app.js` генерирует `crypto.randomUUID()` и
+кладёт его в `localStorage` под ключом `mysql-ai-agent.client_id`. Он и уходит на
+сервер с каждым сообщением.
+
+> Чистый отпечаток браузера (canvas/шрифты/UA) для идентификации **не
+> используется**: на одинаковых корпоративных машинах он совпадает, и
+> пользователи видели бы переписку друг друга. Отпечаток всё же считается
+> (короткий хеш UA, языка, экрана, таймзоны) и пишется в колонку `fingerprint` —
+> но только как диагностическая метка, не как идентичность.
+
+Следствия, о которых стоит знать:
+
+| Ситуация | Что будет с историей |
+|----------|----------------------|
+| F5, перезапуск браузера | сохраняется |
+| Другой браузер или другой профиль | отдельная история |
+| Режим инкогнито | своя история, пропадёт с окном |
+| Очистка данных сайта | история на сервере останется, но станет недоступна — выдастся новый `client_id` |
+| Один браузер на двоих | общая история (это не аутентификация) |
+
+```bash
+CHATS_RETENTION_DAYS=30       # config.env, спрашивается в ./configure.sh
+CHAT_CONTEXT_MESSAGES=16      # сколько последних сообщений уходит в LLM как контекст
+```
+
+API:
+
+```bash
+curl -s 'http://localhost:5001/chat/history?client_id=<uuid>&limit=50' | python3 -m json.tool
+curl -X DELETE 'http://localhost:5001/chat/history?client_id=<uuid>'
+```
+
+В интерфейсе есть кнопка **«Очистить историю»** в шапке — она удаляет записи
+этого браузера на сервере.
+
+⚠️ Хранилище не шифруется, и любой, кто знает чужой `client_id`, может прочитать
+его переписку через API. Для внутреннего инструмента это обычно приемлемо, но
+если чат будет доступен снаружи — закрывайте его аутентификацией на nginx.
 
 ### Хранение истории алертов
 
@@ -566,40 +658,59 @@ EXTERNAL_BASE_URL="https://monitor.company.ru"
 `install_monitoring.sh` добавит в systemd-юниты:
 
 ```
---web.external-url=https://monitor.company.ru/prometheus --web.route-prefix=/
---web.external-url=https://monitor.company.ru/alertmanager --web.route-prefix=/
+--web.external-url=https://monitor.company.ru/prometheus  --web.route-prefix=/prometheus/
+--web.external-url=https://monitor.company.ru/alertmanager --web.route-prefix=/alertmanager/
 ```
 
-`route-prefix=/` оставляет сервисы отвечающими в корне (префикс уже срезал
-nginx), а `external-url` нужен им, чтобы редиректы и **ссылки в алертах**
-(`generatorURL`, ссылки на silence) вели на внешний адрес, а не на `localhost`.
-Поэтому здесь нужен полный URL со схемой и хостом, а не только путь.
+**Сервисы отдают себя под своим путём**, а не в корне. Поэтому nginx префикс
+**не срезает** — `proxy_pass` без завершающего слэша:
 
 ```nginx
-location = /prometheus { return 301 /prometheus/; }
 location /prometheus/ {
-    proxy_pass http://127.0.0.1:9090/;      # слэш обязателен
+    proxy_pass http://127.0.0.1:9090;       # БЕЗ слэша — путь идёт как есть
     proxy_set_header Host $host;
     proxy_set_header X-Forwarded-Proto $scheme;
 }
 
-location = /alertmanager { return 301 /alertmanager/; }
 location /alertmanager/ {
-    proxy_pass http://127.0.0.1:9093/;      # слэш обязателен
+    proxy_pass http://127.0.0.1:9093;       # БЕЗ слэша
     proxy_set_header Host $host;
     proxy_set_header X-Forwarded-Proto $scheme;
 }
 ```
 
-Применить к уже установленному стеку: `sudo ./scripts/install_monitoring.sh` —
-скрипт перезапишет юниты и сделает `systemctl restart`, иначе изменившийся
-`ExecStart` не подхватится.
+> Это отличается от агента: тот отвечает в корне, и там `proxy_pass` **со**
+> слэшем. Prometheus и Alertmanager умеют работать под префиксом сами, поэтому
+> проще отдать им путь целиком.
 
-Внутренние адреса при этом не меняются и остаются на localhost: Prometheus
-ходит в Alertmanager по `localhost:9093`, Alertmanager шлёт вебхуки агенту на
-`localhost:${AGENT_PORT}/webhook`, Grafana читает Prometheus по `localhost:9090`.
-Правки в nginx на это не влияют. Если снаружи всё ходит только через nginx,
-порты 9090/9093 можно закрыть в firewalld — стек продолжит работать.
+Следствие: **все внутренние адреса тоже содержат префикс**. Скрипты выводят их
+из `PROMETHEUS_ROOT_PATH` / `ALERTMANAGER_ROOT_PATH` автоматически:
+
+| Что | Адрес при `PROMETHEUS_ROOT_PATH="/prometheus"` |
+|-----|-----------------------------------------------|
+| Собственный scrape-таргет | `metrics_path: '/prometheus/metrics'` в job `prometheus` |
+| Датасорс Grafana | `http://localhost:9090/prometheus` |
+| `PROMETHEUS_URL` агента | `http://localhost:9090/prometheus` |
+| Перезагрузка конфига | `POST http://localhost:9090/prometheus/-/reload` |
+| Alertmanager в `prometheus.yml` | `path_prefix: '/alertmanager/'` в блоке `alerting` |
+
+Пустые значения дают прежнее поведение — всё в корне, без префиксов.
+
+⚠️ `prometheus.yml` **полностью перегенерируется** командой `apply`, поэтому
+править `metrics_path` в нём руками бесполезно: значение берётся из
+`PROMETHEUS_ROOT_PATH` в `config.env`.
+
+Применить к уже установленному стеку:
+
+```bash
+sudo ./scripts/install_monitoring.sh    # юниты, датасорс, базовый конфиг
+sudo ./manage_cluster.sh apply          # prometheus.yml с metrics_path
+sudo ./scripts/install_agent.sh         # PROMETHEUS_URL агента
+```
+
+Alertmanager шлёт вебхуки агенту на `localhost:${AGENT_PORT}/webhook` — этот
+адрес от префиксов не зависит. Если снаружи всё ходит только через nginx, порты
+9090/9093 можно закрыть в firewalld.
 
 Две самые частые ошибки:
 
@@ -614,6 +725,179 @@ location /alertmanager/ {
 curl -s http://localhost:5001/ | grep '<base'
 #   <base href="/ai-agent/">
 ```
+
+---
+
+## Аутентификация
+
+Веб-интерфейс закрыт формой входа на `/login`. Настраивается в `./configure.sh`
+(секция 10). Источники проверяются по очереди: **SSO → LDAP → локальный админ**,
+любой можно выключить.
+
+### Локальный администратор
+
+Пароль хранится только хешем PBKDF2-SHA256 (200 000 итераций, случайная соль) —
+в `config.env` и `.env` агента открытого пароля нет:
+
+```bash
+AUTH_ENABLED="true"
+AUTH_ADMIN_USER="admin"
+AUTH_ADMIN_PASSWORD_HASH="pbkdf2_sha256$200000$<соль>$<хеш>"
+AUTH_SECRET="<64 hex>"          # подписывает сессионные cookie
+AUTH_SESSION_TTL_HOURS=12
+```
+
+Сессия — подписанный HMAC cookie (`HttpOnly`, `SameSite=Lax`), состояние на
+сервере не хранится. `AUTH_SECRET` генерируется один раз и сохраняется: если его
+сменить, все сессии станут недействительны.
+
+Смена пароля: `./configure.sh` → секция 10 → новый пароль → `sudo ./scripts/install_agent.sh`.
+
+### LDAP / Active Directory
+
+```bash
+LDAP_ENABLED="true"
+LDAP_URL="ldaps://dc.company.ru:636"
+LDAP_BIND_TEMPLATE="{username}@company.ru"        # для AD обычно UPN
+LDAP_BASE_DN="DC=company,DC=ru"                   # нужен только для проверки группы
+LDAP_USER_FILTER="(sAMAccountName={username})"
+LDAP_REQUIRED_GROUP="CN=DBA,OU=Groups,DC=company,DC=ru"
+LDAP_TLS_VERIFY="true"
+```
+
+Проверка — обычный bind учётными данными пользователя; пароль нигде не
+сохраняется. Если задан `LDAP_REQUIRED_GROUP`, после успешного bind проверяется
+членство через `memberOf`.
+
+Нужен пакет `ldap3` — `install_agent.sh` ставит его сам, но **только когда
+`LDAP_ENABLED=true`**. В закрытом контуре он должен быть в вашем
+`PIP_INDEX_URL`; если установка не удалась, скрипт скажет об этом явно, и вход
+по LDAP работать не будет (локальный админ продолжит работать).
+
+### SSO через обратный прокси
+
+Рассчитано на типовую корпоративную схему: nginx с Kerberos/SAML/oauth2-proxy
+аутентифицирует пользователя и передаёт имя заголовком.
+
+```bash
+SSO_ENABLED="true"
+SSO_HEADER="X-Remote-User"
+SSO_TRUSTED_PROXIES="127.0.0.1,::1"      # адреса, чьему заголовку верим
+SSO_LOGOUT_URL="https://sso.company.ru/logout"
+```
+
+```nginx
+location /ai-agent/ {
+    auth_gss on;                          # или auth_request к oauth2-proxy
+    proxy_pass http://127.0.0.1:5001/;
+    proxy_set_header X-Remote-User $remote_user;
+}
+```
+
+⚠️ **`SSO_TRUSTED_PROXIES` — не формальность.** Заголовок принимается только от
+перечисленных адресов. Без этой проверки любой, кто достучится до порта агента
+напрямую, поставил бы себе `X-Remote-User: admin`. Поэтому при включённом SSO
+порт `5001` должен быть закрыт снаружи — доступ только через nginx.
+
+### Список доступов
+
+**Учётной записи в домене недостаточно.** После успешной проверки пароля
+(LDAP), заголовка SSO или токена OIDC агент дополнительно смотрит, выдан ли
+пользователю доступ. Не выдан — вход отклоняется с понятным сообщением, а не
+«неверный пароль».
+
+Исключение одно: **локальный администратор**. Это bootstrap-учётка, которой
+список и наполняют, поэтому она в нём не нуждается.
+
+Управление — вкладка **🔑 Доступы** (видна только администраторам):
+
+- **Поиск по каталогу.** Введите фамилию, логин или почту — агент ищет в AD и
+  показывает найденных. Кнопка «Выдать доступ» добавляет выбранного, вводить
+  логин руками не нужно. Требуется сервисная учётная запись:
+  ```bash
+  LDAP_SEARCH_USER="CN=svc-monitor,OU=Service,DC=company,DC=ru"
+  LDAP_SEARCH_PASSWORD="..."
+  LDAP_BASE_DN="DC=company,DC=ru"
+  ```
+  Пользовательский bind тут не подходит: доступ выдают **до** того, как человек
+  впервые вошёл.
+- **Добавление по логину вручную** — для SSO/OIDC, когда поиска по каталогу нет.
+- **Роль** `user` или `admin`. Админ дополнительно управляет доступами.
+- **Отзыв** — мягкий: запись остаётся со статусом «отозван», чтобы был виден
+  факт выдачи и отзыва. Кнопка «Вернуть» восстанавливает.
+
+Логины приводятся к единому виду: `COMPANY\J.Smith`, `J.Smith` и `j.smith` —
+одна и та же учётная запись.
+
+**Отзыв действует немедленно.** Каждый запрос перепроверяет список, поэтому уже
+выданная сессионная cookie перестаёт работать сразу, а не после истечения
+`AUTH_SESSION_TTL_HOURS`.
+
+```bash
+curl -s http://localhost:5001/api/users                     # список (нужен админ)
+curl -s 'http://localhost:5001/api/directory/search?q=смирнов'
+curl -X POST http://localhost:5001/api/users      -H 'Content-Type: application/json'      -d '{"username":"j.smith","role":"user"}'
+curl -X DELETE http://localhost:5001/api/users/j.smith      # отозвать
+curl -X DELETE 'http://localhost:5001/api/users/j.smith?hard=true'   # удалить запись
+```
+
+> ⚠️ Пока список пуст, войти может только локальный админ — это защита от
+> ситуации, когда весь домен получает доступ по умолчанию.
+
+### OIDC (встроенный)
+
+Authorization Code Flow с PKCE. На форме входа появляется кнопка рядом с полями
+логина и пароля.
+
+```bash
+OIDC_ENABLED="true"
+OIDC_ISSUER="https://sso.company.ru/realms/main"
+OIDC_CLIENT_ID="mysql-ai-agent"
+OIDC_CLIENT_SECRET="..."                  # пусто = публичный клиент, только PKCE
+OIDC_REDIRECT_URL="https://monitor.company.ru/ai-agent/auth/oidc/callback"
+OIDC_SCOPES="openid profile email"
+OIDC_USERNAME_CLAIM="preferred_username"  # для Entra ID / Keycloak
+OIDC_BUTTON_TEXT="Войти через SSO"
+```
+
+`OIDC_REDIRECT_URL` задавайте явно и ровно так, как он зарегистрирован у
+провайдера: за nginx схему и хост автоматически не определить.
+
+Как устроено: `/auth/oidc/login` уводит к провайдеру с `state` и PKCE-challenge,
+`/auth/oidc/callback` меняет код на токены и берёт личность с **userinfo**.
+Подпись ID-токена не проверяется — вместо этого userinfo запрашивается по TLS
+напрямую у issuer с полученным access-токеном. Так не нужен разбор JWT и
+работа с JWKS, а доверие опирается на TLS-соединение с провайдером. Если ваша
+политика требует именно проверки подписи ID-токена — скажите, это отдельная
+доработка.
+
+`state` одноразовый (защита от CSRF), живёт 10 минут в памяти процесса. При
+рестарте агента незавершённые входы придётся повторить.
+
+Полученный логин проходит через список доступов на общих основаниях: нет
+выданного доступа — редирект на форму с объяснением.
+
+### Что остаётся открытым без входа
+
+| Путь | Почему |
+|------|--------|
+| `/login`, `/api/login` | сама форма входа |
+| `/health` | проверки `verify.sh` и мониторинга |
+| `/static/*` | стили и скрипты формы |
+| `/auth/oidc/login`, `/auth/oidc/callback` | иначе до входа не дойти — бесконечный редирект |
+| `/webhook` | Alertmanager не умеет логиниться — вместо этого принимается **только с localhost**, с любого другого адреса 403 |
+
+WebSocket `/ws` проверяет сессию отдельно: HTTP-middleware на него не
+распространяется. При истёкшей сессии соединение закрывается кодом 4401 и
+интерфейс просит войти заново.
+
+### Отключить аутентификацию
+
+`AUTH_ENABLED="false"` — интерфейс открыт всем, у кого есть сетевой доступ.
+Допустимо только в изолированном сегменте.
+
+Помимо встроенного OIDC остаётся вариант с oauth2-proxy перед nginx и
+режимом SSO по заголовку — он не требует настройки провайдера в самом агенте.
 
 ---
 

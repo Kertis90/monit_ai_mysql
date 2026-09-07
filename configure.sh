@@ -157,6 +157,134 @@ ask "Порт AI-агента" AGENT_PORT "5001"
 ask "Prometheus retention" PROMETHEUS_RETENTION "30d"
 echo -e "  ${YELLOW}История алертов хранится в SQLite рядом с агентом${NC}"
 ask "Хранить алерты, дней" ALERTS_RETENTION_DAYS "30"
+ask "Хранить историю чатов, дней" CHATS_RETENTION_DAYS "30"
+
+echo ""
+echo -e "${CYAN}── 10. Аутентификация ────────────────────────────────${NC}"
+echo -e "  ${YELLOW}Веб-интерфейс закрывается формой входа.${NC}"
+ask "Включить аутентификацию (true/false)" AUTH_ENABLED "true"
+
+if [[ "${AUTH_ENABLED}" == "true" ]]; then
+    # ── Локальный админ ──────────────────────────────────────────────────────
+    ask "Логин локального администратора" AUTH_ADMIN_USER "admin"
+    echo -e "  ${YELLOW}Пароль хранится только в виде PBKDF2-хеша${NC}"
+    if [[ -n "${AUTH_ADMIN_PASSWORD_HASH:-}" ]]; then
+        echo -e "  ${YELLOW}Хеш уже задан — Enter, чтобы оставить прежний пароль${NC}"
+    fi
+    read -rsp "  Пароль администратора: " ADMIN_PW1; echo ""
+    if [[ -n "$ADMIN_PW1" ]]; then
+        read -rsp "  Повторите пароль: " ADMIN_PW2; echo ""
+        if [[ "$ADMIN_PW1" != "$ADMIN_PW2" ]]; then
+            echo -e "  ${YELLOW}! Пароли не совпадают — прежний хеш оставлен${NC}"
+        elif [[ ${#ADMIN_PW1} -lt 8 ]]; then
+            echo -e "  ${YELLOW}! Пароль короче 8 символов — прежний хеш оставлен${NC}"
+        else
+            AUTH_ADMIN_PASSWORD_HASH=$(ADMIN_PW="$ADMIN_PW1" python3 -c '
+import hashlib, os, secrets
+pw   = os.environ["ADMIN_PW"]
+salt = secrets.token_hex(16)
+it   = 200000
+dk   = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), it)
+print(f"pbkdf2_sha256${it}${salt}${dk.hex()}")
+')
+            echo -e "  ${GREEN}✓ Хеш пароля обновлён${NC}"
+        fi
+    fi
+    unset ADMIN_PW1 ADMIN_PW2
+
+    # Секрет подписи сессий: генерируем один раз и сохраняем, иначе после
+    # каждого рестарта агента все пользователи вылетают из сессии
+    if [[ -z "${AUTH_SECRET:-}" ]]; then
+        AUTH_SECRET=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+        echo -e "  ${GREEN}✓ Сгенерирован секрет подписи сессий${NC}"
+    fi
+    ask "Время жизни сессии, часов" AUTH_SESSION_TTL_HOURS "12"
+
+    # ── LDAP / Active Directory ──────────────────────────────────────────────
+    echo ""
+    echo -e "  ${CYAN}LDAP / Active Directory${NC}"
+    echo -e "  ${YELLOW}Enter в первом вопросе — не использовать${NC}"
+    ask "Включить LDAP (true/false)" LDAP_ENABLED "false"
+    if [[ "${LDAP_ENABLED}" == "true" ]]; then
+        ask "URL контроллера домена" LDAP_URL "ldaps://dc.company.ru:636"
+        echo -e "  ${YELLOW}Шаблон bind: {username} подставляется. Для AD обычно UPN${NC}"
+        ask "Шаблон bind-DN" LDAP_BIND_TEMPLATE '{username}@company.ru'
+        echo -e "  ${YELLOW}Ниже — только если нужно ограничить доступ группой${NC}"
+        ask "Base DN (Enter — без проверки группы)" LDAP_BASE_DN ""
+        if [[ -n "${LDAP_BASE_DN}" ]]; then
+            ask "Фильтр поиска пользователя" LDAP_USER_FILTER '(sAMAccountName={username})'
+            ask "DN требуемой группы" LDAP_REQUIRED_GROUP ""
+        fi
+        ask "Проверять TLS-сертификат (true/false)" LDAP_TLS_VERIFY "true"
+        echo -e "  ${YELLOW}Сервисная учётка нужна, чтобы выдавать доступ выбором${NC}"
+        echo -e "  ${YELLOW}из каталога, а не вводом логина руками${NC}"
+        ask "Сервисная учётка для поиска (Enter — без поиска)" LDAP_SEARCH_USER ""
+        if [[ -n "${LDAP_SEARCH_USER}" ]]; then
+            ask "Пароль сервисной учётки" LDAP_SEARCH_PASSWORD "" secret
+            [[ -z "${LDAP_BASE_DN}" ]] && ask "Base DN (нужен для поиска)" LDAP_BASE_DN ""
+        else
+            LDAP_SEARCH_PASSWORD=""
+        fi
+        echo -e "  ${YELLOW}Нужен пакет ldap3 — install_agent.sh поставит его сам${NC}"
+    else
+        LDAP_URL=""; LDAP_BIND_TEMPLATE=""; LDAP_BASE_DN=""
+        LDAP_USER_FILTER=""; LDAP_REQUIRED_GROUP=""; LDAP_TLS_VERIFY="true"
+        LDAP_SEARCH_USER=""; LDAP_SEARCH_PASSWORD=""
+    fi
+
+    # ── OIDC (встроенный) ────────────────────────────────────────────────────
+    echo ""
+    echo -e "  ${CYAN}OIDC / OAuth2${NC}"
+    echo -e "  ${YELLOW}Keycloak, Entra ID, Authentik и т.п.${NC}"
+    ask "Включить OIDC (true/false)" OIDC_ENABLED "false"
+    if [[ "${OIDC_ENABLED}" == "true" ]]; then
+        ask "Issuer URL" OIDC_ISSUER "https://sso.company.ru/realms/main"
+        ask "Client ID" OIDC_CLIENT_ID "mysql-ai-agent"
+        ask "Client secret (Enter — публичный клиент с PKCE)" OIDC_CLIENT_SECRET "" secret
+        echo -e "  ${YELLOW}Должен совпадать с зарегистрированным у провайдера${NC}"
+        DEFAULT_REDIRECT="${EXTERNAL_BASE_URL:-http://${MONITORING_IP}:${AGENT_PORT}}${ROOT_PATH}/auth/oidc/callback"
+        ask "Redirect URI" OIDC_REDIRECT_URL "$DEFAULT_REDIRECT"
+        ask "Scopes" OIDC_SCOPES "openid profile email"
+        echo -e "  ${YELLOW}Поле userinfo с логином. Entra/AD — preferred_username${NC}"
+        ask "Claim с именем пользователя" OIDC_USERNAME_CLAIM "preferred_username"
+        ask "Надпись на кнопке входа" OIDC_BUTTON_TEXT "Войти через SSO"
+        ask "Проверять TLS провайдера (true/false)" OIDC_TLS_VERIFY "true"
+    else
+        OIDC_ISSUER=""; OIDC_CLIENT_ID=""; OIDC_CLIENT_SECRET=""
+        OIDC_REDIRECT_URL=""; OIDC_SCOPES="openid profile email"
+        OIDC_USERNAME_CLAIM="preferred_username"
+        OIDC_BUTTON_TEXT="Войти через SSO"; OIDC_TLS_VERIFY="true"
+    fi
+
+    # ── SSO через доверенный прокси ──────────────────────────────────────────
+    echo ""
+    echo -e "  ${CYAN}SSO через обратный прокси${NC}"
+    echo -e "  ${YELLOW}nginx (Kerberos/SAML/oauth2-proxy) аутентифицирует${NC}"
+    echo -e "  ${YELLOW}пользователя и передаёт имя заголовком${NC}"
+    ask "Включить SSO (true/false)" SSO_ENABLED "false"
+    if [[ "${SSO_ENABLED}" == "true" ]]; then
+        ask "Заголовок с именем пользователя" SSO_HEADER "X-Remote-User"
+        echo -e "  ${YELLOW}ВАЖНО: заголовку верим только с этих адресов,${NC}"
+        echo -e "  ${YELLOW}иначе кто угодно подставит себе чужое имя${NC}"
+        ask "Доверенные адреса прокси (через запятую)" SSO_TRUSTED_PROXIES "127.0.0.1,::1"
+        ask "URL выхода из SSO (Enter — нет)" SSO_LOGOUT_URL ""
+    else
+        SSO_HEADER="X-Remote-User"; SSO_TRUSTED_PROXIES="127.0.0.1,::1"; SSO_LOGOUT_URL=""
+    fi
+else
+    AUTH_ADMIN_USER="admin"; AUTH_ADMIN_PASSWORD_HASH=""; AUTH_SECRET=""
+    AUTH_SESSION_TTL_HOURS="12"
+    LDAP_ENABLED="false"; LDAP_URL=""; LDAP_BIND_TEMPLATE=""; LDAP_BASE_DN=""
+    LDAP_USER_FILTER=""; LDAP_REQUIRED_GROUP=""; LDAP_TLS_VERIFY="true"
+    SSO_ENABLED="false"; SSO_HEADER="X-Remote-User"
+    SSO_TRUSTED_PROXIES="127.0.0.1,::1"; SSO_LOGOUT_URL=""
+    LDAP_SEARCH_USER=""; LDAP_SEARCH_PASSWORD=""
+    OIDC_ENABLED="false"; OIDC_ISSUER=""; OIDC_CLIENT_ID=""; OIDC_CLIENT_SECRET=""
+    OIDC_REDIRECT_URL=""; OIDC_SCOPES="openid profile email"
+    OIDC_USERNAME_CLAIM="preferred_username"
+    OIDC_BUTTON_TEXT="Войти через SSO"; OIDC_TLS_VERIFY="true"
+    echo -e "  ${YELLOW}! Интерфейс будет открыт всем, у кого есть сетевой доступ${NC}"
+fi
 
 # Версии — фиксированные, но настраиваемые
 PROMETHEUS_VERSION="${PROMETHEUS_VERSION:-2.52.0}"
@@ -214,6 +342,44 @@ PIP_CERT="${PIP_CERT}"
 GITHUB_BASE_URL="${GITHUB_BASE_URL}"
 GRAFANA_COM_URL="${GRAFANA_COM_URL}"
 
+# ── Аутентификация ───────────────────────────────────────────────────────────
+# Пароль администратора хранится ТОЛЬКО хешем (PBKDF2-SHA256, 200k итераций).
+# AUTH_SECRET подписывает сессионные cookie — при его смене все сессии слетают.
+AUTH_ENABLED="${AUTH_ENABLED}"
+AUTH_ADMIN_USER="${AUTH_ADMIN_USER}"
+AUTH_ADMIN_PASSWORD_HASH="${AUTH_ADMIN_PASSWORD_HASH}"
+AUTH_SECRET="${AUTH_SECRET}"
+AUTH_SESSION_TTL_HOURS=${AUTH_SESSION_TTL_HOURS}
+
+# LDAP / Active Directory
+LDAP_ENABLED="${LDAP_ENABLED}"
+LDAP_URL="${LDAP_URL}"
+LDAP_BIND_TEMPLATE="${LDAP_BIND_TEMPLATE}"
+LDAP_BASE_DN="${LDAP_BASE_DN}"
+LDAP_USER_FILTER="${LDAP_USER_FILTER}"
+LDAP_REQUIRED_GROUP="${LDAP_REQUIRED_GROUP}"
+LDAP_TLS_VERIFY="${LDAP_TLS_VERIFY}"
+# Сервисная учётка — только для поиска по каталогу при выдаче доступов
+LDAP_SEARCH_USER="${LDAP_SEARCH_USER}"
+LDAP_SEARCH_PASSWORD="${LDAP_SEARCH_PASSWORD}"
+
+# OIDC (встроенный, Authorization Code + PKCE)
+OIDC_ENABLED="${OIDC_ENABLED}"
+OIDC_ISSUER="${OIDC_ISSUER}"
+OIDC_CLIENT_ID="${OIDC_CLIENT_ID}"
+OIDC_CLIENT_SECRET="${OIDC_CLIENT_SECRET}"
+OIDC_REDIRECT_URL="${OIDC_REDIRECT_URL}"
+OIDC_SCOPES="${OIDC_SCOPES}"
+OIDC_USERNAME_CLAIM="${OIDC_USERNAME_CLAIM}"
+OIDC_BUTTON_TEXT="${OIDC_BUTTON_TEXT}"
+OIDC_TLS_VERIFY="${OIDC_TLS_VERIFY}"
+
+# SSO через доверенный обратный прокси
+SSO_ENABLED="${SSO_ENABLED}"
+SSO_HEADER="${SSO_HEADER}"
+SSO_TRUSTED_PROXIES="${SSO_TRUSTED_PROXIES}"
+SSO_LOGOUT_URL="${SSO_LOGOUT_URL}"
+
 # Порты
 AGENT_PORT=${AGENT_PORT}
 
@@ -237,6 +403,9 @@ PROMETHEUS_RETENTION="${PROMETHEUS_RETENTION}"
 
 # История алертов агента (SQLite). Записи старше окна удаляются автоматически.
 ALERTS_RETENTION_DAYS=${ALERTS_RETENTION_DAYS}
+
+# История чатов (та же БД). Пользователь опознаётся по client_id браузера.
+CHATS_RETENTION_DAYS=${CHATS_RETENTION_DAYS}
 
 # Версии экспортёров
 NODE_EXPORTER_VERSION="${NODE_EXPORTER_VERSION}"

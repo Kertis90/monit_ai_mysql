@@ -36,6 +36,7 @@ cp "${SCRIPT_DIR}/../clusters.json"       "${AGENT_DIR}/clusters.json"
 cp "${SCRIPT_DIR}/../web/index.html"      "${AGENT_DIR}/web/"
 cp "${SCRIPT_DIR}/../web/style.css"       "${AGENT_DIR}/web/"
 cp "${SCRIPT_DIR}/../web/app.js"          "${AGENT_DIR}/web/"
+cp "${SCRIPT_DIR}/../web/login.html"      "${AGENT_DIR}/web/"
 
 log_info "Файлы скопированы в ${AGENT_DIR}"
 
@@ -81,6 +82,16 @@ fi
     "httpx==0.27.0" \
     "pydantic==2.7.1" \
     "websockets==12.0"
+
+if [[ "${LDAP_ENABLED:-false}" == "true" ]]; then
+    if "${AGENT_DIR}/venv/bin/pip" install -q "${PIP_ARGS[@]}" "ldap3==2.9.1"; then
+        log_info "ldap3 установлен (LDAP-аутентификация)"
+    else
+        log_error "Не удалось поставить ldap3 — вход по LDAP работать не будет"
+        log_warn  "Проверьте доступность пакета в вашем pip-репозитории"
+    fi
+fi
+
 log_info "Зависимости установлены"
 
 # =============================================================================
@@ -92,15 +103,49 @@ LLM_API_KEY=${LLM_API_KEY}
 LLM_MODEL=${LLM_MODEL}
 LLM_MAX_TOKENS=${LLM_MAX_TOKENS}
 LLM_TEMPERATURE=${LLM_TEMPERATURE}
-PROMETHEUS_URL=http://localhost:9090
+PROMETHEUS_URL=http://localhost:9090${PROMETHEUS_ROOT_PATH:-}
 AGENT_PORT=${AGENT_PORT}
 ROOT_PATH=${ROOT_PATH:-}
 REGISTRY_PATH=${AGENT_DIR}/clusters.json
 WEB_DIR=${AGENT_DIR}/web
 ALERTS_DB_PATH=${AGENT_DIR}/alerts.db
 ALERTS_RETENTION_DAYS=${ALERTS_RETENTION_DAYS:-30}
+CHATS_RETENTION_DAYS=${CHATS_RETENTION_DAYS:-30}
+AUTH_ENABLED=${AUTH_ENABLED:-true}
+AUTH_ADMIN_USER=${AUTH_ADMIN_USER:-admin}
+AUTH_ADMIN_PASSWORD_HASH=${AUTH_ADMIN_PASSWORD_HASH:-}
+AUTH_SECRET=${AUTH_SECRET:-}
+AUTH_SESSION_TTL_HOURS=${AUTH_SESSION_TTL_HOURS:-12}
+LDAP_ENABLED=${LDAP_ENABLED:-false}
+LDAP_URL=${LDAP_URL:-}
+LDAP_BIND_TEMPLATE=${LDAP_BIND_TEMPLATE:-}
+LDAP_BASE_DN=${LDAP_BASE_DN:-}
+LDAP_USER_FILTER=${LDAP_USER_FILTER:-}
+LDAP_REQUIRED_GROUP=${LDAP_REQUIRED_GROUP:-}
+LDAP_TLS_VERIFY=${LDAP_TLS_VERIFY:-true}
+LDAP_SEARCH_USER=${LDAP_SEARCH_USER:-}
+LDAP_SEARCH_PASSWORD=${LDAP_SEARCH_PASSWORD:-}
+OIDC_ENABLED=${OIDC_ENABLED:-false}
+OIDC_ISSUER=${OIDC_ISSUER:-}
+OIDC_CLIENT_ID=${OIDC_CLIENT_ID:-}
+OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET:-}
+OIDC_REDIRECT_URL=${OIDC_REDIRECT_URL:-}
+OIDC_SCOPES=${OIDC_SCOPES:-openid profile email}
+OIDC_USERNAME_CLAIM=${OIDC_USERNAME_CLAIM:-preferred_username}
+OIDC_BUTTON_TEXT=${OIDC_BUTTON_TEXT:-Войти через SSO}
+OIDC_TLS_VERIFY=${OIDC_TLS_VERIFY:-true}
+SSO_ENABLED=${SSO_ENABLED:-false}
+SSO_HEADER=${SSO_HEADER:-X-Remote-User}
+SSO_TRUSTED_PROXIES=${SSO_TRUSTED_PROXIES:-127.0.0.1,::1}
+SSO_LOGOUT_URL=${SSO_LOGOUT_URL:-}
 EOF
 chmod 600 "${AGENT_DIR}/.env"
+
+if [[ "${AUTH_ENABLED:-true}" == "true" ]] && [[ -z "${AUTH_ADMIN_PASSWORD_HASH:-}" ]] && [[ "${LDAP_ENABLED:-false}" != "true" ]] && [[ "${SSO_ENABLED:-false}" != "true" ]] && [[ "${OIDC_ENABLED:-false}" != "true" ]]; then
+    log_error "Аутентификация включена, но не задан ни пароль админа, ни LDAP, ни SSO."
+    log_error "Войти в интерфейс будет невозможно. Запустите ./configure.sh"
+    exit 1
+fi
 
 touch /var/log/ai-alert-agent.log
 chmod 666 /var/log/ai-alert-agent.log

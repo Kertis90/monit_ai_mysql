@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Вход — MySQL AI Agent</title>
+<!-- href подставляет agent.py из ROOT_PATH, как и на главной странице -->
+<base href="/">
+<link rel="stylesheet" href="static/style.css">
+<style>
+  .login-wrap { min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px; }
+  .login-card { width:100%; max-width:360px; background:var(--panel,#1b1f27);
+                border:1px solid var(--border,#2b313c); border-radius:12px; padding:28px; }
+  .login-card h1 { margin:0 0 4px; font-size:20px; }
+  .login-sub { color:var(--muted,#8b95a5); font-size:13px; margin-bottom:22px; }
+  .login-card label { display:block; font-size:13px; margin:14px 0 6px; color:var(--muted,#8b95a5); }
+  .login-card input { width:100%; box-sizing:border-box; padding:10px 12px; border-radius:8px;
+                      border:1px solid var(--border,#2b313c); background:var(--bg,#12151b);
+                      color:inherit; font:inherit; }
+  .login-card input:focus { outline:none; border-color:var(--accent,#4c8dff); }
+  .login-btn { width:100%; margin-top:20px; padding:11px; border:0; border-radius:8px;
+               background:var(--accent,#4c8dff); color:#fff; font:inherit; font-weight:600; cursor:pointer; }
+  .login-btn:disabled { opacity:.6; cursor:default; }
+  .login-err { margin-top:14px; padding:10px 12px; border-radius:8px; font-size:13px;
+               background:rgba(230,80,80,.12); border:1px solid rgba(230,80,80,.35);
+               color:#ff9d9d; display:none; }
+  .login-err.show { display:block; }
+  .login-or { margin:16px 0 0; text-align:center; font-size:12px;
+              color:var(--muted,#8b95a5); }
+  .login-sso { display:block; margin-top:10px; background:transparent;
+               border:1px solid var(--accent,#4c8dff); color:var(--accent,#4c8dff); }
+  .login-foot { margin-top:18px; font-size:12px; color:var(--muted,#8b95a5); text-align:center; }
+</style>
+</head>
+<body>
+
+<div class="login-wrap">
+  <form class="login-card" id="login-form" autocomplete="on">
+    <h1>MySQL AI Agent</h1>
+    <div class="login-sub">Центр мониторинга кластеров</div>
+
+    <label for="username">Пользователь</label>
+    <input id="username" name="username" type="text" autocomplete="username"
+           required autofocus placeholder="admin или доменная учётка">
+
+    <label for="password">Пароль</label>
+    <input id="password" name="password" type="password"
+           autocomplete="current-password" required>
+
+    <button class="login-btn" id="login-btn" type="submit">Войти</button>
+
+    <div class="login-or" id="login-or" style="display:none">или</div>
+    <a class="login-btn login-sso" id="oidc-btn" href="auth/oidc/login"
+       style="display:none;text-decoration:none;text-align:center"></a>
+
+    <div class="login-err" id="login-err"></div>
+
+    <div class="login-foot" id="login-foot"></div>
+  </form>
+</div>
+
+<script>
+(() => {
+  const SSO_ONLY     = {{SSO_ONLY}};
+  const OIDC_ENABLED = {{OIDC_ENABLED}};
+  const OIDC_TEXT    = "{{OIDC_BUTTON_TEXT}}";
+  const params       = new URLSearchParams(location.search);
+  const form = document.getElementById('login-form');
+  const err  = document.getElementById('login-err');
+  const btn  = document.getElementById('login-btn');
+  const foot = document.getElementById('login-foot');
+
+  function showError(text) {
+    err.textContent = text;
+    err.classList.add('show');
+  }
+
+  if (SSO_ONLY) {
+    foot.textContent = 'Вход выполняется через корпоративный SSO. ' +
+                       'Если вы видите эту форму — SSO не сработал, обратитесь к администратору.';
+  }
+
+  if (OIDC_ENABLED) {
+    const b = document.getElementById('oidc-btn');
+    b.textContent = OIDC_TEXT;
+    b.style.display = '';
+    document.getElementById('login-or').style.display = '';
+  }
+
+  // Учётка проверена, но доступ не выдан — это не про пароль
+  if (params.get('denied')) {
+    showError('Ваша учётная запись найдена, но доступ к системе не выдан. ' +
+              'Обратитесь к администратору, чтобы вас добавили в список доступов.');
+  } else if (params.get('oidc_error')) {
+    showError('Вход через SSO не удался: ' + params.get('oidc_error'));
+  }
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    err.classList.remove('show');
+    btn.disabled = true;
+    btn.textContent = 'Проверяю…';
+
+    try {
+      const r = await fetch('api/login', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({
+          username: document.getElementById('username').value,
+          password: document.getElementById('password').value,
+        }),
+      });
+
+      if (r.ok) {
+        // base href уже учитывает префикс nginx, поэтому переходим относительно него
+        location.href = new URL('.', document.baseURI).href;
+        return;
+      }
+
+      let detail = 'Неверный логин или пароль';
+      try { detail = (await r.json()).detail || detail; } catch (e) {}
+      showError(detail);
+    } catch (e) {
+      showError('Сервер недоступен: ' + e);
+    }
+
+    btn.disabled = false;
+    btn.textContent = 'Войти';
+    document.getElementById('password').value = '';
+    document.getElementById('password').focus();
+  });
+})();
+</script>
+
+</body>
+</html>
