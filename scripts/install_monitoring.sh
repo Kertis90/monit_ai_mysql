@@ -70,9 +70,6 @@ GRAFANA_COM_URL="${GRAFANA_COM_URL:-https://grafana.com}"; GRAFANA_COM_URL="${GR
 [[ "$GRAFANA_COM_URL" != "https://grafana.com" ]] && log_info "Зеркало grafana.com: ${GRAFANA_COM_URL}"
 
 # ── Работа за обратным прокси ────────────────────────────────────────────────
-# nginx срезает префикс (proxy_pass со слэшем на конце), поэтому route-prefix
-# оставляем корневым: сервисы продолжают отвечать в корне. external-url нужен
-# им, чтобы редиректы и ссылки в алертах указывали на внешний адрес.
 # Сервисы отдают себя ПОД своим путём (route-prefix = подпуть), поэтому nginx
 # префикс не срезает, а все внутренние адреса включают его.
 PROM_PREFIX="${PROMETHEUS_ROOT_PATH:-}"
@@ -90,6 +87,10 @@ if [[ -n "$AM_PREFIX" ]]; then
 else
     AM_LOCAL="http://localhost:9093"
 fi
+
+# Цели скрейпа: с подпутём идём через nginx (без порта), иначе прямо в порт
+[[ -n "$PROM_PREFIX" ]] && PROM_TARGET="localhost" || PROM_TARGET="localhost:9090"
+[[ -n "$AM_PREFIX"   ]] && AM_TARGET="localhost"   || AM_TARGET="localhost:9093"
 
 # Подпути достаточно самого по себе — как у агента. Внешний адрес нужен
 # только чтобы ссылки в алертах вели наружу, а не на localhost; без него
@@ -154,7 +155,7 @@ global:
 alerting:
   alertmanagers:
     - static_configs:
-        - targets: ['localhost:9093']${AM_PREFIX:+
+        - targets: ['${AM_TARGET}']${AM_PREFIX:+
       path_prefix: '${AM_PREFIX}/'}
 
 rule_files:
@@ -164,7 +165,7 @@ scrape_configs:
   - job_name: 'prometheus'${PROM_PREFIX:+
     metrics_path: '${PROM_PREFIX}/metrics'}
     static_configs:
-      - targets: ['localhost:9090']
+      - targets: ['${PROM_TARGET}']
 EOF
 fi
 
@@ -475,6 +476,16 @@ fi
 mkdir -p /etc/grafana/provisioning/datasources
 cat > /etc/grafana/provisioning/datasources/prometheus.yml << EOF
 apiVersion: 1
+
+# Сначала удаляем запись по ИМЕНИ, потом создаём с фиксированным uid.
+# Без этого Grafana НЕ СТАРТУЕТ: если в grafana.db уже есть "Prometheus"
+# со случайным uid (её создал провижининг прошлых версий, без uid), то
+# сопоставление по uid не находит запись и модуль провижининга падает с
+# "Datasource provisioning error: data source not found".
+deleteDatasources:
+  - name: Prometheus
+    orgId: 1
+
 datasources:
   - name: Prometheus
     type: prometheus
