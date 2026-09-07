@@ -230,7 +230,12 @@ print(f"pbkdf2_sha256${it}${salt}${dk.hex()}")
         ask "Base DN (Enter — без проверки группы)" LDAP_BASE_DN ""
         if [[ -n "${LDAP_BASE_DN}" ]]; then
             ask "Фильтр поиска пользователя" LDAP_USER_FILTER '(sAMAccountName={username})'
-            ask "DN требуемой группы" LDAP_REQUIRED_GROUP ""
+            echo -e "  ${YELLOW}Группы, членам которых разрешён вход.${NC}"
+            echo -e "  ${YELLOW}Несколько — через точку с запятой (в DN есть запятые).${NC}"
+            echo -e "  ${YELLOW}Enter — вход только по явно выданным доступам.${NC}"
+            ask "Группы доступа (DN через ;)" LDAP_ALLOWED_GROUPS ""
+            echo -e "  ${YELLOW}Учитывать вложенные группы AD (обычно да)${NC}"
+            ask "Вложенные группы (true/false)" LDAP_NESTED_GROUPS "true"
         fi
         ask "Проверять TLS-сертификат (true/false)" LDAP_TLS_VERIFY "true"
         echo -e "  ${YELLOW}Сервисная учётка нужна, чтобы выдавать доступ выбором${NC}"
@@ -245,7 +250,8 @@ print(f"pbkdf2_sha256${it}${salt}${dk.hex()}")
         echo -e "  ${YELLOW}Нужен пакет ldap3 — install_agent.sh поставит его сам${NC}"
     else
         LDAP_URL=""; LDAP_BIND_TEMPLATE=""; LDAP_BASE_DN=""
-        LDAP_USER_FILTER=""; LDAP_REQUIRED_GROUP=""; LDAP_TLS_VERIFY="true"
+        LDAP_USER_FILTER=""; LDAP_ALLOWED_GROUPS=""; LDAP_NESTED_GROUPS="true"
+        LDAP_TLS_VERIFY="true"
         LDAP_SEARCH_USER=""; LDAP_SEARCH_PASSWORD=""
     fi
 
@@ -374,7 +380,10 @@ LDAP_URL="${LDAP_URL}"
 LDAP_BIND_TEMPLATE="${LDAP_BIND_TEMPLATE}"
 LDAP_BASE_DN="${LDAP_BASE_DN}"
 LDAP_USER_FILTER="${LDAP_USER_FILTER}"
-LDAP_REQUIRED_GROUP="${LDAP_REQUIRED_GROUP}"
+# Группы, членам которых разрешён вход. Несколько — через «;».
+# Пусто = вход только по явно выданным доступам.
+LDAP_ALLOWED_GROUPS="${LDAP_ALLOWED_GROUPS}"
+LDAP_NESTED_GROUPS="${LDAP_NESTED_GROUPS}"
 LDAP_TLS_VERIFY="${LDAP_TLS_VERIFY}"
 # Сервисная учётка — только для поиска по каталогу при выдаче доступов
 LDAP_SEARCH_USER="${LDAP_SEARCH_USER}"

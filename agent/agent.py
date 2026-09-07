@@ -89,7 +89,17 @@ LDAP_URL              = os.environ.get("LDAP_URL", "")
 LDAP_BIND_TEMPLATE    = os.environ.get("LDAP_BIND_TEMPLATE", "{username}")
 LDAP_BASE_DN          = os.environ.get("LDAP_BASE_DN", "")
 LDAP_USER_FILTER      = os.environ.get("LDAP_USER_FILTER", "(sAMAccountName={username})")
-LDAP_REQUIRED_GROUP   = os.environ.get("LDAP_REQUIRED_GROUP", "")
+# Группы, членам которых разрешён вход. Несколько — через «;»: в DN есть
+# запятые, поэтому разделитель другой.
+LDAP_ALLOWED_GROUPS   = [g.strip() for g in
+                         os.environ.get("LDAP_ALLOWED_GROUPS", "").split(";")
+                         if g.strip()]
+# Старое имя на одну группу — поддерживаем, чтобы не ломать существующие конфиги
+LDAP_REQUIRED_GROUP   = os.environ.get("LDAP_REQUIRED_GROUP", "").strip()
+if LDAP_REQUIRED_GROUP and LDAP_REQUIRED_GROUP not in LDAP_ALLOWED_GROUPS:
+    LDAP_ALLOWED_GROUPS.append(LDAP_REQUIRED_GROUP)
+# Вложенные группы AD: пользователь в группе, которая входит в разрешённую
+LDAP_NESTED_GROUPS    = os.environ.get("LDAP_NESTED_GROUPS", "true").lower() == "true"
 LDAP_TLS_VERIFY       = os.environ.get("LDAP_TLS_VERIFY", "true").lower() == "true"
 LDAP_TIMEOUT          = float(os.environ.get("LDAP_TIMEOUT", "8"))
 # Сервисная учётка для поиска по каталогу (выбор пользователей из списка).
@@ -216,45 +226,111 @@ def sso_username(request: Request) -> Optional[str]:
 
 # ── Источник 2: LDAP / Active Directory ──────────────────────────────────────
 
+def ldap_conn(user: str, password: str):
+    """Соединение с каталогом. Отдельная функция: bind нужен и для проверки
+    пароля пользователя, и для поиска групп сервисной учёткой."""
+    from ldap3 import Server, Connection, Tls, ALL
+    import ssl as _ssl
+    tls = Tls(validate=_ssl.CERT_REQUIRED if LDAP_TLS_VERIFY else _ssl.CERT_NONE)
+    server = Server(LDAP_URL, get_info=ALL, tls=tls, connect_timeout=LDAP_TIMEOUT)
+    return Connection(server, user=user, password=password, auto_bind=True,
+                      receive_timeout=LDAP_TIMEOUT)
+
+
+def ldap_matched_groups(username: str, conn=None) -> list:
+    """Какие из разрешённых групп содержат пользователя.
+
+    Пустой список означает «ни в одной». Если список разрешённых групп
+    не задан, возвращается ['*'] — членство не проверяется.
+
+    conn — уже открытое соединение (например, bind самого пользователя).
+    Если его нет, ищем сервисной учёткой: для SSO и OIDC пароля пользователя
+    у нас нет вовсе.
+    """
+    if not LDAP_ALLOWED_GROUPS:
+        return ["*"]
+    if not LDAP_BASE_DN:
+        logger.error("Заданы группы доступа, но LDAP_BASE_DN пуст — "
+                     "проверить членство невозможно")
+        return []
+
+    try:
+        from ldap3 import SUBTREE
+        from ldap3.utils.conv import escape_filter_chars
+    except ImportError:
+        logger.error("Проверка групп требует пакета ldap3")
+        return []
+
+    own_conn = False
+    if conn is None:
+        if not LDAP_SEARCH_USER:
+            logger.error("Проверка групп без пароля пользователя требует "
+                         "сервисной учётки LDAP_SEARCH_USER")
+            return []
+        try:
+            conn = ldap_conn(LDAP_SEARCH_USER, LDAP_SEARCH_PASSWORD)
+            own_conn = True
+        except Exception as e:
+            logger.error(f"Не удалось подключиться к каталогу для проверки групп: {e}")
+            return []
+
+    # 1.2.840.113556.1.4.1941 — правило AD «член в том числе через вложенность».
+    # Без него пользователь во вложенной группе выглядит как посторонний,
+    # а вложенные группы в AD встречаются постоянно.
+    rule = ":1.2.840.113556.1.4.1941:" if LDAP_NESTED_GROUPS else ""
+    safe = escape_filter_chars(username)
+    matched = []
+    try:
+        for grp in LDAP_ALLOWED_GROUPS:
+            flt = ("(&" + LDAP_USER_FILTER.format(username=safe) +
+                   "(memberOf" + rule + "=" + grp + "))")
+            conn.search(LDAP_BASE_DN, flt, search_scope=SUBTREE, attributes=["cn"])
+            if conn.entries:
+                matched.append(grp)
+    except Exception as e:
+        logger.error(f"Поиск групп для {username} не удался: {e}")
+        matched = []
+    finally:
+        if own_conn:
+            try:
+                conn.unbind()
+            except Exception:
+                pass
+    return matched
+
+
 def ldap_authenticate(username: str, password: str) -> bool:
+    """Проверка пароля в каталоге. Членство в группах проверяется отдельно —
+    в authenticate(), чтобы разделить «неверный пароль» и «нет доступа»."""
     if not (LDAP_ENABLED and LDAP_URL and username and password):
         return False
     try:
-        from ldap3 import Server, Connection, Tls, ALL, SUBTREE
-        import ssl as _ssl
+        import ldap3  # noqa: F401
     except ImportError:
         logger.error("LDAP включён, но пакет ldap3 не установлен. "
                      "Поставьте: /opt/ai-alert-agent/venv/bin/pip install ldap3")
         return False
     try:
-        tls = Tls(validate=_ssl.CERT_REQUIRED if LDAP_TLS_VERIFY else _ssl.CERT_NONE)
-        server = Server(LDAP_URL, get_info=ALL, tls=tls,
-                        connect_timeout=LDAP_TIMEOUT)
-        bind_dn = LDAP_BIND_TEMPLATE.format(username=username)
-
-        conn = Connection(server, user=bind_dn, password=password,
-                          auto_bind=True, receive_timeout=LDAP_TIMEOUT)
-
-        # Проверка членства в группе — если она задана
-        if LDAP_REQUIRED_GROUP:
-            if not LDAP_BASE_DN:
-                logger.error("LDAP_REQUIRED_GROUP задан, но LDAP_BASE_DN пуст")
-                conn.unbind()
-                return False
-            flt = ("(&" + LDAP_USER_FILTER.format(username=username) +
-                   f"(memberOf={LDAP_REQUIRED_GROUP}))")
-            conn.search(LDAP_BASE_DN, flt, search_scope=SUBTREE, attributes=["cn"])
-            allowed = bool(conn.entries)
-            conn.unbind()
-            if not allowed:
-                logger.warning(f"LDAP: {username} не состоит в {LDAP_REQUIRED_GROUP}")
-            return allowed
-
+        conn = ldap_conn(LDAP_BIND_TEMPLATE.format(username=username), password)
         conn.unbind()
         return True
     except Exception as e:
         logger.warning(f"LDAP-аутентификация {username} не прошла: {e}")
         return False
+
+
+def group_access_allowed(username: str) -> tuple:
+    """(разрешён ли вход по группам, названия совпавших групп).
+
+    Группы — второй путь получения доступа наряду со списком: заводить
+    каждого вручную в домене на сотни человек нереально.
+    """
+    if not (LDAP_ENABLED and LDAP_ALLOWED_GROUPS):
+        return False, []
+    matched = ldap_matched_groups(username)
+    if matched == ["*"]:
+        return False, []          # список групп пуст — этот путь не используется
+    return bool(matched), matched
 
 
 # ── Источник 3: локальный админ ──────────────────────────────────────────────
@@ -266,6 +342,28 @@ def local_authenticate(username: str, password: str) -> bool:
     user_ok = hmac.compare_digest(username or "", AUTH_ADMIN_USER)
     pass_ok = verify_password(password or "", AUTH_ADMIN_PASSWORD_HASH)
     return user_ok and pass_ok
+
+
+def access_allowed(username: str, source: str = "") -> bool:
+    """Есть ли право входа: явная выдача или членство в разрешённой группе AD.
+
+    Порядок важен. Явный ОТЗЫВ перебивает группу: иначе администратор
+    отзывает доступ, а человек заходит снова при следующем входе, потому что
+    остался в группе.
+    """
+    rec = user_get(username)
+    if rec is not None:
+        return bool(rec["enabled"])          # запись есть — она и решает
+
+    ok, groups = group_access_allowed(username)
+    if ok:
+        # Заводим запись, чтобы админ видел, кто вошёл по группе,
+        # и мог отозвать доступ конкретному человеку
+        user_grant(username, display_name="", email="", role="user",
+                   granted_by="группа " + ", ".join(groups)[:100])
+        logger.info(f"Доступ по группе AD: {username} ({', '.join(groups)})")
+        return True
+    return False
 
 
 ERR_BAD_CREDS = "Неверный логин или пароль"
@@ -283,26 +381,27 @@ def authenticate(username: str, password: str) -> tuple[Optional[str], str]:
         return "local", ""
 
     if ldap_authenticate(username, password):
-        # Пароль в домене верный — но этого мало, нужен выданный доступ
-        if not user_allowed(username):
-            logger.warning(f"LDAP-вход {username}: доступ не выдан")
-            return None, ERR_NO_ACCESS
-        return "ldap", ""
+        # Пароль верный — но этого мало. Доступ даёт либо явная выдача,
+        # либо членство в разрешённой группе AD.
+        if access_allowed(username, "ldap"):
+            return "ldap", ""
+        logger.warning(f"LDAP-вход {username}: доступ не выдан")
+        return None, ERR_NO_ACCESS
 
     return None, ERR_BAD_CREDS
 
 
 def sso_denied(request: Request) -> bool:
-    """Прокси аутентифицировал пользователя, но доступ ему не выдавали."""
+    """Прокси аутентифицировал пользователя, но доступа у него нет."""
     name = sso_username(request)
-    return bool(name) and not user_allowed(name)
+    return bool(name) and not access_allowed(name, "sso")
 
 
 def current_user(request: Request) -> Optional[dict]:
     """Пользователь запроса: сначала SSO, затем сессионный cookie."""
     name = sso_username(request)
     if name:
-        if not user_allowed(name):
+        if not access_allowed(name, "sso"):
             logger.warning(f"SSO-вход {name}: доступ не выдан")
             return None
         return {"username": name, "source": "sso"}
@@ -315,6 +414,10 @@ def current_user(request: Request) -> Optional[dict]:
 
     # Подписи и срока мало: доступ могли отозвать уже после выдачи cookie.
     # Локальный админ — исключение, его в списке доступов нет по определению.
+    # Здесь именно user_allowed, а не access_allowed: проверка идёт на КАЖДОМ
+    # запросе, и ходить в LDAP за группами каждый раз недопустимо. Вошедшие
+    # по группе заводятся в списке при первом входе, поэтому проверка работает
+    # и для них, а отзыв действует немедленно.
     if sess.get("source") != "local" and not user_allowed(sess["username"]):
         logger.warning(f"Сессия {sess['username']}: доступ отозван — вход закрыт")
         return None
@@ -2830,7 +2933,7 @@ async def oidc_callback(request: Request, code: str = "", state: str = "",
         return back("Провайдер не сообщил имя пользователя")
 
     username = norm_username(raw_name)
-    if not user_allowed(username):
+    if not access_allowed(username, "oidc"):
         logger.warning(f"OIDC-вход {username}: доступ не выдан")
         return RedirectResponse(f"{prefix}/login?denied=1", status_code=302)
 
