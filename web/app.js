@@ -17,6 +17,7 @@ const App = (() => {
     clusters:      [],
     currentTab:    'chat',
     streamingEl:   null,   // элемент .msg-body куда стримятся токены
+    streamBuf:     '',     // сырой текст ответа до разметки
     pendingCharts: null,   // графики, ждущие конца ответа
     awaitingReply: false,
     pingTimer:     null,
@@ -71,9 +72,10 @@ const App = (() => {
       if (!d.items || !d.items.length) return;
 
       for (const m of d.items) {
-        addMsg(m.role === 'user' ? 'user' : 'assistant',
-               m.content,
-               m.role === 'user' ? 'Вы' : 'AI Agent');
+        const el = addMsg(m.role === 'user' ? 'user' : 'assistant', m.content,
+                          m.role === 'user' ? 'Вы' : 'AI Agent');
+        // ответы агента показываем размеченными, вопросы — как есть
+        if (m.role !== 'user') el.innerHTML = renderMarkdown(m.content);
       }
       const div = document.createElement('div');
       div.className = 'muted';
@@ -201,7 +203,10 @@ const App = (() => {
         // Убрать индикатор "думает" при первом токене
         const think = state.streamingEl.querySelector('.thinking');
         if (think) { think.remove(); state.streamingEl.classList.add('streaming'); }
-        state.streamingEl.textContent += msg.text;
+        // Пока идёт стрим — простой текст: перерисовывать разметку
+        // на каждом токене дорого. Разметку накладываем в finishStreaming.
+        state.streamBuf += msg.text;
+        state.streamingEl.textContent = state.streamBuf;
         scrollToBottom();
         break;
       }
@@ -226,8 +231,10 @@ const App = (() => {
     if (state.streamingEl) {
       const think = state.streamingEl.querySelector('.thinking');
       if (think) think.remove();
-      if (suffix) state.streamingEl.textContent += suffix;
+      if (suffix) state.streamBuf += suffix;
+      state.streamingEl.innerHTML = renderMarkdown(state.streamBuf);
       state.streamingEl.classList.remove('streaming');
+      state.streamBuf = '';
       // Графики встраиваем в само сообщение, а не отдельным блоком снизу
       if (state.pendingCharts) {
         attachCharts(state.streamingEl.parentElement, state.pendingCharts);
@@ -270,6 +277,7 @@ const App = (() => {
     addMsg('user', text, 'Вы');
 
     // Заготовка под ответ со стримингом
+    state.streamBuf = '';
     const el = addMsg('assistant', '', 'AI Agent');
     el.innerHTML = '<span class="thinking"><i></i><i></i><i></i></span>';
     state.streamingEl   = el;
@@ -684,6 +692,153 @@ const App = (() => {
     if (!r.ok) { alert('Не удалось отозвать доступ'); return; }
     await loadAccess();
   }
+
+  // ═══ РАЗМЕТКА ОТВЕТА ════════════════════════════════════════════
+  // Свой минимальный markdown: в закрытом контуре библиотеку не подтянуть.
+  // Порядок важен — СНАЧАЛА экранируем HTML, потом расставляем теги.
+  // Текст приходит от LLM, вставлять его как HTML напрямую нельзя.
+
+  function mdInline(s) {
+    return s
+      .replace(/`([^`]+)`/g, (m, c) => '<code>' + c + '</code>')
+      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s.,;:)]|$)/g, '$1<em>$2</em>');
+  }
+
+  // Строка-разделитель таблицы: |---|---| у markdown и -+- у наших блоков
+  const isTableSep = (l) => /^[\s|:+-]+$/.test(l) && /[-—]/.test(l);
+  const looksLikeRow = (l) => l.includes('|');
+
+  function splitRow(line) {
+    return line.replace(/^\s*\|/, '').replace(/\|\s*$/, '')
+               .split('|').map(c => c.trim());
+  }
+
+  function renderTable(rows) {
+    if (!rows.length) return '';
+    const head = splitRow(rows[0]);
+    const body = rows.slice(1).map(splitRow);
+    // числовые колонки прижимаем вправо — так их удобнее сравнивать глазом
+    const numeric = head.map((_, i) =>
+      body.length > 0 && body.every(r =>
+        r[i] === undefined || r[i] === '' || r[i] === '—' ||
+        /^[-+]?[\d\s.,]+[%a-zA-Zа-яА-Я/]*$/.test(r[i])));
+    const th = head.map((c, i) =>
+      '<th' + (numeric[i] ? ' class="num"' : '') + '>' + mdInline(c) + '</th>').join('');
+    const tr = body.map(r =>
+      '<tr>' + head.map((_, i) =>
+        '<td' + (numeric[i] ? ' class="num"' : '') + '>' +
+        mdInline(r[i] === undefined ? '' : r[i]) + '</td>').join('') + '</tr>').join('');
+    return '<div class="md-tablewrap"><table class="md-table"><thead><tr>' +
+           th + '</tr></thead><tbody>' + tr + '</tbody></table></div>';
+  }
+
+  function renderMarkdown(raw) {
+    if (!raw) return '';
+    let text = esc(raw);
+
+    // Блоки кода вынимаем первыми, чтобы внутри ничего не форматировалось
+    const blocks = [];
+    text = text.replace(/```(\w*)\n?([\s\S]*?)```/g, (m, lang, code) => {
+      blocks.push({ lang: lang || '', code: code.replace(/\n$/, '') });
+      return '@@CODEBLOCK@@' + (blocks.length - 1) + '';
+    });
+
+    const lines = text.split('\n');
+    const out = [];
+    let list = null;          // 'ul' | 'ol'
+    let para = [];
+    let table = [];
+
+    const flushPara = () => {
+      if (para.length) { out.push('<p>' + mdInline(para.join(' ')) + '</p>'); para = []; }
+    };
+    const flushList = () => { if (list) { out.push('</' + list + '>'); list = null; } };
+    const flushTable = () => {
+      if (table.length) {
+        // без строки-разделителя это не таблица, а просто текст с |
+        out.push(table.length >= 2 ? renderTable(table)
+                                   : '<p>' + mdInline(table[0]) + '</p>');
+        table = [];
+      }
+    };
+    const flushAll = () => { flushPara(); flushList(); flushTable(); };
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const t = line.trim();
+
+      if (t.startsWith('@@CODEBLOCK@@')) { flushAll(); out.push(t); continue; }
+
+      if (!t) { flushAll(); continue; }
+
+      // Таблица: строка с | , следующая — разделитель
+      if (!table.length && looksLikeRow(t) && i + 1 < lines.length &&
+          isTableSep(lines[i + 1].trim())) {
+        flushPara(); flushList();
+        table.push(t); i++;                     // разделитель пропускаем
+        continue;
+      }
+      if (table.length) {
+        if (looksLikeRow(t)) { table.push(t); continue; }
+        flushTable();
+      }
+
+      const h = t.match(/^(#{1,6})\s+(.+)$/);
+      if (h) {
+        flushAll();
+        const lvl = Math.min(h[1].length + 2, 6);   // ## -> h4, чтобы не спорить с заголовками страницы
+        out.push('<h' + lvl + ' class="md-h">' + mdInline(h[2]) + '</h' + lvl + '>');
+        continue;
+      }
+
+      const ul = t.match(/^[-*•]\s+(.+)$/);
+      const ol = t.match(/^(\d+)[.)]\s+(.+)$/);
+      if (ul || ol) {
+        flushPara(); flushTable();
+        const want = ul ? 'ul' : 'ol';
+        if (list !== want) { flushList(); out.push('<' + want + ' class="md-list">'); list = want; }
+        out.push('<li>' + mdInline((ul ? ul[1] : ol[2])) + '</li>');
+        continue;
+      }
+      flushList();
+
+      if (/^([-–—]{3,}|_{3,})$/.test(t)) { flushAll(); out.push('<hr class="md-hr">'); continue; }
+
+      para.push(t);
+    }
+    flushAll();
+
+    let html = out.join('');
+    html = html.replace(/@@CODEBLOCK@@(\d+)/g, (m, n) => {
+      const b = blocks[+n];
+      const label = b.lang ? '<span class="md-lang">' + esc(b.lang) + '</span>' : '';
+      return '<div class="md-code">' + label +
+             '<button class="md-copy" type="button" title="Скопировать">копировать</button>' +
+             '<pre><code>' + b.code + '</code></pre></div>';
+    });
+    return html;
+  }
+
+  // Копирование кода: делегируем на контейнер, чтобы не вешать слушатель
+  // на каждый блок при каждом ответе
+  document.addEventListener('click', (e) => {
+    const btn = e.target.closest && e.target.closest('.md-copy');
+    if (!btn) return;
+    const code = btn.parentElement.querySelector('code');
+    if (!code) return;
+    const done = () => { btn.textContent = 'скопировано';
+                         setTimeout(() => { btn.textContent = 'копировать'; }, 1500); };
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(code.textContent).then(done, () => {});
+    } else {
+      const ta = document.createElement('textarea');
+      ta.value = code.textContent;
+      document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); done(); } catch (err) {}
+      document.body.removeChild(ta);
+    }
+  });
 
   // ═══ ГРАФИКИ ════════════════════════════════════════════════════
   // Рисуем сами, инлайновым SVG: в закрытом контуре CDN недоступен,

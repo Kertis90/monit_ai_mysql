@@ -488,3 +488,41 @@ textarea#input:disabled { opacity: .55; }
             background: var(--panel, #1b1f27); color: var(--muted, #8b95a5);
             cursor: pointer; font-size: 13px; line-height: 1; }
 .stop-btn:hover { border-color: #e05a5a; color: #e05a5a; }
+
+/* ═══ Разметка ответа ИИ ═══════════════════════════════════════════ */
+.msg-body p          { margin: 0 0 8px; }
+.msg-body p:last-child { margin-bottom: 0; }
+.md-h                { margin: 12px 0 6px; font-size: 14px; font-weight: 600; }
+.md-h:first-child    { margin-top: 0; }
+.md-list             { margin: 4px 0 8px; padding-left: 22px; }
+.md-list li          { margin: 2px 0; }
+.md-hr               { border: 0; border-top: 1px solid var(--border, #2b313c);
+                       margin: 12px 0; }
+
+.msg-body code       { background: rgba(127,140,160,.16); padding: 1px 5px;
+                       border-radius: 4px; font-size: 12px;
+                       font-family: ui-monospace, Consolas, monospace; }
+
+.md-code             { position: relative; margin: 8px 0;
+                       border: 1px solid var(--border, #2b313c);
+                       border-radius: 8px; background: var(--bg, #12151b); }
+.md-code pre         { margin: 0; padding: 10px 12px; overflow-x: auto; }
+.md-code code        { background: none; padding: 0; font-size: 12px;
+                       line-height: 1.45; white-space: pre; }
+.md-lang             { position: absolute; top: 6px; right: 88px; font-size: 10px;
+                       color: var(--muted, #8b95a5); text-transform: uppercase; }
+.md-copy             { position: absolute; top: 4px; right: 6px; font: inherit;
+                       font-size: 11px; padding: 2px 8px; cursor: pointer;
+                       color: var(--muted, #8b95a5); background: var(--panel, #1b1f27);
+                       border: 1px solid var(--border, #2b313c); border-radius: 5px; }
+.md-copy:hover       { color: var(--accent, #4c8dff); border-color: var(--accent, #4c8dff); }
+
+/* Таблицы: широкие прокручиваются внутри себя, страницу не растягивают */
+.md-tablewrap        { overflow-x: auto; margin: 8px 0; }
+.md-table            { border-collapse: collapse; width: 100%; font-size: 12px; }
+.md-table th,
+.md-table td         { padding: 5px 9px; text-align: left; white-space: nowrap;
+                       border-bottom: 1px solid var(--border, #2b313c); }
+.md-table th         { background: rgba(127,140,160,.10); font-weight: 600; }
+.md-table tbody tr:hover { background: rgba(127,140,160,.06); }
+.md-table .num       { text-align: right; font-variant-numeric: tabular-nums; }
