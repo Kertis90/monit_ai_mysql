@@ -1547,58 +1547,53 @@ async def log_ssh(host: str, remote_cmd: str) -> tuple:
     return True, text
 
 
-async def remote_now(host: str):
-    """Локальное время сервера: метки в логах пишутся именно в нём."""
-    ok, out = await log_ssh(host, "date +%Y-%m-%dT%H:%M:%S")
+async def remote_time(host: str):
+    """Время сервера: абсолютное и локальное одновременно.
+
+    Нужны оба. Файлы выбираем по mtime — это Unix-время, одинаковое везде.
+    Метки внутри логов пишутся в ЛОКАЛЬНОМ поясе сервера, и grep идёт по ним.
+    Пояса серверов различаются (Владивосток и Кемерово — 4 часа), поэтому
+    смешивать эти величины нельзя: файл выбрался бы не тот.
+
+    Возвращает {"epoch": int, "local": datetime, "offset": "+1000", "tz": "..."}
+    или None, если сервер недоступен.
+    """
+    ok, out = await log_ssh(host, "date '+%s|%Y-%m-%dT%H:%M:%S|%z|%Z'")
     if not ok or not out.strip():
         return None
+    parts = out.strip().split("|")
+    if len(parts) < 3:
+        return None
     try:
-        return datetime.datetime.strptime(out.strip()[:19], "%Y-%m-%dT%H:%M:%S")
-    except ValueError:
+        return {
+            "epoch":  int(parts[0]),
+            "local":  datetime.datetime.strptime(parts[1][:19], "%Y-%m-%dT%H:%M:%S"),
+            "offset": parts[2],
+            "tz":     parts[3] if len(parts) > 3 else "",
+        }
+    except (ValueError, IndexError):
         return None
 
 
-async def log_list_files(host: str, dirs: list, pattern: str = "*") -> list:
-    """stat по файлам: размер и время изменения.
-
-    Метаданные смотрим ДО чтения: архив и текущий лог лежат в разных
-    каталогах и режутся по размеру, поэтому по имени файла период не
-    определить — только по mtime.
-    """
-    if not dirs:
-        return []
-    quoted_dirs = " ".join(shlex.quote(d) for d in dirs)
-    pat = shlex.quote(pattern)
-    fmt = "'%s\\t%T@\\t%p\\n'"
-    cmd = ("find " + quoted_dirs + " -maxdepth 1 -type f -name " + pat +
-           " -printf " + fmt + " 2>/dev/null | sort -k2 -n -r | head -50")
-    ok, out = await log_ssh(host, cmd)
-    if not ok:
-        logger.warning("Список логов на %s не получен: %s", host, out[:120])
-        return []
-    files = []
-    for line in out.splitlines():
-        parts = line.split("\t")
-        if len(parts) != 3:
-            continue
-        try:
-            files.append({"size": int(parts[0]), "mtime": float(parts[1]),
-                          "path": parts[2]})
-        except ValueError:
-            continue
-    return files
+async def remote_now(host: str):
+    """Локальное время сервера (обратная совместимость)."""
+    t = await remote_time(host)
+    return t["local"] if t else None
 
 
-def log_pick_files(files: list, since, until, limit: int = 4) -> list:
+def log_pick_files(files: list, since_epoch: float, until_epoch: float,
+                   limit: int = 4) -> list:
     """Какие файлы могли содержать нужный период.
 
-    Берём все, изменённые внутри окна, плюс ОДИН последний, изменённый до его
-    начала: файл ротируется по размеру, и запись за начало периода часто
-    оказывается в предыдущем файле.
+    Границы — Unix-время: mtime тоже в нём, и часовой пояс сервера на
+    сравнение не влияет.
+
+    Берём все файлы, изменённые внутри окна, плюс ОДИН последний, изменённый
+    до его начала: логи ротируются по размеру, и запись за начало периода
+    часто оказывается в предыдущем файле.
     """
-    since_ts, until_ts = since.timestamp(), until.timestamp()
-    inside = [f for f in files if since_ts <= f["mtime"] <= until_ts + 3600]
-    before = sorted([f for f in files if f["mtime"] < since_ts],
+    inside = [f for f in files if since_epoch <= f["mtime"] <= until_epoch + 3600]
+    before = sorted([f for f in files if f["mtime"] < since_epoch],
                     key=lambda f: -f["mtime"])[:1]
     picked = inside + before
     return sorted(picked, key=lambda f: -f["mtime"])[:limit]
@@ -1642,7 +1637,8 @@ async def log_grep(host: str, path: str, patterns: list,
 
 
 async def read_log_group(host: str, dirs: list, pattern: str, since, until,
-                         title: str, extra: str = "", hint: str = "") -> str:
+                         title: str, extra: str = "", hint: str = "",
+                         since_epoch: float = 0, until_epoch: float = 0) -> str:
     """Общий путь чтения: stat -> выбор файлов по времени -> grep.
 
     Одинаково работает и для slow-лога, и для логов приложения: оба
@@ -1654,7 +1650,9 @@ async def read_log_group(host: str, dirs: list, pattern: str, since, until,
                 "  В каталогах " + ", ".join(dirs) +
                 " файлов по маске " + pattern + " нет.")
 
-    picked = log_pick_files(files, since, until)
+    # Выбор по абсолютному времени: mtime не зависит от пояса сервера
+    picked = log_pick_files(files, since_epoch or since.timestamp(),
+                            until_epoch or until.timestamp())
     if not picked:
         newest = datetime.datetime.fromtimestamp(files[0]["mtime"])
         return ("### " + title + " " + host + "\n"
@@ -1699,7 +1697,8 @@ def log_dir_and_pattern(path: str) -> tuple:
 
 
 async def read_slow_log(cluster: dict, host: str, since, until,
-                        extra: str = "") -> str:
+                        extra: str = "",
+                        since_epoch: float = 0, until_epoch: float = 0) -> str:
     """Slow-лог MySQL за период. Ротированные файлы тоже просматриваются."""
     raw = (cluster.get("slow_log_path") or "/var/log/mysql/slow.log").strip()
     directory, pattern = log_dir_and_pattern(raw)
@@ -1711,11 +1710,13 @@ async def read_slow_log(cluster: dict, host: str, since, until,
     return await read_log_group(
         host, dirs, pattern, since, until, "Slow-лог", extra,
         hint="Записей за период нет. Возможно, slow_query_log выключен "
-             "или long_query_time слишком велик.")
+             "или long_query_time слишком велик.",
+        since_epoch=since_epoch, until_epoch=until_epoch)
 
 
 async def read_app_log(cluster: dict, host: str, since, until,
-                       extra: str = "") -> str:
+                       extra: str = "",
+                       since_epoch: float = 0, until_epoch: float = 0) -> str:
     """Логи приложения: текущие и архивные, включая tar.gz."""
     dirs = [d.strip() for d in (cluster.get("app_log_dirs") or "").split(",")
             if d.strip()]
@@ -1723,7 +1724,9 @@ async def read_app_log(cluster: dict, host: str, since, until,
         return ""
     pattern = (cluster.get("app_log_pattern") or "*.log*").strip()
     return await read_log_group(host, dirs, pattern, since, until,
-                                "Логи приложения", extra)
+                                "Логи приложения", extra,
+                                since_epoch=since_epoch,
+                                until_epoch=until_epoch)
 
 
 LOG_KEYWORDS = (
@@ -2306,22 +2309,36 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
         if detect_log_intent(user_message):
             win = hours if hours > 0 else 2.0
             for ip, role in cluster_hosts(cluster):
-                srv_now = await remote_now(ip)
-                if srv_now is None:
+                t = await remote_time(ip)
+                if t is None:
                     blocks.append(
                         f"## Логи {cluster['label']} · {role} ({ip})\n\n"
-                        f"  Сервер недоступен по SSH — логи прочитать нельзя.")
+                        f"  Сервер недоступен по SSH под учёткой "
+                        f"{LOG_SSH_USER or '(не задана)'} — логи прочитать нельзя.")
                     continue
-                since = srv_now - datetime.timedelta(hours=win)
-                parts = [await read_slow_log(cluster, ip, since, srv_now),
-                         await read_app_log(cluster, ip, since, srv_now)]
+
+                # Два разных отсчёта. Файлы выбираем по абсолютному времени
+                # (mtime), а grep идёт по локальным меткам внутри логов.
+                # Пояса серверов различаются, смешивать нельзя.
+                until_epoch = t["epoch"]
+                since_epoch = until_epoch - win * 3600
+                local_until = t["local"]
+                local_since = local_until - datetime.timedelta(hours=win)
+
+                parts = [await read_slow_log(cluster, ip, local_since,
+                                             local_until, "",
+                                             since_epoch, until_epoch),
+                         await read_app_log(cluster, ip, local_since,
+                                            local_until, "",
+                                            since_epoch, until_epoch)]
                 parts = [p for p in parts if p]
                 if parts:
                     blocks.append(
                         f"## Логи {cluster['label']} · {role} ({ip}), "
-                        f"период {since:%Y-%m-%d %H:%M} — {srv_now:%H:%M} "
-                        f"по времени сервера\n\n"
-                        + ("\n\n".join(parts)))
+                        f"период {local_since:%Y-%m-%d %H:%M} — "
+                        f"{local_until:%H:%M} по времени сервера "
+                        f"(пояс {t['tz'] or t['offset']}, смещение {t['offset']})"
+                        f"\n\n" + ("\n\n".join(parts)))
     else:
         # Обзор всех
         clusters = enabled_clusters()
