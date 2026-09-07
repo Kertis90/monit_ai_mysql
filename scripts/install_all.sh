@@ -38,7 +38,8 @@ echo -e "${BOLD}[3/3] Применение реестра кластеров...$
 bash "${SCRIPT_DIR}/../manage_cluster.sh" apply || \
     echo "Реестр пуст — добавьте кластеры: ./manage_cluster.sh add"
 
-source "${SCRIPT_DIR}/../config.env"
+source "${SCRIPT_DIR}/lib_secrets.sh"
+load_config "${SCRIPT_DIR}/../config.env"
 echo ""
 echo -e "${GREEN}${BOLD}════════════ УСТАНОВКА ЗАВЕРШЕНА ════════════${NC}"
 echo ""

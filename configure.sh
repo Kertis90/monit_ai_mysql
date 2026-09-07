@@ -14,6 +14,7 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${SCRIPT_DIR}/config.env"
+source "${SCRIPT_DIR}/scripts/lib_secrets.sh"
 
 echo ""
 echo -e "${BOLD}${BLUE}╔════════════════════════════════════════════════════╗${NC}"
@@ -24,7 +25,7 @@ echo ""
 # Загрузить существующие значения если конфиг уже есть
 if [[ -f "$CONFIG_FILE" ]]; then
     echo -e "${YELLOW}Найден существующий config.env — значения будут предложены как defaults${NC}"
-    source "$CONFIG_FILE"
+    load_config "$CONFIG_FILE"
     echo ""
 fi
 
@@ -328,20 +329,20 @@ MONITORING_IP="${MONITORING_IP}"
 
 # Удалённая LLM (OpenAI-совместимый API: /chat/completions)
 LLM_BASE_URL="${LLM_BASE_URL}"
-LLM_API_KEY="${LLM_API_KEY}"
+LLM_API_KEY=$(sq "${LLM_API_KEY}")
 LLM_MODEL="${LLM_MODEL}"
 LLM_MAX_TOKENS=${LLM_MAX_TOKENS}
 LLM_TEMPERATURE=${LLM_TEMPERATURE}
 
 # Grafana
-GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD}"
+GRAFANA_ADMIN_PASSWORD=$(sq "${GRAFANA_ADMIN_PASSWORD}")
 
 # Alertmanager email (пусто = отключено)
 ALERT_EMAIL_TO="${ALERT_EMAIL_TO}"
 ALERT_EMAIL_FROM="${ALERT_EMAIL_FROM}"
 ALERT_SMTP_HOST="${ALERT_SMTP_HOST}"
 ALERT_SMTP_USER="${ALERT_SMTP_USER}"
-ALERT_SMTP_PASSWORD="${ALERT_SMTP_PASSWORD}"
+ALERT_SMTP_PASSWORD=$(sq "${ALERT_SMTP_PASSWORD}")
 
 # SSH-доступ к MySQL-серверам (установка экспортёров)
 # Команды на удалённых серверах выполняются как: sudo -n <команда>
@@ -370,8 +371,8 @@ GRAFANA_COM_URL="${GRAFANA_COM_URL}"
 # AUTH_SECRET подписывает сессионные cookie — при его смене все сессии слетают.
 AUTH_ENABLED="${AUTH_ENABLED}"
 AUTH_ADMIN_USER="${AUTH_ADMIN_USER}"
-AUTH_ADMIN_PASSWORD_HASH="${AUTH_ADMIN_PASSWORD_HASH}"
-AUTH_SECRET="${AUTH_SECRET}"
+AUTH_ADMIN_PASSWORD_HASH=$(sq "${AUTH_ADMIN_PASSWORD_HASH}")
+AUTH_SECRET=$(sq "${AUTH_SECRET}")
 AUTH_SESSION_TTL_HOURS=${AUTH_SESSION_TTL_HOURS}
 
 # LDAP / Active Directory
@@ -387,13 +388,13 @@ LDAP_NESTED_GROUPS="${LDAP_NESTED_GROUPS}"
 LDAP_TLS_VERIFY="${LDAP_TLS_VERIFY}"
 # Сервисная учётка — только для поиска по каталогу при выдаче доступов
 LDAP_SEARCH_USER="${LDAP_SEARCH_USER}"
-LDAP_SEARCH_PASSWORD="${LDAP_SEARCH_PASSWORD}"
+LDAP_SEARCH_PASSWORD=$(sq "${LDAP_SEARCH_PASSWORD}")
 
 # OIDC (встроенный, Authorization Code + PKCE)
 OIDC_ENABLED="${OIDC_ENABLED}"
 OIDC_ISSUER="${OIDC_ISSUER}"
 OIDC_CLIENT_ID="${OIDC_CLIENT_ID}"
-OIDC_CLIENT_SECRET="${OIDC_CLIENT_SECRET}"
+OIDC_CLIENT_SECRET=$(sq "${OIDC_CLIENT_SECRET}")
 OIDC_REDIRECT_URL="${OIDC_REDIRECT_URL}"
 OIDC_SCOPES="${OIDC_SCOPES}"
 OIDC_USERNAME_CLAIM="${OIDC_USERNAME_CLAIM}"
@@ -435,7 +436,7 @@ CHATS_RETENTION_DAYS=${CHATS_RETENTION_DAYS}
 
 # Токены для POST /api/alerts/ingest (несколько — через запятую).
 # Пусто = приём алертов из внешних систем выключен.
-INGEST_TOKENS="${INGEST_TOKENS}"
+INGEST_TOKENS=$(sq "${INGEST_TOKENS}")
 
 # Версии экспортёров
 NODE_EXPORTER_VERSION="${NODE_EXPORTER_VERSION}"

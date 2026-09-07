@@ -11,7 +11,8 @@ set -euo pipefail
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/../config.env"
+source "${SCRIPT_DIR}/lib_secrets.sh"
+load_config "${SCRIPT_DIR}/../config.env"
 
 AGENT_ENV="/opt/ai-alert-agent/.env"
 [[ -f "$AGENT_ENV" ]] || { echo -e "${RED}Агент не установлен (нет ${AGENT_ENV})${NC}"; exit 1; }

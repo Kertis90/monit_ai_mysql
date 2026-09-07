@@ -8,7 +8,8 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/../config.env"
+source "${SCRIPT_DIR}/lib_secrets.sh"
+load_config "${SCRIPT_DIR}/../config.env"
 
 OK="  ${GREEN}✓${NC}"; FAIL="  ${RED}✗${NC}"; WARN="  ${YELLOW}!${NC}"
 

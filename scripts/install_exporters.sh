@@ -27,7 +27,8 @@ log_section() { echo -e "\n${BLUE}══ $1 ══${NC}"; }
 SELF="${BASH_SOURCE[0]:-}"
 if [[ -n "$SELF" ]]; then
     SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
-    [[ -f "${SCRIPT_DIR}/../config.env" ]] && source "${SCRIPT_DIR}/../config.env"
+    source "${SCRIPT_DIR}/lib_secrets.sh"
+    [[ -f "${SCRIPT_DIR}/../config.env" ]] && load_config "${SCRIPT_DIR}/../config.env"
 fi
 
 NODE_EXPORTER_VERSION="${NODE_EXPORTER_VERSION:-1.8.2}"

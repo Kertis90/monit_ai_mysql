@@ -31,7 +31,8 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="${SCRIPT_DIR}/../config.env"
 [[ -f "$CONFIG" ]] || { log_error "config.env не найден — запустите сначала ./configure.sh"; exit 1; }
-source "$CONFIG"
+source "${SCRIPT_DIR}/lib_secrets.sh"
+load_config "$CONFIG"
 [[ $EUID -ne 0 ]] && { log_error "Нужен root (sudo)"; exit 1; }
 
 
