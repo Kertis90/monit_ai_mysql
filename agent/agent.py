@@ -986,9 +986,28 @@ def detect_history_intent(text: str) -> bool:
     return any(kw in t for kw in HISTORY_KEYWORDS)
 
 
+# «за последний час» цифры не содержит, но период назван вполне однозначно.
+# Раньше такие фразы проваливались в дефолт 24 ч.
+WORD_PERIODS = {
+    "последние полчаса": 0.5, "полчаса": 0.5, "последних полчаса": 0.5,
+    "последний час": 1.5, "последнего часа": 1.5, "последнюю часу": 1.5,
+    "за час": 1.5, "последний часа": 1.5,
+    "пару часов": 2.5, "пары часов": 2.5, "несколько часов": 4,
+    "последние два часа": 2.5, "последние три часа": 3.5,
+    "последние сутки": 26, "последних суток": 26,
+    "последнюю неделю": 170, "последней недели": 170,
+    "последний месяц": 730, "последнего месяца": 730,
+}
+
+
 def detect_time_hours(text: str) -> float:
     """Окно в часах из фразы. 0 — период не назван."""
     t = text.lower()
+
+    # словесные периоды проверяем ПЕРВЫМИ: они длиннее и однозначнее
+    for kw, hours in sorted(WORD_PERIODS.items(), key=lambda kv: -len(kv[0])):
+        if kw in t:
+            return float(hours)
 
     # минуты — для коротких окон вида «за последние 30 минут»
     m = re.search(r'за\s+(?:послед[а-яё]+\s+)?(\d+)\s+минут', t)
@@ -1443,16 +1462,21 @@ def detect_breakdown_intent(text: str) -> bool:
     return any(kw in t for kw in BREAKDOWN_KEYWORDS) or parse_step_seconds(t) is not None
 
 
-async def collect_series_table(cluster: dict, hours: float,
-                               step_s: int) -> dict:
-    """Ряды всех показателей на общей сетке времени."""
+async def collect_series_table(cluster: dict, hours: float, step_s: int,
+                               max_rows: Optional[int] = None) -> dict:
+    """Ряды всех показателей на общей сетке времени.
+
+    max_rows — бюджет строк: когда таблиц несколько (вопрос без названия
+    города), общий лимит делится между кластерами.
+    """
+    limit = max_rows or SERIES_MAX_ROWS
     prim = cluster["primary_ip"]
     ctx  = {"inst": f"{prim}:9104", "node": f"{prim}:9100"}
 
     # Шаг не может быть мельче реальности и не должен раздувать таблицу
     points = int(hours * 3600 / max(step_s, 15))
-    if points > SERIES_MAX_ROWS:
-        step_s = int(hours * 3600 / SERIES_MAX_ROWS)
+    if points > limit:
+        step_s = int(hours * 3600 / limit)
         # округляем вверх до целых минут — «по 7 минут» читается странно
         step_s = max(int((step_s + 59) // 60) * 60, 60)
         adjusted = True
@@ -1573,6 +1597,18 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
             for c, h in zip(clusters, hists):
                 if h:
                     blocks.append(fmt_history(h, c["label"]))
+
+            # И детализацию тоже: раньше таблица строилась только когда
+            # в вопросе назван город, а «по метрикам ОС» города не содержит
+            if detect_breakdown_intent(user_message):
+                step = parse_step_seconds(user_message) or 300
+                # бюджет строк делим между кластерами, иначе контекст распухнет
+                budget = max(SERIES_MAX_ROWS // max(len(clusters), 1), 40)
+                tables = await asyncio.gather(
+                    *[collect_series_table(c, hours, step, budget)
+                      for c in clusters])
+                for c, tb in zip(clusters, tables):
+                    blocks.append(fmt_series_table(tb, c["label"]))
 
     # Спросили про алерты/инциденты — подмешиваем историю из БД
     if detect_alert_intent(user_message):
