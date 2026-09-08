@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
@@ -9,7 +10,7 @@ from fastapi.responses import HTMLResponse
 
 from agent.api.deps import Alerts, MaybeUser
 from agent.core.config import settings
-from agent.services import directory, oidc
+from agent.services import access, directory, oidc
 from agent.services.analysis import fmt_current, fmt_history, system_prompt
 from agent.services.llm import llm_complete
 from agent.services.mysql import db_versions_text
@@ -143,18 +144,31 @@ async def config_info(user: MaybeUser):
     }
 
 
-def _page(name: str, request: Request) -> HTMLResponse:
-    """Отдать страницу, подставив префикс за nginx в <base>.
+def _page(name: str, request: Request,
+          values: dict[str, str] | None = None) -> HTMLResponse:
+    """Отдать страницу, подставив префикс за nginx и значения шаблона.
 
-    Без подстановки относительные пути ломаются, когда агент проксируется
-    не в корень, а в подкаталог.
+    Префикс нужен, потому что при проксировании не в корень относительные
+    пути иначе ломаются. Плейсхолдеры вида {{ИМЯ}} обязательны: страница
+    входа подставляет их прямо в JavaScript, и незаменённый остаток —
+    синтаксическая ошибка, из-за которой скрипт не выполняется целиком,
+    а форма перестаёт отправляться.
     """
     path = Path(settings.web_dir) / name
     if not path.exists():
         return HTMLResponse(f"<h1>{name} не найден</h1>", status_code=500)
+
     prefix = (request.scope.get("root_path") or settings.prefix).rstrip("/")
     html = path.read_text(encoding="utf-8")
-    return HTMLResponse(html.replace('<base href="/">', f'<base href="{prefix}/">', 1))
+    html = html.replace('<base href="/">', f'<base href="{prefix}/">', 1)
+    for key, value in (values or {}).items():
+        html = html.replace("{{%s}}" % key, value)
+
+    left = re.findall(r"\{\{[A-Z_]+\}\}", html)
+    if left:
+        logger.error("В %s остались незаполненные плейсхолдеры: %s — страница "
+                     "работать не будет", name, ", ".join(sorted(set(left))))
+    return HTMLResponse(html)
 
 
 @router.get("/", include_in_schema=False)
@@ -164,7 +178,15 @@ async def index(request: Request):
 
 @router.get("/login", include_in_schema=False)
 async def login_page(request: Request):
-    return _page("login.html", request)
+    oidc_ready = bool(oidc.OIDC_ENABLED and oidc.OIDC_ISSUER and oidc.OIDC_CLIENT_ID)
+    # Если настроен только SSO, поля пароля на форме не нужны
+    sso_only = bool(access.SSO_ENABLED and not (settings.ldap.enabled
+                                                or settings.auth.admin_password_hash))
+    return _page("login.html", request, {
+        "SSO_ONLY":         "true" if sso_only else "false",
+        "OIDC_ENABLED":     "true" if oidc_ready else "false",
+        "OIDC_BUTTON_TEXT": oidc.OIDC_BUTTON_TEXT,
+    })
 
 
 @router.get("/report", include_in_schema=False)

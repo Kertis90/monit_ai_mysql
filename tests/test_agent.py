@@ -176,9 +176,20 @@ def application() -> None:
               c.post("/api/login", json={"username": "admin",
                                          "password": "нет"}).status_code, 401)
 
+        # Страница входа: незаполненный плейсхолдер попадает прямо в
+        # JavaScript и ломает скрипт целиком — форма перестаёт отправляться,
+        # а внешне это выглядит как «нажимаю, и ничего»
+        page = c.get("/login")
+        check("страница входа отдаётся", page.status_code, 200)
+        check("шаблон заполнен полностью", "{{" not in page.text, True)
+
         r = c.post("/api/login", json={"username": "admin", "password": password})
         check("вход администратором", r.status_code, 200)
         check("права администратора", c.get("/api/me").json().get("is_admin"), True)
+        # После входа браузер идёт на корень: он должен отдать интерфейс,
+        # а не отправить обратно на форму
+        home = c.get("/", follow_redirects=False)
+        check("после входа открывается интерфейс", home.status_code, 200)
 
         r = c.post("/api/users", json={"username": "MSK" + chr(92) + "IvKop",
                                        "role": "admin"})
