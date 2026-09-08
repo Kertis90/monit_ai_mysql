@@ -418,6 +418,14 @@ LDAP_SEARCH_MODE="${LDAP_SEARCH_MODE:-prefix}"
 WORKLOAD_WINDOW_S="${WORKLOAD_WINDOW_S:-10}"
 # Через сколько минут после записи решения проверить, не повторилось ли
 FOLLOWUP_MINUTES="${FOLLOWUP_MINUTES:-15}"
+# Сверка с обычным состоянием по расписанию: «запросов вдвое меньше нормы»
+# не пересекает ни одного порога, но означает, что отвалилось приложение
+ANOMALY_ENABLED="${ANOMALY_ENABLED:-true}"
+ANOMALY_INTERVAL_MIN="${ANOMALY_INTERVAL_MIN:-30}"
+# Самопроверка агента: протухший SSH-ключ или потерянные права db_user
+# должны приходить событием, а не обнаруживаться в разгар аварии
+SELFCHECK_ENABLED="${SELFCHECK_ENABLED:-true}"
+SELFCHECK_INTERVAL_MIN="${SELFCHECK_INTERVAL_MIN:-60}"
 # Сколько недель усреднять для базы сравнения. Одна точка ненадёжна: сбой
 # или праздник ровно неделю назад искажает представление о норме
 BASELINE_WEEKS="${BASELINE_WEEKS:-4}"

@@ -679,7 +679,8 @@ const App = (() => {
                         logs:   () => { fillClusterSelects(); },
                         sql:    () => { fillClusterSelects(); loadTemplates();
                                         renderSqlHistory(); },
-                        search: () => $('search-q').focus() };
+                        search: () => $('search-q').focus(),
+                        health: () => loadHealth() };
 
   function showTab(tab) {
     state.currentTab = tab;
@@ -1539,6 +1540,47 @@ const App = (() => {
           <div id="cluster-diag" class="muted small">
             Тяжёлые запросы, полные сканирования, ожидания блокировок,
             планы выполнения.</div>
+        </div>
+        <div class="card">
+          <h4>Запас по ресурсам
+            <button class="ghost-btn lazy" onclick="App.loadForecast()">Посчитать</button></h4>
+          <div id="cluster-forecast" class="muted small">
+            Через сколько кончится место на дисках, когда упрёмся в предел
+            соединений и сколько осталось до переполнения автоинкрементов.</div>
+        </div>
+        <div class="card">
+          <h4>Настройки MySQL
+            <button class="ghost-btn lazy" onclick="App.loadConfigAudit()">Разобрать</button></h4>
+          <div id="cluster-config" class="muted small">
+            Что выставлено неудачно и чем это грозит, с пометкой, что можно
+            менять на ходу.</div>
+        </div>
+        <div class="card">
+          <h4>Рост данных
+            <button class="ghost-btn lazy" onclick="App.loadGrowth()">Показать</button>
+          </h4>
+          <div id="cluster-growth" class="muted small">
+            Что растёт быстрее всех, где место не вернулось диску, где нет
+            первичного ключа.</div>
+        </div>
+        <div class="card">
+          <h4>Отклонения от обычного
+            <button class="ghost-btn lazy" onclick="App.loadAnomalies()">Сверить</button></h4>
+          <div id="cluster-anomaly" class="muted small">
+            Сравнение с медианой за несколько недель на этот же час: ловит то,
+            на что нет порога.</div>
+        </div>
+        <div class="card">
+          <h4>Можно ли трогать
+            <span>
+              <button class="ghost-btn lazy" onclick="App.loadReadiness('restart')">Перезапуск</button>
+              <button class="ghost-btn lazy" onclick="App.loadReadiness('alter')">ALTER</button>
+              <button class="ghost-btn lazy" onclick="App.loadReadiness('backup')">Бэкап</button>
+            </span>
+          </h4>
+          <div id="cluster-ready" class="muted small">
+            Долгие транзакции, зависшие запросы, ожидание блокировок,
+            состояние реплик — то, что проверяют перед обслуживанием.</div>
         </div>`;
 
       html += '<div class="card"><h4>События за сутки</h4>' +
@@ -1581,6 +1623,37 @@ const App = (() => {
 
   const loadReplication = () => lazyBlock('cluster-repl',
     'api/replication/' + encodeURIComponent(state.clusterName), 'Читаю состояние…');
+
+  const loadForecast = () => lazyBlock('cluster-forecast',
+    'api/forecast/' + encodeURIComponent(state.clusterName), 'Считаю запас…');
+
+  const loadConfigAudit = () => lazyBlock('cluster-config',
+    'api/config-audit/' + encodeURIComponent(state.clusterName),
+    'Читаю настройки…');
+
+  const loadGrowth = () => lazyBlock('cluster-growth',
+    'api/growth/' + encodeURIComponent(state.clusterName) + '?days=30',
+    'Сравниваю снимки…');
+
+  const loadAnomalies = () => lazyBlock('cluster-anomaly',
+    'api/anomalies/' + encodeURIComponent(state.clusterName),
+    'Сверяю с обычным состоянием…');
+
+  const loadReadiness = (action) => lazyBlock('cluster-ready',
+    'api/readiness/' + encodeURIComponent(state.clusterName) +
+    '?action=' + encodeURIComponent(action || 'restart'),
+    'Проверяю…');
+
+  async function loadHealth() {
+    const out = $('health-out');
+    out.textContent = 'Проверяю Prometheus, модель, SSH, учётки баз…';
+    try {
+      const d = await fetch('health/deep').then(r => r.json());
+      out.textContent = d.text || 'Нет данных.';
+    } catch (e) {
+      out.textContent = 'Проверка не выполнена: ' + e;
+    }
+  }
 
   const loadDiag = () => lazyBlock('cluster-diag',
     'api/diagnose/' + encodeURIComponent(state.clusterName) + '?deep=true',
@@ -1902,6 +1975,8 @@ const App = (() => {
            toggleClusters, openCluster, loadClusterPage, loadWorkload,
            loadReplication, loadDiag, askAboutCluster, analyzeAlert,
            similarIncidents, loadLogs, runSql, useTemplate, runSearch,
+           loadForecast, loadConfigAudit, loadGrowth, loadAnomalies,
+           loadReadiness, loadHealth,
            grantManual, revokeAccess, deleteAlert, deleteAlertsByName,
            resolveAlert,
            stopGeneration };

@@ -10,7 +10,7 @@ from fastapi.responses import HTMLResponse
 
 from agent.api.deps import AdminUser, Alerts, MaybeUser
 from agent.core.config import settings
-from agent.services import access, digest, directory, oidc
+from agent.services import access, digest, directory, oidc, selfcheck
 from agent.services.analysis import fmt_current, fmt_history, system_prompt
 from agent.services.llm import llm_complete
 from agent.services.mysql import db_versions_text
@@ -233,3 +233,16 @@ async def report_page(request: Request):
     """Печатная версия отчёта. PDF делает браузер (Ctrl+P → сохранить как PDF):
     так не нужны ни серверный рендер, ни новые зависимости."""
     return _page("report.html", request)
+
+
+@router.get("/health/deep", tags=["Служебные"],
+            summary="Проверка всех зависимостей агента")
+async def health_deep(user: MaybeUser):
+    """Prometheus, модель, SSH до каждого сервера, учётки БД, каталог.
+
+    То же, что делает verify.sh, но изнутри агента и в любой момент: чинить
+    протухший ключ лучше до аварии, а не во время неё.
+    """
+    data = await selfcheck.run()
+    data["text"] = selfcheck.fmt_selfcheck(data)
+    return data

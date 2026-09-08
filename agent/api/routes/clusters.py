@@ -7,8 +7,9 @@ import logging
 
 from fastapi import APIRouter, HTTPException, Request
 
-from agent.api.deps import Audit, CurrentUser, MaybeUser
-from agent.services import audit
+from agent.api.deps import AdminUser, Audit, CurrentUser, MaybeUser
+from agent.services import (anomaly, audit, config_audit, forecast, growth,
+                            readiness)
 from agent.schemas.api import SqlRequest, SqlResult
 from agent.services.analysis import (DIAG_QUERIES, collect_series_table,
                                      explain_top_queries, fmt_diagnostics,
@@ -185,3 +186,60 @@ async def templates(user: CurrentUser):
     return {"items": [{"key": q["key"], "title": q["title"],
                        "why": q.get("why", ""), "sql": q["sql"].strip()}
                       for q in DIAG_QUERIES]}
+
+
+@router.get("/api/forecast/{name}", tags=["Диагностика"],
+            summary="Когда кончится место, соединения и автоинкременты")
+async def forecast_one(name: str, user: CurrentUser):
+    """«Занято 85%» говорит о состоянии, «хватит на трое суток» — о запасе
+    времени. Второе полезнее."""
+    data = await forecast.collect(_need(name))
+    data["text"] = forecast.fmt_forecast(data)
+    return data
+
+
+@router.get("/api/config-audit/{name}", tags=["Диагностика"],
+            summary="Разбор настроек MySQL")
+async def config_audit_one(name: str, user: CurrentUser, host: str = ""):
+    data = await config_audit.audit(_need(name), host or None)
+    data["text"] = config_audit.fmt_audit(data)
+    return data
+
+
+@router.get("/api/growth/{name}", tags=["Диагностика"],
+            summary="Что растёт: размеры таблиц и динамика")
+async def growth_one(name: str, user: CurrentUser, days: int = 30):
+    _need(name)
+    data = await growth.report(name, max(1, min(days, 90)))
+    data["text"] = growth.fmt_growth(data)
+    return data
+
+
+@router.post("/api/growth/{name}/snapshot", tags=["Диагностика"],
+             summary="Снять срез размеров немедленно")
+async def growth_snapshot(name: str, admin: AdminUser):
+    """Первый снимок обычно нужен сразу, а не через сутки по расписанию."""
+    return {"cluster": name, "tables": await growth.snapshot(_need(name))}
+
+
+@router.get("/api/anomalies/{name}", tags=["Диагностика"],
+            summary="Отклонения от обычного состояния")
+async def anomalies_one(name: str, user: CurrentUser):
+    """Половина поломок не пересекает ни одного порога: запросов вдвое
+    меньше обычного — приложение отвалилось, а база здорова."""
+    cluster = _need(name)
+    items = await anomaly.check(cluster)
+    return {"cluster": name, "items": items,
+            "text": anomaly.fmt_anomalies(items, cluster["label"])}
+
+
+@router.get("/api/readiness/{name}", tags=["Диагностика"],
+            summary="Можно ли сейчас перезапускать, менять схему, снимать копию")
+async def readiness_one(name: str, user: CurrentUser, action: str = "restart",
+                        host: str = ""):
+    if action not in ("restart", "alter", "backup"):
+        raise HTTPException(status_code=400,
+                            detail="action: restart, alter или backup")
+    data = await readiness.check(_need(name), action, host or None)
+    data["text"] = readiness.fmt_readiness(data)
+    return data

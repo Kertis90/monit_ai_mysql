@@ -15,7 +15,7 @@ from __future__ import annotations
 import datetime
 from typing import Optional
 
-from sqlalchemy import Index, Integer, String, Text
+from sqlalchemy import BigInteger, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from agent.db.base import Base
@@ -210,3 +210,28 @@ class ChatThread(Base):
     updated_at: Mapped[str] = mapped_column(String(TS_LEN), nullable=False)
 
     __table_args__ = (Index("idx_threads_owner", "owner", "updated_at"),)
+
+
+class TableSize(Base):
+    """Снимок размеров таблиц.
+
+    Одна точка ничего не говорит: важно, что растёт и как быстро. Поэтому
+    храним ряд снимков и считаем разницу. Метрик для этого нет — размеры
+    берутся запросом к information_schema, и делать это чаще раза в сутки
+    незачем: на большой базе такой запрос сам по себе не бесплатный.
+    """
+    __tablename__ = "table_sizes"
+
+    id:      Mapped[int] = mapped_column(Integer, primary_key=True,
+                                         autoincrement=True)
+    ts:      Mapped[str] = mapped_column(String(TS_LEN), nullable=False)
+    cluster: Mapped[str] = mapped_column(String(NAME_LEN), nullable=False)
+    db:      Mapped[str] = mapped_column(String(NAME_LEN), nullable=False)
+    tbl:     Mapped[str] = mapped_column(String(NAME_LEN), nullable=False)
+    data_bytes:  Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    index_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    free_bytes:  Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    rows_est:    Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    has_pk:      Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+
+    __table_args__ = (Index("idx_sizes_cluster_ts", "cluster", "ts"),)

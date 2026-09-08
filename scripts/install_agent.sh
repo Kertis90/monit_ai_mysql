@@ -192,6 +192,12 @@ CHAT_CONTEXT_MESSAGES=${CHAT_CONTEXT_MESSAGES:-10}
 WORKLOAD_WINDOW_S=${WORKLOAD_WINDOW_S:-10}
 # Через сколько минут после записи решения проверить, не повторилось ли
 FOLLOWUP_MINUTES=${FOLLOWUP_MINUTES:-15}
+# Сверка с обычным состоянием: ловит поломки, на которые нет порога
+ANOMALY_ENABLED=${ANOMALY_ENABLED:-true}
+ANOMALY_INTERVAL_MIN=${ANOMALY_INTERVAL_MIN:-30}
+# Самопроверка: Prometheus, модель, SSH, учётки баз, каталог
+SELFCHECK_ENABLED=${SELFCHECK_ENABLED:-true}
+SELFCHECK_INTERVAL_MIN=${SELFCHECK_INTERVAL_MIN:-60}
 # Сводка по расписанию: во сколько, за какой период и кому
 DIGEST_ENABLED=${DIGEST_ENABLED:-false}
 DIGEST_AT=${DIGEST_AT:-09:00}

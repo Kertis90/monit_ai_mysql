@@ -245,6 +245,7 @@ def application() -> None:
         websocket(c)
         threads(c)
         gui_endpoints(c)
+        foresight(c)
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -387,6 +388,72 @@ def gui_endpoints(client) -> None:
     # Логи: сервера нет, но ответ должен быть осмысленным
     logs = client.get("/api/logs/kemerovo?hours=1&kind=slow").json()
     check("логи отвечают текстом", isinstance(logs.get("text"), str), True)
+
+
+def foresight(client) -> None:
+    """Прогноз, разбор настроек, рост, отклонения, готовность, самопроверка."""
+    from agent.services import anomaly, config_audit, forecast
+
+    # Разбор настроек — чистая функция, её проверяем на данных, а не на сервере
+    bad = {"version": "5.7.44", "innodb_flush_log_at_trx_commit": "2",
+           "sync_binlog": "0", "innodb_buffer_pool_size": str(1024 ** 3),
+           "query_cache_type": "ON", "slow_query_log": "OFF",
+           "performance_schema": "OFF", "log_bin": "OFF",
+           "max_connections": "1000"}
+    found = config_audit.analyse(bad, {"max_used_connections": "950",
+                                       "uptime": "100000"}, 16 * 1024 ** 3)
+    names = {f["name"] for f in found}
+    check("плохие настройки замечены", len(found) >= 6, True)
+    check("выключенный binlog — важное",
+          any(f["level"] == "critical" and f["name"] == "log_bin" for f in found), True)
+    check("сказано, что нужен перезапуск",
+          any(f["restart"] for f in found), True)
+
+    good = {"version": "8.0.36", "innodb_flush_log_at_trx_commit": "1",
+            "sync_binlog": "1",
+            "innodb_buffer_pool_size": str(int(16 * 1024 ** 3 * 0.7)),
+            "innodb_redo_log_capacity": str(int(16 * 1024 ** 3 * 0.2)),
+            "query_cache_type": "0", "slow_query_log": "ON",
+            "long_query_time": "1", "performance_schema": "ON",
+            "log_bin": "ON", "binlog_format": "ROW",
+            "binlog_expire_logs_seconds": "604800", "max_connections": "500",
+            "gtid_mode": "ON", "innodb_file_per_table": "ON",
+            "innodb_print_all_deadlocks": "ON"}
+    check("на разумных настройках молчит",
+          len(config_audit.analyse(good, {"max_used_connections": "200",
+                                          "uptime": "100000"}, 16 * 1024 ** 3)), 0)
+
+    # Отклонения: падение вдвое и рост втрое должны замечаться, шум — нет
+    now  = {"qps": {"avg": 40}, "slow_qps": {"avg": 0.1},
+            "connections_pct": {"avg": 20}, "iowait_pct": {"avg": 4}}
+    base = {"qps": {"avg": 100}, "slow_qps": {"avg": 0.1},
+            "connections_pct": {"avg": 18}, "iowait_pct": {"avg": 4}}
+    drop = anomaly.compare(now, base)
+    check("падение потока запросов замечено",
+          any(d["metric"] == "qps" and d["kind"] == "drop" for d in drop), True)
+    check("мелкие колебания не тревожат", len(drop), 1)
+    check("на одинаковых значениях молчит", len(anomaly.compare(base, base)), 0)
+    check("малые величины не сравниваются",
+          len(anomaly.compare({"slow_qps": {"avg": 0.08}},
+                              {"slow_qps": {"avg": 0.01}})), 0)
+
+    # Предельные значения типов для автоинкремента
+    check("предел int без знака",
+          forecast.INT_LIMITS["int"][1], 4294967295)
+    check("порог тревоги в сутках", forecast.CRITICAL_DAYS <= 7, True)
+
+    # Методы отвечают даже без доступной базы
+    for path in ("api/forecast/kemerovo", "api/config-audit/kemerovo",
+                 "api/growth/kemerovo", "api/anomalies/kemerovo",
+                 "api/readiness/kemerovo?action=restart"):
+        r = client.get("/" + path)
+        check("отвечает /" + path.split("?")[0], r.status_code, 200)
+    check("недопустимое действие отклоняется",
+          client.get("/api/readiness/kemerovo?action=drop").status_code, 400)
+
+    deep = client.get("/health/deep").json()
+    check("самопроверка отвечает", isinstance(deep.get("checks"), list), True)
+    check("самопроверка видит проблемы", deep["ok"], False)
 
 
 def websocket(client) -> None:
