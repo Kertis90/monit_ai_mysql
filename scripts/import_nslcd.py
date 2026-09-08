@@ -213,6 +213,16 @@ def main():
         shown = "***" if k.endswith("PASSWORD") and v else (v or "(пусто)")
         print("  %-22s %s" % (k, shown))
 
+    if not values["LDAP_SEARCH_USER"]:
+        print("")
+        print("  В nslcd.conf нет binddn — каталог опрашивается анонимно.")
+        print("  Для входа этого хватит, а вот поиск учёток во вкладке")
+        print("  «Доступы» работать не будет: доступ выдаётся до первого")
+        print("  входа человека, и его пароля у нас ещё нет. Пропишите")
+        print("  вручную сервисную учётку в config.env:")
+        print("    LDAP_SEARCH_USER=\"CN=svc-ldap,OU=Service,DC=company,DC=ru\"")
+        print("    LDAP_SEARCH_PASSWORD=\"...\"")
+
     if not (groups or netgroups):
         print("")
         print("  Ни группы, ни netgroup не заданы — вход будет только по")

@@ -125,8 +125,10 @@ LDAP_SEARCH_USER      = os.environ.get("LDAP_SEARCH_USER", "")
 LDAP_SEARCH_PASSWORD  = os.environ.get("LDAP_SEARCH_PASSWORD", "")
 LDAP_SEARCH_FILTER    = os.environ.get(
     "LDAP_SEARCH_FILTER",
-    "(&(objectClass=user)(|(sAMAccountName=*{query}*)"
-    "(displayName=*{query}*)(mail=*{query}*)))")
+    "(&(|(objectClass=user)(objectClass=posixAccount)"
+    "(objectClass=inetOrgPerson))"
+    "(|(sAMAccountName=*{query}*)(uid=*{query}*)"
+    "(displayName=*{query}*)(cn=*{query}*)(mail=*{query}*)))")
 
 # ── SSO через доверенный обратный прокси ─────────────────────────────────────
 # nginx с Kerberos/SAML/oauth2-proxy аутентифицирует пользователя и передаёт
@@ -825,27 +827,55 @@ def alerts_delete_by_name(name: str) -> int:
 
 
 
-def ldap_search_users(query: str, limit: int = 25) -> list[dict]:
-    """Поиск по каталогу для выбора кандидатов на доступ.
+def login_attr() -> str:
+    """Атрибут имени входа — тот же, по которому проверяется пароль.
 
-    Нужна сервисная учётка (LDAP_SEARCH_USER): пользовательский bind тут
-    не подходит — админ выбирает людей до того, как они впервые вошли.
+    Иначе доступ выдаётся на одно имя, а входит человек под другим: в AD это
+    sAMAccountName, в OpenLDAP — uid.
     """
-    if not (LDAP_ENABLED and LDAP_URL and LDAP_BASE_DN):
-        return []
+    m = re.search(r"\(([A-Za-z]+)=\{username\}\)", LDAP_USER_FILTER or "")
+    return m.group(1) if m else "sAMAccountName"
+
+
+def directory_search_status() -> str:
+    """Пусто — поиск по каталогу доступен. Иначе причина, почему нет.
+
+    Раньше поиск просто исчезал из интерфейса, и администратор видел пустой
+    список без единой подсказки, что чинить.
+    """
+    if not LDAP_ENABLED:
+        return "LDAP выключен: LDAP_ENABLED=false в config.env"
+    if not LDAP_URL:
+        return "не задан LDAP_URL"
+    if not LDAP_BASE_DN:
+        return "не задан LDAP_BASE_DN — неизвестно, в какой ветке искать"
     if not LDAP_SEARCH_USER:
-        logger.error("Поиск по каталогу требует сервисной учётки LDAP_SEARCH_USER")
-        return []
+        return ("не задана сервисная учётка LDAP_SEARCH_USER. Она нужна "
+                "именно здесь: доступ выдаётся до первого входа человека, "
+                "и его пароля у нас ещё нет")
+    return ""
+
+
+def ldap_search_users(query: str, limit: int = 25) -> tuple:
+    """(найденные, ошибка) — поиск кандидатов на выдачу доступа.
+
+    Ошибку возвращаем текстом, а не глотаем: пустой список и неверная
+    настройка выглядят в интерфейсе одинаково, и искать причину негде.
+    """
+    why = directory_search_status()
+    if why:
+        logger.error("Поиск по каталогу недоступен: " + why)
+        return [], why
     q = (query or "").strip()
     if len(q) < 2:
-        return []
+        return [], ""
     try:
         from ldap3 import Server, Connection, Tls, ALL, SUBTREE
         from ldap3.utils.conv import escape_filter_chars
         import ssl as _ssl
     except ImportError:
         logger.error("Поиск по каталогу требует пакета ldap3")
-        return []
+        return [], "не установлен пакет ldap3"
     try:
         safe = escape_filter_chars(q)      # защита от инъекции в LDAP-фильтр
         tls = Tls(validate=_ssl.CERT_REQUIRED if LDAP_TLS_VERIFY else _ssl.CERT_NONE)
@@ -854,16 +884,21 @@ def ldap_search_users(query: str, limit: int = 25) -> list[dict]:
                           password=LDAP_SEARCH_PASSWORD, auto_bind=True,
                           receive_timeout=LDAP_TIMEOUT)
         flt = LDAP_SEARCH_FILTER.replace("{query}", safe)
+        # Порядок важен: сначала атрибут, по которому идёт вход, иначе доступ
+        # будет выдан на имя, под которым человек не входит
+        primary = login_attr()
+        names = [primary] + [a for a in ("sAMAccountName", "uid",
+                                         "userPrincipalName")
+                             if a.lower() != primary.lower()]
         conn.search(LDAP_BASE_DN, flt, search_scope=SUBTREE,
-                    attributes=["sAMAccountName", "userPrincipalName",
-                                "displayName", "cn", "mail"],
+                    attributes=names + ["displayName", "cn", "mail"],
                     size_limit=limit)
         out = []
         for e in conn.entries:
             def attr(name):
                 v = getattr(e, name, None)
                 return str(v) if v and str(v) != "[]" else ""
-            login = attr("sAMAccountName") or attr("userPrincipalName")
+            login = next((attr(n) for n in names if attr(n)), "")
             if not login:
                 continue
             out.append({
@@ -872,10 +907,12 @@ def ldap_search_users(query: str, limit: int = 25) -> list[dict]:
                 "email":        attr("mail"),
             })
         conn.unbind()
-        return out
+        return out, ""
     except Exception as e:
         logger.error(f"Поиск по каталогу не удался: {e}")
-        return []
+        why = ad_reason(str(e))
+        return [], (f"каталог ответил: {why}" if why
+                    else f"{type(e).__name__}: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -4079,8 +4116,10 @@ class GrantRequest(BaseModel):
 @app.get("/api/users", tags=["Доступ"], summary="Список выданных доступов")
 def api_users(request: Request):
     require_admin(request)
+    why = directory_search_status()
     return {"items": users_list(),
-            "ldap_search": bool(LDAP_ENABLED and LDAP_SEARCH_USER)}
+            "ldap_search": not why,
+            "ldap_search_reason": why}
 
 
 @app.post("/api/users")
@@ -4106,11 +4145,11 @@ def api_users_revoke(username: str, request: Request, hard: bool = False):
 def api_directory_search(request: Request, q: str = "", limit: int = 25):
     """Поиск в AD, чтобы выдавать доступ выбором из списка, а не вводом руками."""
     require_admin(request)
-    found   = ldap_search_users(q, min(limit, 100))
+    found, err = ldap_search_users(q, min(limit, 100))
     granted = {u["username"] for u in users_list() if u["enabled"]}
     for f in found:
         f["already_granted"] = f["username"] in granted
-    return {"items": found, "query": q}
+    return {"items": found, "query": q, "error": err}
 
 
 @app.get("/report", response_class=HTMLResponse)

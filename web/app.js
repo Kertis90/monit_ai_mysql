@@ -630,8 +630,19 @@ const App = (() => {
       }
       const d = await r.json();
 
-      // Поиск по каталогу доступен только с сервисной учёткой LDAP
-      $('dir-search-box').style.display = d.ldap_search ? '' : 'none';
+      // Раньше блок поиска просто прятался, и админ видел пустой список без
+      // единой подсказки. Теперь он на месте, но с причиной.
+      const why = d.ldap_search_reason || '';
+      $('dir-query').disabled      = !!why;
+      $('dir-search-btn').disabled = !!why;
+      $('dir-results').innerHTML = why
+        ? '<div class="muted" style="font-size:12px;line-height:1.5">' +
+          'Поиск по каталогу недоступен: ' + esc(why) + '.<br>' +
+          'Поправьте <code>config.env</code> (или запустите ' +
+          '<code>sudo ./scripts/import_nslcd.py --write</code>) и переустановите ' +
+          'агента: <code>sudo ./scripts/install_agent.sh</code>.<br>' +
+          'Пока можно выдать доступ по логину вручную — форма ниже.</div>'
+        : '';
 
       if (!d.items.length) {
         box.innerHTML = '<div class="muted">Пока никому не выдан. ' +
@@ -667,7 +678,15 @@ const App = (() => {
     try {
       const r = await fetch('api/directory/search?q=' + encodeURIComponent(q));
       const d = await r.json();
-      if (!d.items.length) { box.innerHTML = '<div class="muted">Никого не найдено.</div>'; return; }
+      if (d.error) {
+        box.innerHTML = '<div class="muted">Поиск не выполнен: ' + esc(d.error) + '</div>';
+        return;
+      }
+      if (!d.items.length) {
+        box.innerHTML = '<div class="muted">Никого не найдено по запросу «' +
+                        esc(q) + '».</div>';
+        return;
+      }
       box.innerHTML = d.items.map(u => `
         <div class="alert-item" style="display:flex;align-items:center;gap:12px">
           <div style="flex:1">

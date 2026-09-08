@@ -101,7 +101,8 @@
           <input id="dir-query" type="text" placeholder="Поиск в каталоге: фамилия, логин или почта"
                  style="flex:1;padding:9px 12px;border-radius:8px;border:1px solid var(--border,#2b313c);
                         background:var(--bg,#12151b);color:inherit;font:inherit">
-          <button class="ghost-btn" onclick="App.searchDirectory()">Найти</button>
+          <button class="ghost-btn" id="dir-search-btn"
+                  onclick="App.searchDirectory()">Найти</button>
         </div>
         <div id="dir-results"></div>
       </div>
