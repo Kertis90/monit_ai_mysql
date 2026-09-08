@@ -31,7 +31,7 @@ except ImportError:
     sys.exit(1)
 
 import ssl
-from ldap3 import Server, Connection, Tls, ALL, SUBTREE
+from ldap3 import Server, Connection, Tls, ALL, SUBTREE, BASE
 from ldap3.utils.conv import escape_filter_chars
 
 # Та же таблица, что в agent.py: AD прячет причину в тексте ошибки
@@ -138,8 +138,7 @@ def find_user_dn(cfg: dict, username: str):
     flt = cfg.get("LDAP_USER_FILTER", "(sAMAccountName={username})").format(
         username=escape_filter_chars(username))
     try:
-        conn.search(cfg["LDAP_BASE_DN"], flt, search_scope=SUBTREE,
-                    attributes=["distinguishedName"])
+        conn.search(cfg["LDAP_BASE_DN"], flt, search_scope=SUBTREE)
         if not conn.entries:
             return None, "по фильтру %s никого не найдено" % flt
         return str(conn.entries[0].entry_dn), ""
@@ -170,15 +169,15 @@ def check_groups(cfg: dict, username: str, conn) -> None:
         # Сначала проверяем, что такая группа вообще есть: опечатка в DN
         # выглядит точно так же, как отсутствие членства
         try:
-            conn.search(base,
-                        "(distinguishedName=%s)" % escape_filter_chars(grp),
-                        search_scope=SUBTREE, attributes=["cn"])
+            conn.search(grp, "(objectClass=*)", search_scope=BASE,
+                        attributes=["cn"])
             if not conn.entries:
                 print("  [нет] %s" % grp)
                 print("        группы с таким DN нет — проверьте строку целиком")
                 continue
         except Exception as e:
-            print("  [?]   %s — не удалось проверить: %s" % (grp, e))
+            print("  [нет] %s" % grp)
+            print("        объект по этому DN не читается: %s" % str(e)[:120])
             continue
         try:
             conn.search(base,
@@ -188,7 +187,11 @@ def check_groups(cfg: dict, username: str, conn) -> None:
             mark = "[да]  входит      " if conn.entries else "[--]  не входит   "
             print("  %s %s" % (mark, grp))
         except Exception as e:
-            print("  [?]   %s — ошибка проверки: %s" % (grp, e))
+            print("  [?]   %s — проверить не удалось: %s" % (grp, str(e)[:120]))
+            if "memberOf" in str(e):
+                print("        В каталоге нет атрибута memberOf (в OpenLDAP")
+                print("        он даёт overlay memberof). Используйте")
+                print("        LDAP_ALLOWED_NETGROUPS вместо групп.")
 
 
 # (хост,пользователь,домен). Пустое поле пользователя по правилам NIS —

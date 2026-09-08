@@ -123,12 +123,10 @@ LDAP_TIMEOUT          = max(1, int(float(os.environ.get("LDAP_TIMEOUT") or 8)))
 # Пользовательский bind тут не годится: доступ выдают ДО первого входа.
 LDAP_SEARCH_USER      = os.environ.get("LDAP_SEARCH_USER", "")
 LDAP_SEARCH_PASSWORD  = os.environ.get("LDAP_SEARCH_PASSWORD", "")
-LDAP_SEARCH_FILTER    = os.environ.get(
-    "LDAP_SEARCH_FILTER",
-    "(&(|(objectClass=user)(objectClass=posixAccount)"
-    "(objectClass=inetOrgPerson))"
-    "(|(sAMAccountName=*{query}*)(uid=*{query}*)"
-    "(displayName=*{query}*)(cn=*{query}*)(mail=*{query}*)))")
+# Пусто — фильтр собирается на месте из атрибутов, которые есть в схеме
+# сервера. Жёсткий фильтр под AD ронял поиск в OpenLDAP: ldap3 сверяет имена
+# атрибутов со схемой и на sAMAccountName выдавал LDAPAttributeError.
+LDAP_SEARCH_FILTER    = os.environ.get("LDAP_SEARCH_FILTER", "").strip()
 
 # ── SSO через доверенный обратный прокси ─────────────────────────────────────
 # nginx с Kerberos/SAML/oauth2-proxy аутентифицирует пользователя и передаёт
@@ -480,6 +478,19 @@ def ldap_matched_groups(username: str, conn=None) -> list:
     # 1.2.840.113556.1.4.1941 — правило AD «член в том числе через вложенность».
     # Без него пользователь во вложенной группе выглядит как посторонний,
     # а вложенные группы в AD встречаются постоянно.
+    known = schema_attrs(conn)
+    if known and "memberof" not in known:
+        logger.warning(
+            "В схеме каталога нет memberOf — проверка групп пропущена. "
+            "Так бывает в OpenLDAP без overlay memberof; используйте "
+            "LDAP_ALLOWED_NETGROUPS")
+        if own_conn:
+            try:
+                conn.unbind()
+            except Exception:
+                pass
+        return []
+
     rule = ":1.2.840.113556.1.4.1941:" if LDAP_NESTED_GROUPS else ""
     safe = escape_filter_chars(username)
     matched = []
@@ -834,6 +845,38 @@ def alerts_delete_by_name(name: str) -> int:
 
 
 
+def schema_attrs(conn) -> set:
+    """Имена атрибутов, известные серверу, в нижнем регистре.
+
+    Пустое множество означает «схему прочитать не удалось» — тогда ничего
+    не отфильтровываем, чтобы не отрезать лишнего.
+    """
+    try:
+        out = set()
+        for key, val in (conn.server.schema.attribute_types or {}).items():
+            out.add(str(key).lower())
+            for alias in (getattr(val, "name", None) or ()):
+                out.add(str(alias).lower())
+        return out
+    except Exception:
+        return set()
+
+
+# По этим атрибутам ищем человека: логин в AD и в OpenLDAP называется
+# по-разному, а искать хочется и по имени, и по почте
+SEARCH_ATTRS = ("sAMAccountName", "uid", "cn", "displayName", "mail")
+
+
+def build_search_filter(known: set, safe_query: str) -> str:
+    """Фильтр поиска только из тех атрибутов, что есть в схеме."""
+    usable = [a for a in SEARCH_ATTRS
+              if not known or a.lower() in known] or ["cn"]
+    # objectClass есть всегда; значения, которых в каталоге нет, просто
+    # ни с чем не совпадут, поэтому перечисляем варианты для AD и OpenLDAP
+    return ("(&(|(objectClass=person)(objectClass=posixAccount))(|"
+            + "".join("(%s=*%s*)" % (a, safe_query) for a in usable) + "))")
+
+
 def login_attr() -> str:
     """Атрибут имени входа — тот же, по которому проверяется пароль.
 
@@ -889,16 +932,26 @@ def ldap_search_users(query: str, limit: int = 25) -> tuple:
                 Connection(server, user=LDAP_SEARCH_USER,
                            password=LDAP_SEARCH_PASSWORD, auto_bind=True,
                            receive_timeout=LDAP_TIMEOUT))
-        flt = LDAP_SEARCH_FILTER.replace("{query}", safe)
+        known = schema_attrs(conn)
+        flt = (LDAP_SEARCH_FILTER.replace("{query}", safe)
+               if LDAP_SEARCH_FILTER else build_search_filter(known, safe))
         # Порядок важен: сначала атрибут, по которому идёт вход, иначе доступ
         # будет выдан на имя, под которым человек не входит
         primary = login_attr()
         names = [primary] + [a for a in ("sAMAccountName", "uid",
                                          "userPrincipalName")
                              if a.lower() != primary.lower()]
+        # Запрашивать атрибут, которого нет в схеме, нельзя: ldap3 сверяет
+        # имена и бросает LDAPAttributeError ещё до отправки запроса
+        names = [a for a in names if not known or a.lower() in known]
+        if not names:
+            return [], ("в схеме каталога нет ни одного из атрибутов имени "
+                        "(%s) — укажите свой LDAP_USER_FILTER"
+                        % ", ".join((primary, "sAMAccountName", "uid")))
+        extra = [a for a in ("displayName", "cn", "mail")
+                 if not known or a.lower() in known]
         conn.search(LDAP_BASE_DN, flt, search_scope=SUBTREE,
-                    attributes=names + ["displayName", "cn", "mail"],
-                    size_limit=limit)
+                    attributes=names + extra, size_limit=limit)
         out = []
         for e in conn.entries:
             def attr(name):
