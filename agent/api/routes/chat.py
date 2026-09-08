@@ -14,7 +14,7 @@ from fastapi import (APIRouter, HTTPException, Request, WebSocket,
                      WebSocketDisconnect)
 from fastapi.responses import JSONResponse
 
-from agent.api.deps import AdminUser, Chats, Feedbacks, MaybeUser
+from agent.api.deps import AdminUser, Alerts, Chats, Feedbacks, MaybeUser
 from agent.core.config import settings
 from agent.db.base import session_scope
 from agent.db.repositories.chats import ChatRepository, FeedbackRepository
@@ -501,3 +501,39 @@ async def add_feedback(req: FeedbackRequest, request: Request,
 async def feedback_stats(admin: AdminUser, feedbacks: Feedbacks,
                          days: int = 30):
     return await feedbacks.stats(days)
+
+
+@router.get("/api/search", summary="Поиск по переписке и событиям")
+async def search(request: Request, chats: Chats, alerts: Alerts,
+                 q: str = "", client_id: str = "", limit: int = 30):
+    """Чатов и инцидентов со временем становится много, и найти нужное
+    прокруткой невозможно. Ищем сразу в обоих местах."""
+    text = (q or "").strip()
+    if len(text) < 2:
+        raise HTTPException(status_code=400,
+                            detail="Запрос должен быть не короче двух символов")
+    key = await chat_key(request, client_id)
+    found_chats = await chats.search(key, text, limit=limit) if key else []
+    found_alerts = await alerts.search(text, limit=limit)
+    return {
+        "query": text,
+        "messages": found_chats,
+        "alerts": [{"id": a.id, "ts": a.ts, "alert": a.alert,
+                    "cluster": a.cluster, "cluster_label": a.cluster_label,
+                    "severity": a.severity, "summary": a.summary,
+                    "resolution": a.resolution} for a in found_alerts],
+    }
+
+
+async def broadcast(payload: dict) -> None:
+    """Разослать событие всем открытым вкладкам.
+
+    Отдельного канала не заводим: сокет чата уже открыт у каждого, кто
+    смотрит интерфейс. Мониторинг, в котором новое событие не появляется
+    само, а ждёт нажатия «Обновить», — это справочник, а не монитор.
+    """
+    for client in list(ws_clients):
+        try:
+            await client.send_json(payload)
+        except Exception:
+            ws_clients.discard(client)

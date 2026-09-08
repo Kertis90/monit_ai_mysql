@@ -134,3 +134,22 @@ class AlertRepository:
             logger.info("Удалено старых алертов: %d (хранение %d дн.)",
                         removed, settings.db.alerts_retention_days)
         return removed
+
+    async def search(self, text: str, *, days: int = 365,
+                     limit: int = 50) -> Sequence[Alert]:
+        """Поиск по событиям: имя, описание, разбор, решение.
+
+        LIKE, а не полнотекстовый индекс: событий тысячи, не миллионы, а
+        полнотекстовый поиск в SQLite и MySQL настраивается по-разному —
+        одинаковое поведение важнее скорости на таком объёме.
+        """
+        needle = "%" + (text or "").strip().lower() + "%"
+        stmt = (select(Alert)
+                .where(Alert.ts >= cutoff_iso(days))
+                .where(func.lower(func.coalesce(Alert.alert, "")).like(needle)
+                       | func.lower(func.coalesce(Alert.summary, "")).like(needle)
+                       | func.lower(func.coalesce(Alert.analysis, "")).like(needle)
+                       | func.lower(func.coalesce(Alert.resolution, "")).like(needle))
+                .order_by(Alert.ts.desc())
+                .limit(limit))
+        return (await self.session.execute(stmt)).scalars().all()

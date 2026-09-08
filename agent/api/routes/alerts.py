@@ -94,6 +94,11 @@ async def ingest(payload: IngestAlert, alerts: Alerts):
                      severity=severity, summary=summary, analysis=analysis,
                      source=payload.source.strip().lower() or "api")
     logger.info("Принято событие из %s: %s (%s)", payload.source, name, severity)
+    # Открытые вкладки узнают о событии сразу, а не по нажатию «Обновить»
+    from agent.api.routes.chat import broadcast
+    await broadcast({"type": "alert", "alert": name, "severity": severity,
+                     "cluster": label, "summary": summary,
+                     "source": payload.source})
     return {"ok": True, "alert": name, "severity": severity,
             "cluster": cluster["name"] if cluster else None,
             "source": payload.source,

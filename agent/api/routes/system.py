@@ -114,6 +114,10 @@ async def webhook(request: Request, alerts: Alerts):
         await alerts.add(alert=name, cluster=cname, cluster_label=label,
                          instance=instance, severity=severity, summary=summary,
                          analysis=analysis, source="prometheus")
+        from agent.api.routes.chat import broadcast
+        await broadcast({"type": "alert", "alert": name, "severity": severity,
+                         "cluster": label, "summary": summary,
+                         "source": "prometheus"})
         processed += 1
 
     return {"processed": processed}

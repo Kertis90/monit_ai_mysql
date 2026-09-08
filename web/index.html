@@ -46,6 +46,11 @@
       <div class="tab active" data-tab="chat"   onclick="App.showTab('chat')">💬 Чат</div>
       <div class="tab"        data-tab="status" onclick="App.showTab('status')">📊 Статус</div>
       <div class="tab"        data-tab="alerts" onclick="App.showTab('alerts')">🔔 Алерты <span class="alert-count" id="alert-count"></span></div>
+      <div class="tab"        data-tab="cluster" id="tab-btn-cluster"
+           style="display:none" onclick="App.showTab('cluster')">🖥 Кластер</div>
+      <div class="tab"        data-tab="logs"   onclick="App.showTab('logs')">📄 Логи</div>
+      <div class="tab"        data-tab="sql"    onclick="App.showTab('sql')">🗄 SQL</div>
+      <div class="tab"        data-tab="search" onclick="App.showTab('search')">🔍 Поиск</div>
       <div class="tab" data-tab="access" id="tab-btn-access" style="display:none"
            onclick="App.showTab('access')">🔑 Доступы</div>
       <div class="tab" data-tab="audit" id="tab-btn-audit" style="display:none"
@@ -108,6 +113,83 @@
     <section id="tab-alerts" class="tab-pane alerts-pane" hidden>
       <div id="alerts-content"><div class="muted">Загрузка…</div></div>
       <button class="ghost-btn" onclick="App.loadAlerts()">↻ Обновить</button>
+    </section>
+
+    <!-- ── КЛАСТЕР: всё, что агент собирает для разбора, одним экраном ── -->
+    <section id="tab-cluster" class="tab-pane pad-pane" hidden>
+      <div class="pane-head">
+        <h3 id="cluster-head">Кластер</h3>
+        <div class="pane-actions">
+          <select id="cluster-hours" onchange="App.loadClusterPage()">
+            <option value="1">за час</option>
+            <option value="3" selected>за 3 часа</option>
+            <option value="12">за 12 часов</option>
+            <option value="24">за сутки</option>
+          </select>
+          <button class="ghost-btn" onclick="App.loadClusterPage()">↻ Обновить</button>
+          <button class="ghost-btn" onclick="App.askAboutCluster()">Спросить агента</button>
+        </div>
+      </div>
+      <div id="cluster-body"><div class="muted">Выберите кластер слева.</div></div>
+    </section>
+
+    <!-- ── ЛОГИ ── -->
+    <section id="tab-logs" class="tab-pane pad-pane" hidden>
+      <div class="pane-head">
+        <h3>Логи серверов</h3>
+        <div class="pane-actions">
+          <select id="logs-cluster"></select>
+          <select id="logs-kind">
+            <option value="all">slow-лог и ядро</option>
+            <option value="slow">только slow-лог</option>
+            <option value="app">только ядро</option>
+          </select>
+          <select id="logs-hours">
+            <option value="1">за час</option>
+            <option value="2" selected>за 2 часа</option>
+            <option value="6">за 6 часов</option>
+            <option value="24">за сутки</option>
+          </select>
+          <input id="logs-filter" type="text" placeholder="строка поиска (необязательно)">
+          <button class="ghost-btn" onclick="App.loadLogs()">Показать</button>
+        </div>
+      </div>
+      <p class="muted small">Файлы выбираются по времени изменения, архивы читаются
+         на месте через zgrep — целиком лог никогда не выкачивается.</p>
+      <pre id="logs-out" class="output">Выберите кластер и период.</pre>
+    </section>
+
+    <!-- ── SQL ── -->
+    <section id="tab-sql" class="tab-pane pad-pane" hidden>
+      <div class="pane-head">
+        <h3>SQL-запрос</h3>
+        <div class="pane-actions">
+          <select id="sql-cluster"></select>
+          <select id="sql-template" onchange="App.useTemplate(this.value)">
+            <option value="">готовые запросы…</option>
+          </select>
+          <button class="ghost-btn" onclick="App.runSql()">Выполнить</button>
+        </div>
+      </div>
+      <p class="muted small">Только чтение: SELECT, SHOW, EXPLAIN, DESCRIBE.
+         Запрет проверяется до отправки, каждый запрос попадает в журнал действий.</p>
+      <textarea id="sql-text" rows="5" placeholder="SELECT ..."></textarea>
+      <div id="sql-history" class="sql-history"></div>
+      <div id="sql-out"></div>
+    </section>
+
+    <!-- ── ПОИСК ── -->
+    <section id="tab-search" class="tab-pane pad-pane" hidden>
+      <div class="pane-head">
+        <h3>Поиск</h3>
+        <div class="pane-actions">
+          <input id="search-q" type="text" placeholder="слово из переписки или события">
+          <button class="ghost-btn" onclick="App.runSearch()">Найти</button>
+        </div>
+      </div>
+      <p class="muted small">Ищется и по вашим чатам, и по истории событий вместе
+         с разборами и записанными решениями.</p>
+      <div id="search-out"></div>
     </section>
 
     <section id="tab-access" class="tab-pane" hidden>

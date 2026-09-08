@@ -244,6 +244,7 @@ def application() -> None:
         extras(c)
         websocket(c)
         threads(c)
+        gui_endpoints(c)
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -359,6 +360,33 @@ def threads(client) -> None:
     check("в списке его больше нет",
           any(t["id"] == created["id"]
               for t in client.get("/chat/threads").json()["items"]), False)
+
+
+def gui_endpoints(client) -> None:
+    """Данные для новых экранов интерфейса."""
+    # Поиск идёт и по переписке, и по событиям
+    found = client.get("/api/search?q=DiskLow").json()
+    check("поиск находит событие",
+          any(a["alert"] == "DiskLow" for a in found["alerts"]), True)
+    check("короткий запрос отклоняется",
+          client.get("/api/search?q=a").status_code, 400)
+
+    # Готовые запросы для вкладки SQL
+    tpl = client.get("/api/diagnostics/templates").json()["items"]
+    check("шаблоны запросов отдаются", len(tpl) > 3, True)
+    check("у шаблона есть текст запроса",
+          all(t["sql"] and t["title"] for t in tpl), True)
+
+    # Профиль и репликация: без базы возвращают понятную причину, а не падают
+    load = client.get("/api/workload/kemerovo").json()
+    check("профиль нагрузки отвечает", "error" in load or "queries" in load, True)
+    repl = client.get("/api/replication/kemerovo").json()
+    check("состояние репликации отвечает", "items" in repl, True)
+    check("несуществующий кластер", client.get("/api/workload/нет").status_code, 404)
+
+    # Логи: сервера нет, но ответ должен быть осмысленным
+    logs = client.get("/api/logs/kemerovo?hours=1&kind=slow").json()
+    check("логи отвечают текстом", isinstance(logs.get("text"), str), True)
 
 
 def websocket(client) -> None:

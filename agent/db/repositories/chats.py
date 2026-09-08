@@ -155,6 +155,21 @@ class ChatRepository:
             stmt = stmt.where(ChatMessage.session_id == thread_id)
         return int((await self.session.execute(stmt)).rowcount or 0)
 
+    async def search(self, owner: str, text: str,
+                     limit: int = 50) -> list[dict]:
+        """Поиск по своей переписке с указанием, в каком чате нашлось."""
+        needle = "%" + (text or "").strip().lower() + "%"
+        stmt = (select(ChatMessage.ts, ChatMessage.role, ChatMessage.content,
+                       ChatThread.id, ChatThread.title)
+                .join(ChatThread, ChatThread.id == ChatMessage.session_id)
+                .where(ChatThread.owner == owner,
+                       func.lower(ChatMessage.content).like(needle))
+                .order_by(desc(ChatMessage.ts))
+                .limit(limit))
+        return [{"ts": r[0], "role": r[1], "content": r[2],
+                 "thread_id": r[3], "thread_title": r[4]}
+                for r in (await self.session.execute(stmt)).all()]
+
     async def purge_old(self) -> int:
         stmt = delete(ChatMessage).where(
             ChatMessage.ts < cutoff_iso(settings.db.chats_retention_days))

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import logging
 
 from fastapi import APIRouter, HTTPException, Request
@@ -9,12 +10,19 @@ from fastapi import APIRouter, HTTPException, Request
 from agent.api.deps import Audit, CurrentUser, MaybeUser
 from agent.services import audit
 from agent.schemas.api import SqlRequest, SqlResult
-from agent.services.analysis import (collect_series_table, explain_top_queries,
-                                     fmt_diagnostics, run_diagnostics)
+from agent.services.analysis import (DIAG_QUERIES, collect_series_table,
+                                     explain_top_queries, fmt_diagnostics,
+                                     run_diagnostics)
+from agent.services.logs import read_app_log, read_slow_log
+from agent.services.replication import collect_replication, fmt_replication
+from agent.services.ssh import remote_time
+from agent.services.workload import (DEFAULT_WINDOW_S, fmt_workload,
+                                     workload_delta)
 from agent.services.mysql import db_versions_text, sql_execute
 from agent.services.prometheus import (build_charts, collect_current,
                                        collect_history)
-from agent.services.registry import enabled_clusters, find_cluster
+from agent.services.registry import (app_host, cluster_hosts,
+                                     enabled_clusters, find_cluster)
 
 logger = logging.getLogger("agent.api.clusters")
 router = APIRouter(tags=["Кластеры"])
@@ -98,3 +106,82 @@ async def diagnose(name: str, user: CurrentUser, deep: bool = False):
     if deep:
         text += "\n\n" + await explain_top_queries(cluster)
     return {"cluster": name, "report": text}
+
+
+@router.get("/api/workload/{name}", tags=["Диагностика"],
+            summary="Что нагружает базу прямо сейчас")
+async def workload(name: str, user: CurrentUser, seconds: float = 0,
+                   host: str = ""):
+    """Два среза performance_schema с интервалом и разница между ними.
+
+    Именно разница: накопленные суммы показывают средние за всё время работы
+    сервера и текущую проблему прячут.
+    """
+    data = await workload_delta(_need(name), seconds or DEFAULT_WINDOW_S,
+                                host or None)
+    if not data.get("error"):
+        data["text"] = fmt_workload(data, name)
+    return data
+
+
+@router.get("/api/replication/{name}", tags=["Диагностика"],
+            summary="Состояние репликации кластера")
+async def replication(name: str, user: CurrentUser):
+    cluster = _need(name)
+    states = await collect_replication(cluster)
+    return {"cluster": name, "items": states,
+            "text": fmt_replication(states, cluster["label"])}
+
+
+@router.get("/api/logs/{name}", tags=["Диагностика"],
+            summary="Slow-лог и логи ядра за период")
+async def logs(name: str, user: CurrentUser, hours: float = 2,
+               filter: str = "", kind: str = "all"):
+    """kind: slow — только slow-лог, app — только ядро, all — оба.
+
+    Период приводится ко времени того сервера, с которого читаем: пояса
+    различаются, и grep пошёл бы не по тем датам.
+    """
+    cluster = _need(name)
+    hours = max(0.25, min(float(hours), 48.0))
+    parts = []
+
+    if kind in ("all", "slow"):
+        for ip, role in cluster_hosts(cluster):
+            moment = await remote_time(ip)
+            if moment is None:
+                parts.append("### %s (%s)\n  Сервер не отвечает по SSH." % (ip, role))
+                continue
+            until, since = moment["epoch"], moment["epoch"] - hours * 3600
+            local_until = moment["local"]
+            local_since = local_until - datetime.timedelta(hours=hours)
+            text = await read_slow_log(cluster, ip, local_since, local_until,
+                                       filter, since, until)
+            if text:
+                parts.append(text)
+
+    if kind in ("all", "app"):
+        host = app_host(cluster)
+        moment = await remote_time(host)
+        if moment is None:
+            parts.append("### Ядро (%s)\n  Сервер не отвечает по SSH." % host)
+        else:
+            until, since = moment["epoch"], moment["epoch"] - hours * 3600
+            local_until = moment["local"]
+            local_since = local_until - datetime.timedelta(hours=hours)
+            text = await read_app_log(cluster, host, local_since, local_until,
+                                      filter, since, until)
+            if text:
+                parts.append(text)
+
+    return {"cluster": name, "hours": hours, "filter": filter,
+            "text": "\n\n".join(parts) or "За этот период записей не найдено."}
+
+
+@router.get("/api/diagnostics/templates", tags=["Диагностика"],
+            summary="Готовые диагностические запросы")
+async def templates(user: CurrentUser):
+    """Набор из документации MySQL — чтобы не писать их по памяти."""
+    return {"items": [{"key": q["key"], "title": q["title"],
+                       "why": q.get("why", ""), "sql": q["sql"].strip()}
+                      for q in DIAG_QUERIES]}

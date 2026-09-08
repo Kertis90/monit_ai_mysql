@@ -749,3 +749,191 @@ textarea#input:disabled { opacity: .55; }
 .layout.clusters-collapsed .collapse-btn { transform: rotate(180deg); }
 
 .sidebar { transition: width .18s ease; }
+
+/* ── Общие элементы новых вкладок ────────────────────────────────── */
+
+.pad-pane { padding: 18px 22px; overflow-y: auto; }
+
+.pane-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.pane-head h3 { margin: 0; font-size: 15px; color: var(--text-hl); }
+
+.pane-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.pane-actions select,
+.pane-actions input,
+#sql-text {
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+}
+.pane-actions input { min-width: 220px; }
+
+#sql-text {
+  width: 100%;
+  font-family: var(--mono);
+  margin: 10px 0 8px;
+  resize: vertical;
+}
+
+.small { font-size: 12px; margin: 4px 0 12px; line-height: 1.5; }
+
+.output {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 62vh;
+  overflow: auto;
+}
+
+/* Таблица результата запроса. Горизонтальная прокрутка внутри рамки:
+   широкий результат не должен растягивать всю страницу. */
+.res-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; }
+.res-table { border-collapse: collapse; width: 100%; font-size: 12px; }
+.res-table th, .res-table td {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  white-space: nowrap;
+  font-family: var(--mono);
+}
+.res-table th { background: var(--surface2); color: var(--text-hl); position: sticky; top: 0; }
+.res-table tr:hover td { background: var(--surface); }
+
+.sql-history { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+.sql-history button {
+  max-width: 340px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 4px 9px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  cursor: pointer;
+}
+.sql-history button:hover { color: var(--text-hl); border-color: var(--border-hl); }
+
+/* ── Страница кластера ───────────────────────────────────────────── */
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin-bottom: 12px;
+}
+.card h4 {
+  margin: 0 0 10px;
+  font-size: 13px;
+  color: var(--text-hl);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+.card .lazy { font-size: 12px; }
+
+.tiles { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+.tile {
+  flex: 1 1 130px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+.tile .k { font-size: 11px; color: var(--muted); }
+.tile .v { font-size: 18px; color: var(--text-hl); margin-top: 2px; }
+.tile.warn .v { color: var(--yellow); }
+.tile.bad  .v { color: var(--red); }
+.tile.good .v { color: var(--green); }
+
+/* ── Действия на событии ─────────────────────────────────────────── */
+
+.alert-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.alert-actions button {
+  padding: 4px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+.alert-actions button:hover { color: var(--text-hl); border-color: var(--accent); }
+
+/* ── Чем пользовался агент ───────────────────────────────────────── */
+
+.tools-used {
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+.tool-chip {
+  font-size: 10.5px;
+  padding: 2px 7px;
+  border-radius: 20px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+
+/* ── Всплывающее уведомление о новом событии ─────────────────────── */
+
+.toast-box {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.toast {
+  background: var(--surface2);
+  border: 1px solid var(--border-hl);
+  border-left: 3px solid var(--accent);
+  border-radius: 9px;
+  padding: 10px 14px;
+  max-width: 340px;
+  font-size: 12.5px;
+  cursor: pointer;
+  box-shadow: 0 6px 20px rgba(0,0,0,.4);
+}
+.toast.critical { border-left-color: var(--red); }
+.toast.warning  { border-left-color: var(--yellow); }
+.toast .t-title { color: var(--text-hl); margin-bottom: 3px; }
+.toast .t-sub   { color: var(--muted); font-size: 11.5px; }
+
+.cname { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.ask-btn {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 0 2px;
+  opacity: 0;
+  transition: opacity .15s;
+}
+.cluster-card:hover .ask-btn { opacity: 1; }
+.ask-btn:hover { color: var(--accent); }

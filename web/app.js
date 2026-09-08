@@ -20,6 +20,8 @@ const App = (() => {
     threads:       [],     // чаты владельца
     threadId:      null,   // текущий чат
     clusters:      [],
+    clusterName:   null,   // открытый на вкладке «Кластер»
+    templates:     [],     // готовые диагностические запросы
     currentTab:    'chat',
     streamingEl:   null,   // элемент .msg-body куда стримятся токены
     streamBuf:     '',     // сырой текст ответа до разметки
@@ -366,6 +368,24 @@ const App = (() => {
       case 'pong':
         break;
 
+      case 'tools':
+        // Показываем, чем агент пользовался: видно, на чём основан ответ
+        if (state.streamingEl && msg.used && msg.used.length) {
+          const wrap = document.createElement('div');
+          wrap.className = 'tools-used';
+          wrap.innerHTML = msg.used.map(t =>
+            '<span class="tool-chip">' + esc(TOOL_NAMES[t] || t) + '</span>').join('');
+          state.streamingEl.parentElement.appendChild(wrap);
+        }
+        break;
+
+      case 'alert':
+        // Событие пришло, пока вкладка открыта — показываем сразу
+        showToast(msg);
+        bumpAlertCount();
+        if (state.currentTab === 'alerts') loadAlerts();
+        break;
+
       case 'context': {
         // Сервер мог завести чат сам (первое сообщение) или переименовать
         if (msg.thread_id && msg.thread_id !== state.threadId) {
@@ -579,8 +599,12 @@ const App = (() => {
     }
     list.innerHTML = state.clusters.map(c => `
       <div class="cluster-card" id="cc-${c.name}"
-           onclick="App.pickCluster('${c.name}')">
-        <div class="cname">${esc(c.label)}</div>
+           onclick="App.openCluster('${c.name}')"
+           title="Открыть метрики и диагностику кластера">
+        <div class="cname">${esc(c.label)}
+          <button class="ask-btn" title="Спросить о нём в чате"
+                  onclick="event.stopPropagation();App.pickCluster('${c.name}')">💬</button>
+        </div>
         <div class="cmeta">${esc(c.primary_ip)}${c.replica_ip ? ' · ' + esc(c.replica_ip) : ''}</div>
         ${c.description ? `<div class="cdesc">${esc(c.description)}</div>` : ''}
         <div class="cbadges" id="cb-${c.name}">
@@ -650,7 +674,12 @@ const App = (() => {
   const TAB_LOADERS = { status: () => loadStatus(),
                         alerts: () => loadAlerts(),
                         access: () => loadAccess(),
-                        audit:  () => loadAudit() };
+                        audit:  () => loadAudit(),
+                        cluster: () => loadClusterPage(),
+                        logs:   () => { fillClusterSelects(); },
+                        sql:    () => { fillClusterSelects(); loadTemplates();
+                                        renderSqlHistory(); },
+                        search: () => $('search-q').focus() };
 
   function showTab(tab) {
     state.currentTab = tab;
@@ -763,7 +792,7 @@ const App = (() => {
             <span class="mini-badge ${it.severity === 'critical' ? 'crit' : 'warn'}">${esc(it.severity)}</span>
             <span class="src-badge" title="Источник алерта">${esc(srcLabel(it.source))}</span>
           </div>
-          <div class="ameta">${esc(it.cluster_label || it.instance)} · ${esc((it.timestamp||'').replace('T',' ').slice(0,19))} UTC</div>
+          <div class="ameta">${esc(it.cluster_label || it.instance)} · ${esc(String(it.ts || it.timestamp || '').replace('T',' ').slice(0,19))} UTC</div>
           <div class="asummary">${esc(it.summary)}</div>
           <button class="expand-link" onclick="App.toggleAnalysis(${i}, this)">▸ Анализ ИИ</button>
           ${it.id ? `<button class="expand-link" style="margin-left:12px"
@@ -771,6 +800,14 @@ const App = (() => {
              title="Записать, чем закончился инцидент">✎ ${it.resolution ? 'Решение записано' : 'Записать решение'}</button>` : ''}
           ${state.isAdmin && it.id ? `<button class="expand-link" style="margin-left:12px"
              onclick="App.deleteAlert(${it.id})" title="Удалить ложное срабатывание">✕ Удалить</button>` : ''}
+          <div class="alert-actions">
+            <button onclick="App.analyzeAlert('${esc(it.alert)}','${esc(it.cluster_label || '')}','${esc(it.ts || '')}')"
+                    title="Задать агенту вопрос по этому событию">Разобрать в чате</button>
+            <button onclick="App.similarIncidents('${esc(it.alert)}','${esc(it.cluster || '')}')"
+                    title="Прошлые случаи с записанными решениями">Похожие случаи</button>
+            ${it.cluster ? `<button onclick="App.openCluster('${esc(it.cluster)}')"
+                    title="Метрики и диагностика этого кластера">Метрики кластера</button>` : ''}
+          </div>
           ${it.resolution ? `<div class="resolution"><b>Что помогло:</b> ${esc(it.resolution)}${
              it.resolved_by ? ' <span class="muted">— ' + esc(it.resolved_by) + '</span>' : ''}</div>` : ''}
           <div class="analysis-box" id="ab-${i}">${esc(it.analysis)}</div>
@@ -1411,6 +1448,390 @@ const App = (() => {
 
   // ═══ УТИЛИТЫ ════════════════════════════════════════════════════
 
+  // ═══ СТРАНИЦА КЛАСТЕРА ═════════════════════════════════════════
+  // Всё, что агент собирает для разбора, показано человеку напрямую:
+  // раньше это существовало только внутри ответа в чате.
+
+  function clusterHours() {
+    return parseFloat(($('cluster-hours') || {}).value || '3');
+  }
+
+  async function openCluster(name) {
+    state.clusterName = name;
+    $('tab-btn-cluster').style.display = '';
+    showTab('cluster');
+    await loadClusterPage();
+  }
+
+  function tile(k, v, cls) {
+    return `<div class="tile ${cls || ''}"><div class="k">${esc(k)}</div>` +
+           `<div class="v">${esc(v)}</div></div>`;
+  }
+
+  function pct(v) { return isNaN(num(v)) ? '—' : num(v).toFixed(0) + '%'; }
+
+  async function loadClusterPage() {
+    const name = state.clusterName;
+    const box  = $('cluster-body');
+    if (!name) { box.innerHTML = '<div class="muted">Выберите кластер слева.</div>'; return; }
+
+    const meta = state.clusters.find(c => c.name === name) || {};
+    $('cluster-head').textContent = meta.label || name;
+    box.innerHTML = '<div class="muted">Собираю…</div>';
+
+    const hours = clusterHours();
+    try {
+      // Состояние и графики — сразу; тяжёлое (профиль нагрузки, репликация,
+      // диагностика) грузится по кнопке: у профиля окно в секундах, и ждать
+      // его при каждом открытии страницы незачем
+      const [st, ch, al] = await Promise.all([
+        fetch('clusters/' + encodeURIComponent(name) + '/status').then(r => r.json()),
+        fetch('api/charts/' + encodeURIComponent(name) + '?hours=' + hours).then(r => r.json()),
+        fetch('alerts/history?cluster=' + encodeURIComponent(name) + '&hours=24&limit=10')
+          .then(r => r.json()),
+      ]);
+
+      const p = st.primary || {};
+      const r = st.replica || {};
+      const lag = r.replication_lag_over_plan_s;
+      const tiles = [
+        tile('MySQL', p.mysql_up == 1 ? 'работает' : 'НЕ ОТВЕЧАЕТ',
+             p.mysql_up == 1 ? 'good' : 'bad'),
+        tile('Запросов/с', p.qps ?? '—'),
+        tile('Медленных/с', p.slow_qps ?? '—', num(p.slow_qps) > 1 ? 'warn' : ''),
+        tile('Соединений', pct(p.connections_pct),
+             num(p.connections_pct) > 80 ? 'bad' : num(p.connections_pct) > 60 ? 'warn' : ''),
+        tile('CPU', pct(p.cpu_pct), num(p.cpu_pct) > 85 ? 'warn' : ''),
+        tile('iowait', pct(p.iowait_pct), num(p.iowait_pct) > 20 ? 'warn' : ''),
+      ];
+      if (meta.replica_ip) {
+        tiles.push(tile('Лаг сверх плана',
+                        isNaN(num(lag)) ? '—' : num(lag).toFixed(0) + ' с',
+                        num(lag) > 300 ? 'bad' : num(lag) > 60 ? 'warn' : 'good'));
+      }
+
+      let html = '<div class="tiles">' + tiles.join('') + '</div>';
+
+      if (ch.charts && ch.charts.length) {
+        html += '<div class="card"><h4>Метрики за ' + hours + ' ч</h4>' +
+                '<div id="cluster-charts"></div></div>';
+      }
+
+      html += `
+        <div class="card">
+          <h4>Что нагружает базу сейчас
+            <button class="ghost-btn lazy" onclick="App.loadWorkload()">Снять профиль</button></h4>
+          <div id="cluster-workload" class="muted small">
+            Два среза performance_schema с интервалом в несколько секунд —
+            показывает то, что исполняется именно сейчас, а не средние за всё
+            время работы сервера.</div>
+        </div>
+        <div class="card">
+          <h4>Репликация
+            <button class="ghost-btn lazy" onclick="App.loadReplication()">Проверить</button></h4>
+          <div id="cluster-repl" class="muted small">
+            Состояние потоков, ошибки применения, отставание сверх
+            запланированного.</div>
+        </div>
+        <div class="card">
+          <h4>Диагностика Performance Schema
+            <button class="ghost-btn lazy" onclick="App.loadDiag()">Выполнить</button></h4>
+          <div id="cluster-diag" class="muted small">
+            Тяжёлые запросы, полные сканирования, ожидания блокировок,
+            планы выполнения.</div>
+        </div>`;
+
+      html += '<div class="card"><h4>События за сутки</h4>' +
+              (al.items && al.items.length
+                ? al.items.map(a => `
+                    <div class="alert-item">
+                      <div><b>${esc(a.alert)}</b>
+                        <span class="ctx-chip">${esc(a.severity || '?')}</span>
+                        <span class="muted">${esc(String(a.ts).slice(0, 16).replace('T', ' '))}</span></div>
+                      <div class="muted" style="font-size:12px">${esc(a.summary || '')}</div>
+                    </div>`).join('')
+                : '<div class="muted small">Событий не было.</div>') +
+              '</div>';
+
+      box.innerHTML = html;
+      if (ch.charts && ch.charts.length) {
+        attachCharts($('cluster-charts'), ch.charts);
+      }
+    } catch (e) {
+      box.innerHTML = '<div class="muted">Не удалось собрать данные: ' + esc(e) + '</div>';
+    }
+  }
+
+  async function lazyBlock(id, url, label) {
+    const box = $(id);
+    if (!box) return;
+    box.innerHTML = '<span class="muted small">' + esc(label) + '</span>';
+    try {
+      const d = await fetch(url).then(r => r.json());
+      box.innerHTML = '<pre class="output">' +
+                      esc(d.text || d.report || d.error || 'Нет данных.') + '</pre>';
+    } catch (e) {
+      box.innerHTML = '<span class="muted small">Не получилось: ' + esc(e) + '</span>';
+    }
+  }
+
+  const loadWorkload = () => lazyBlock('cluster-workload',
+    'api/workload/' + encodeURIComponent(state.clusterName),
+    'Снимаю два среза, это займёт несколько секунд…');
+
+  const loadReplication = () => lazyBlock('cluster-repl',
+    'api/replication/' + encodeURIComponent(state.clusterName), 'Читаю состояние…');
+
+  const loadDiag = () => lazyBlock('cluster-diag',
+    'api/diagnose/' + encodeURIComponent(state.clusterName) + '?deep=true',
+    'Выполняю набор запросов…');
+
+  function askAboutCluster() {
+    const meta = state.clusters.find(c => c.name === state.clusterName) || {};
+    askInChat('Разберись, что происходит с кластером ' + (meta.label || state.clusterName) +
+              ' за последние ' + clusterHours() + ' часа и почему');
+  }
+
+  // ═══ ВОПРОС В ЧАТ ОДНОЙ КНОПКОЙ ════════════════════════════════
+  // Дежурный читает событие, а потом руками формулирует вопрос, вспоминая
+  // имя кластера и время. Пусть это делает интерфейс.
+
+  function askInChat(text) {
+    showTab('chat');
+    const input = $('input');
+    input.value = text;
+    autoResize(input);
+    input.focus();
+    sendMessage();
+  }
+
+  function analyzeAlert(name, cluster, ts) {
+    const when = String(ts || '').slice(0, 16).replace('T', ' ');
+    askInChat('Разбери событие ' + name + (cluster ? ' на кластере ' + cluster : '') +
+              (when ? ' от ' + when + ' UTC' : '') +
+              '. Что было причиной, что делать и повторялось ли такое раньше?');
+  }
+
+  async function similarIncidents(name, cluster) {
+    showTab('alerts');
+    const box = $('alerts-content');
+    box.innerHTML = '<div class="muted">Ищу прошлые случаи…</div>';
+    try {
+      const d = await fetch('api/incidents/' + encodeURIComponent(name) +
+                            (cluster ? '?cluster=' + encodeURIComponent(cluster) : ''))
+                      .then(r => r.json());
+      box.innerHTML = '<h4 style="margin:0 0 10px">Как решали «' + esc(name) + '» раньше</h4>' +
+        (d.items && d.items.length
+          ? d.items.map(a => `
+              <div class="alert-item">
+                <div class="muted" style="font-size:12px">
+                  ${esc(String(a.resolved_at || a.ts).slice(0, 16).replace('T', ' '))} ·
+                  ${esc(a.cluster_label || a.cluster || '—')}</div>
+                <div>${esc(a.resolution || '')}</div>
+              </div>`).join('')
+          : '<div class="muted">Записанных решений пока нет. ' +
+            'Запишите своё — в следующий раз агент предложит его первым.</div>') +
+        '<button class="ghost-btn" onclick="App.loadAlerts()">← К списку событий</button>';
+    } catch (e) {
+      box.innerHTML = '<div class="muted">Не удалось: ' + esc(e) + '</div>';
+    }
+  }
+
+  // ═══ ЛОГИ ══════════════════════════════════════════════════════
+
+  function fillClusterSelects() {
+    const options = state.clusters
+      .map(c => `<option value="${esc(c.name)}">${esc(c.label || c.name)}</option>`)
+      .join('');
+    ['logs-cluster', 'sql-cluster'].forEach(id => {
+      const el = $(id);
+      if (el && el.options.length !== state.clusters.length) el.innerHTML = options;
+    });
+  }
+
+  async function loadLogs() {
+    const out = $('logs-out');
+    const name = $('logs-cluster').value;
+    if (!name) { out.textContent = 'Кластеры ещё не загружены.'; return; }
+    out.textContent = 'Читаю логи по SSH…';
+    try {
+      const d = await fetch('api/logs/' + encodeURIComponent(name) +
+                            '?hours=' + encodeURIComponent($('logs-hours').value) +
+                            '&kind=' + encodeURIComponent($('logs-kind').value) +
+                            '&filter=' + encodeURIComponent($('logs-filter').value))
+                      .then(r => r.json());
+      out.textContent = d.text || 'Ничего не найдено.';
+    } catch (e) {
+      out.textContent = 'Не удалось прочитать логи: ' + e;
+    }
+  }
+
+  // ═══ SQL ═══════════════════════════════════════════════════════
+
+  const SQL_KEY = 'mysql-ai-agent.sql_history';
+
+  function sqlHistory() {
+    try { return JSON.parse(localStorage.getItem(SQL_KEY) || '[]'); }
+    catch (e) { return []; }
+  }
+
+  function rememberSql(text) {
+    const list = sqlHistory().filter(q => q !== text);
+    list.unshift(text);
+    try { localStorage.setItem(SQL_KEY, JSON.stringify(list.slice(0, 12))); }
+    catch (e) { /* приватный режим */ }
+    renderSqlHistory();
+  }
+
+  function renderSqlHistory() {
+    const box = $('sql-history');
+    if (!box) return;
+    const list = sqlHistory();
+    box.innerHTML = list.length
+      ? list.map((q, i) => `<button data-i="${i}" title="${esc(q)}">${esc(q.slice(0, 60))}</button>`).join('')
+      : '';
+  }
+
+  async function loadTemplates() {
+    const sel = $('sql-template');
+    if (!sel || sel.options.length > 1) return;
+    try {
+      const d = await fetch('api/diagnostics/templates').then(r => r.json());
+      state.templates = d.items || [];
+      sel.innerHTML = '<option value="">готовые запросы…</option>' +
+        state.templates.map((t, i) =>
+          `<option value="${i}" title="${esc(t.why)}">${esc(t.title)}</option>`).join('');
+    } catch (e) { /* шаблоны — необязательное удобство */ }
+  }
+
+  function useTemplate(index) {
+    const t = (state.templates || [])[parseInt(index, 10)];
+    if (t) { $('sql-text').value = t.sql; $('sql-template').value = ''; }
+  }
+
+  async function runSql() {
+    const out  = $('sql-out');
+    const sql  = $('sql-text').value.trim();
+    const name = $('sql-cluster').value;
+    if (!sql) return;
+    out.innerHTML = '<div class="muted">Выполняю…</div>';
+    try {
+      const r = await fetch('api/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cluster: name, sql: sql }),
+      });
+      const d = await r.json();
+      if (d.error || !r.ok) {
+        out.innerHTML = '<div class="muted">' + esc(d.error || d.detail || 'Ошибка') + '</div>';
+        return;
+      }
+      rememberSql(sql);
+      if (!d.rows.length) {
+        out.innerHTML = '<div class="muted">Запрос выполнен, строк нет.</div>';
+        return;
+      }
+      out.innerHTML =
+        '<div class="muted small">' + esc(d.host || name) +
+        (d.via ? ' · ' + esc(d.via) : '') + ' · строк: ' + d.rows.length +
+        (d.truncated ? ' (показаны первые)' : '') + '</div>' +
+        '<div class="res-wrap"><table class="res-table"><thead><tr>' +
+        d.columns.map(c => '<th>' + esc(c) + '</th>').join('') +
+        '</tr></thead><tbody>' +
+        d.rows.map(row => '<tr>' + row.map(v =>
+          '<td>' + esc(v === null ? 'NULL' : String(v).slice(0, 200)) + '</td>').join('') +
+          '</tr>').join('') +
+        '</tbody></table></div>';
+    } catch (e) {
+      out.innerHTML = '<div class="muted">Не удалось выполнить: ' + esc(e) + '</div>';
+    }
+  }
+
+  // ═══ ПОИСК ═════════════════════════════════════════════════════
+
+  async function runSearch() {
+    const q   = $('search-q').value.trim();
+    const box = $('search-out');
+    if (q.length < 2) { box.innerHTML = '<div class="muted">Введите хотя бы 2 символа.</div>'; return; }
+    box.innerHTML = '<div class="muted">Ищу…</div>';
+    try {
+      const d = await fetch('api/search?q=' + encodeURIComponent(q)).then(r => r.json());
+      const parts = [];
+
+      if (d.alerts && d.alerts.length) {
+        parts.push('<h4 style="margin:14px 0 8px">События (' + d.alerts.length + ')</h4>' +
+          d.alerts.map(a => `
+            <div class="alert-item">
+              <div><b>${esc(a.alert)}</b>
+                <span class="ctx-chip">${esc(a.severity || '?')}</span>
+                <span class="muted">${esc(String(a.ts).slice(0, 16).replace('T', ' '))} ·
+                ${esc(a.cluster_label || a.cluster || '—')}</span></div>
+              <div class="muted" style="font-size:12px">${esc(a.summary || '')}</div>
+              ${a.resolution ? '<div style="font-size:12px">Решение: ' +
+                               esc(a.resolution.slice(0, 200)) + '</div>' : ''}
+            </div>`).join(''));
+      }
+      if (d.messages && d.messages.length) {
+        parts.push('<h4 style="margin:14px 0 8px">Переписка (' + d.messages.length + ')</h4>' +
+          d.messages.map(m => `
+            <div class="alert-item search-msg" data-thread="${esc(m.thread_id)}"
+                 style="cursor:pointer" title="Открыть этот чат">
+              <div class="muted" style="font-size:12px">
+                ${esc(String(m.ts).slice(0, 16).replace('T', ' '))} ·
+                ${esc(m.thread_title || 'без названия')} ·
+                ${m.role === 'user' ? 'вы' : 'агент'}</div>
+              <div style="font-size:12px">${esc(m.content.slice(0, 300))}</div>
+            </div>`).join(''));
+      }
+      box.innerHTML = parts.length ? parts.join('')
+                                   : '<div class="muted">Ничего не найдено.</div>';
+    } catch (e) {
+      box.innerHTML = '<div class="muted">Поиск не удался: ' + esc(e) + '</div>';
+    }
+  }
+
+  // ═══ УВЕДОМЛЕНИЯ О НОВЫХ СОБЫТИЯХ ══════════════════════════════
+
+  function showToast(msg) {
+    let box = document.querySelector('.toast-box');
+    if (!box) {
+      box = document.createElement('div');
+      box.className = 'toast-box';
+      document.body.appendChild(box);
+    }
+    const el = document.createElement('div');
+    el.className = 'toast ' + (msg.severity || '');
+    el.innerHTML = `<div class="t-title">${esc(msg.alert || 'Событие')}</div>` +
+                   `<div class="t-sub">${esc(msg.cluster || '')}` +
+                   `${msg.summary ? ' · ' + esc(msg.summary.slice(0, 90)) : ''}</div>`;
+    el.onclick = () => { el.remove(); loadAlerts(); showTab('alerts'); };
+    box.appendChild(el);
+    // Убираем сами: висящие уведомления закрывают интерфейс
+    setTimeout(() => el.remove(), 12000);
+  }
+
+  // Имена инструментов человеческим языком: «get_workload» ничего не
+  // говорит тому, кто просто задал вопрос
+  const TOOL_NAMES = {
+    get_current_metrics: 'текущие метрики',
+    get_history:         'история метрик',
+    get_breakdown:       'разбивка по интервалам',
+    get_workload:        'профиль нагрузки',
+    get_replication:     'состояние репликации',
+    run_diagnostics:     'диагностика Performance Schema',
+    run_sql:             'SQL-запрос',
+    read_logs:           'логи серверов',
+    get_alerts:          'история событий',
+  };
+
+  function bumpAlertCount() {
+    const cnt = $('alert-count');
+    if (!cnt) return;
+    const now = parseInt(cnt.textContent || '0', 10) || 0;
+    cnt.textContent = now + 1;
+    cnt.classList.add('show');
+  }
+
   function esc(s) {
     // Кавычки экранируем обязательно: строка попадает и внутрь атрибутов.
     // Без этого имя из каталога вида O'Brien рвало разметку и обработчик.
@@ -1451,6 +1872,23 @@ const App = (() => {
     $('stop-btn').addEventListener('click', stopGeneration);
     bindDirResults();
     bindThreadList();
+
+    // История SQL и переходы из поиска: элементы перерисовываются, поэтому
+    // слушатель один на контейнер
+    $('sql-history')?.addEventListener('click', ev => {
+      const btn = ev.target.closest('button[data-i]');
+      if (btn) $('sql-text').value = sqlHistory()[parseInt(btn.dataset.i, 10)] || '';
+    });
+    $('search-out')?.addEventListener('click', ev => {
+      const row = ev.target.closest('.search-msg');
+      if (row && row.dataset.thread) { switchThread(row.dataset.thread); showTab('chat'); }
+    });
+    $('search-q')?.addEventListener('keydown', ev => {
+      if (ev.key === 'Enter') { ev.preventDefault(); runSearch(); }
+    });
+    $('logs-filter')?.addEventListener('keydown', ev => {
+      if (ev.key === 'Enter') { ev.preventDefault(); loadLogs(); }
+    });
     restoreClustersState();
   }
 
@@ -1461,7 +1899,9 @@ const App = (() => {
            loadStatus, loadAlerts, refreshClusters, logout,
            loadAccess, loadAudit, searchDirectory, grantAgain,
            newThread, deleteThread, switchThread, toggleSidebar,
-           toggleClusters,
+           toggleClusters, openCluster, loadClusterPage, loadWorkload,
+           loadReplication, loadDiag, askAboutCluster, analyzeAlert,
+           similarIncidents, loadLogs, runSql, useTemplate, runSearch,
            grantManual, revokeAccess, deleteAlert, deleteAlertsByName,
            resolveAlert,
            stopGeneration };
