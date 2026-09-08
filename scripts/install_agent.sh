@@ -181,6 +181,14 @@ INGEST_TOKENS=${INGEST_TOKENS:-}
 SSH_USER=${SSH_USER:-}
 SSH_PORT=${SSH_PORT:-22}
 SSH_KEY=${SSH_KEY:-}
+# Дедупликация повторных алертов и глубина контекста чата
+ALERT_DEDUP_MINUTES=${ALERT_DEDUP_MINUTES:-30}
+CHAT_CONTEXT_MESSAGES=${CHAT_CONTEXT_MESSAGES:-10}
+# Окно профиля нагрузки: два среза performance_schema с этим интервалом.
+# На столько же задерживается ответ при разборе «почему медленно»
+WORKLOAD_WINDOW_S=${WORKLOAD_WINDOW_S:-10}
+# Через сколько минут после записи решения проверить, не повторилось ли
+FOLLOWUP_MINUTES=${FOLLOWUP_MINUTES:-15}
 LOG_MAX_LINES=${LOG_MAX_LINES:-400}
 LOG_SSH_TIMEOUT=${LOG_SSH_TIMEOUT:-25}
 AUTH_ENABLED=${AUTH_ENABLED:-true}

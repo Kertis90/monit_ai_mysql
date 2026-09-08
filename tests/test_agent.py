@@ -233,6 +233,7 @@ def application() -> None:
                      json={"resolution": "почистили /var"}).status_code, 200)
         check("инцидент запомнен",
               c.get("/api/incidents/DiskLow").json()["total"], 1)
+        followup_check(c, items[0]["id"])
 
         check("оценка ответа", c.post("/api/feedback",
                                       json={"rating": -1}).status_code, 200)
@@ -244,6 +245,37 @@ def application() -> None:
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
+
+
+def followup_check(client, alert_id: int) -> None:
+    """Проверка «помогло ли решение».
+
+    Запускаем немедленно, а не через четверть часа: важно, что вывод
+    дописывается к решению и различает повтор от его отсутствия.
+    """
+    from anyio.from_thread import start_blocking_portal
+
+    from agent.services import followup
+
+    def verify() -> str:
+        with start_blocking_portal("asyncio") as portal:
+            portal.call(followup._verify, alert_id)
+        rows = client.get("/api/incidents/DiskLow").json()["items"]
+        return next((r["resolution"] or "") for r in rows if r["id"] == alert_id)
+
+    text = verify()
+    check("вывод о решении дописан", followup.MARK in text, True)
+    check("повтора не было — решение рабочее", "не повторялось" in text, True)
+
+    # Событие повторилось УЖЕ ПОСЛЕ записи решения — вывод должен смениться.
+    # Повтор до записи доказательством провала не считается: тогда решение
+    # ещё не применяли.
+    client.post("/api/alerts/%d/resolve" % alert_id,
+                json={"resolution": "почистили /var"})
+    client.post("/api/alerts/ingest", headers={"X-Ingest-Token": "test-token"},
+                json={"alert": "DiskLow", "severity": "critical",
+                      "summary": "снова", "source": "zabbix"})
+    check("повтор после решения замечен", "ПОВТОРИЛОСЬ" in verify(), True)
 
 
 def websocket(client) -> None:

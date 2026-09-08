@@ -34,7 +34,7 @@ from agent.api.routes import (alerts, auth, chat, clusters, system,  # noqa: E40
 from agent.db.base import dispose, init_models, session_scope      # noqa: E402
 from agent.db.repositories.alerts import AlertRepository           # noqa: E402
 from agent.db.repositories.chats import ChatRepository             # noqa: E402
-from agent.services import access                                  # noqa: E402
+from agent.services import access, followup                        # noqa: E402
 from agent.services.mysql import refresh_db_versions               # noqa: E402
 
 # Пути, доступные без входа. Всё остальное закрыто: забыть добавить проверку
@@ -70,8 +70,13 @@ async def lifespan(app: FastAPI):
     # наугад — у 5.7 и 8.0 разные имена таблиц performance_schema.
     # Фоном, чтобы недоступный сервер БД не задерживал запуск агента.
     versions = asyncio.create_task(refresh_db_versions())
+    # Проверки «помогло ли решение» живут в памяти процесса, и рестарт их
+    # теряет — восстанавливаем на оставшееся время
+    await followup.catch_up()
 
     yield
+
+    await followup.shutdown()
 
     # Задачу надо снять явно: недоступный сервер БД держит её в таймауте
     # подключения, и без отмены остановка ждёт её завершения

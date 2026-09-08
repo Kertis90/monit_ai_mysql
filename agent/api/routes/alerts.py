@@ -11,6 +11,7 @@ from agent.schemas.api import AlertOut, IngestAlert, ResolveRequest
 from agent.services.analysis import fmt_current, fmt_history, system_prompt
 from agent.services.llm import llm_complete
 from agent.services.prometheus import collect_current, collect_history
+from agent.services import followup
 from agent.services.registry import find_cluster
 
 logger = logging.getLogger("agent.api.alerts")
@@ -110,7 +111,13 @@ async def resolve(alert_id: int, req: ResolveRequest, alerts: Alerts,
     if not await alerts.resolve(alert_id, req.resolution.strip(),
                                 (user or {}).get("username", "")):
         raise HTTPException(status_code=404, detail="Запись не найдена")
-    return {"ok": True, "id": alert_id}
+
+    # Через четверть часа агент сам посмотрит, не повторилось ли, и допишет
+    # вывод к решению: иначе в памяти инцидентов копится то, что сделали,
+    # а не то, что помогло
+    followup.schedule(alert_id)
+    return {"ok": True, "id": alert_id,
+            "check_in_minutes": followup.CHECK_MINUTES}
 
 
 @router.get("/api/incidents/{alert_name}",

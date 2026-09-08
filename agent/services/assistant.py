@@ -38,6 +38,8 @@ from agent.services.logs import detect_log_intent, read_app_log, read_slow_log
 from agent.services.mysql import (cluster_db_creds, fmt_sql_result, sql_execute)
 from agent.services.prometheus import (build_charts, collect_current,
                                        collect_history)
+from agent.services.replication import collect_replication, fmt_replication
+from agent.services.workload import fmt_workload, workload_delta
 from agent.services.registry import (app_host, cluster_hosts,
                                      detect_cluster_in_text, enabled_clusters,
                                      find_cluster)
@@ -100,6 +102,26 @@ def tool_specs() -> list:
             "parameters": {"type": "object", "properties": {"cluster": cl},
                            "required": ["cluster"]}}},
         {"type": "function", "function": {
+            "name": "get_workload",
+            "description": "Что нагружает базу ПРЯМО СЕЙЧАС: два среза "
+                           "performance_schema с интервалом и разница между "
+                           "ними. В отличие от run_diagnostics, показывает "
+                           "не суммы с момента запуска сервера, а то, что "
+                           "исполнялось в эти секунды.",
+            "parameters": {"type": "object", "properties": {
+                "cluster": cl,
+                "seconds": {"type": "number",
+                            "description": "окно наблюдения, 5-60 с"}},
+                "required": ["cluster"]}}},
+        {"type": "function", "function": {
+            "name": "get_replication",
+            "description": "Состояние репликации: работают ли потоки, ошибки "
+                           "применения, отставание сверх запланированного, "
+                           "непринятый relay log. Отвечает на вопрос ПОЧЕМУ "
+                           "реплика отстала, а не только на сколько.",
+            "parameters": {"type": "object", "properties": {"cluster": cl},
+                           "required": ["cluster"]}}},
+        {"type": "function", "function": {
             "name": "run_sql",
             "description": "Читающий SQL-запрос к кластеру. Разрешены только "
                            "SELECT, SHOW, EXPLAIN, DESCRIBE.",
@@ -132,7 +154,8 @@ async def run_tool(name: str, args: dict) -> str:
     hours   = min(float(args.get("hours") or 6), MAX_METRICS_HOURS)
 
     if name in ("get_current_metrics", "get_history", "get_breakdown",
-                "run_diagnostics", "run_sql", "read_logs") and not cluster:
+                "run_diagnostics", "run_sql", "read_logs",
+                "get_workload", "get_replication") and not cluster:
         return f"Кластер «{cname}» не найден. Доступные: " + \
                ", ".join(c["name"] for c in enabled_clusters())
 
@@ -156,6 +179,13 @@ async def run_tool(name: str, args: dict) -> str:
 
         if name == "run_diagnostics":
             out = []
+            live = await workload_delta(cluster)
+            if not live.get("error"):
+                out.append(fmt_workload(live, cluster["label"]))
+            repl = fmt_replication(await collect_replication(cluster),
+                                   cluster["label"])
+            if repl:
+                out.append(repl)
             for ip, role in cluster_hosts(cluster):
                 diag = await run_diagnostics(cluster, ip)
                 if diag:
@@ -168,6 +198,20 @@ async def run_tool(name: str, args: dict) -> str:
             if plans:
                 out.append(plans)
             return "\n\n".join(out) or "Диагностика недоступна: не задан db_user."
+
+        if name == "get_workload":
+            live = await workload_delta(cluster,
+                                        float(args.get("seconds") or 15))
+            if live.get("error"):
+                return live["error"]
+            return fmt_workload(live, cluster["label"])
+
+        if name == "get_replication":
+            states = await collect_replication(cluster)
+            if not states:
+                return ("В кластере нет реплик либо сервер не настроен как "
+                        "реплика — состояние репликации отсутствует.")
+            return fmt_replication(states, cluster["label"])
 
         if name == "run_sql":
             return fmt_sql_result(
@@ -260,6 +304,10 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
     cluster = detect_cluster_in_text(user_message)
     hours   = detect_time_hours(user_message)
     blocks  = []
+    # Чего собрать не удалось. Без этого списка отсутствующий блок выглядит
+    # для модели так же, как отсутствие проблемы, и она отвечает уверенно,
+    # опираясь на половину данных.
+    gaps: list[str] = []
 
     # Обрезаем окно метрик, но не молча: если просили неделю, а отдаём сутки,
     # LLM должна об этом сказать, иначе ответ будет вводить в заблуждение.
@@ -284,6 +332,8 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
                     blocks.append(cmp_block)
             except Exception as e:
                 logger.error(f"База для сравнения не собрана: {e}")
+                gaps.append("не собрана база для сравнения (те же метрики "
+                            "неделю назад): %s" % e)
             # Просили разбивку по интервалам — агрегатов недостаточно:
             # по min/avg/max не видно, когда был всплеск и с чем он совпал
             if detect_breakdown_intent(user_message):
@@ -304,7 +354,30 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
         # Просят разобраться, почему медленно — собираем диагностический
         # набор сами, по каждому серверу. Советовать «посмотрите
         # performance_schema» бессмысленно, если можно просто посмотреть.
+        if detect_diagnose_intent(user_message) and not cluster_db_creds(cluster):
+            gaps.append("не задана учётка db_user — ни диагностический набор, "
+                        "ни профиль нагрузки, ни состояние репликации "
+                        "прочитать нельзя")
+
         if detect_diagnose_intent(user_message) and cluster_db_creds(cluster):
+            # Что грузит базу ПРЯМО СЕЙЧАС. Накопленная статистика показывает
+            # средние за всё время работы сервера и текущую проблему прячет.
+            live = await workload_delta(cluster)
+            if live.get("error"):
+                gaps.append("не снят профиль нагрузки: %s" % live["error"])
+            else:
+                blocks.append(fmt_workload(live, cluster["label"]))
+
+            # Лаг говорит «на сколько», состояние репликации — «почему»
+            repl = await collect_replication(cluster)
+            block = fmt_replication(repl, cluster["label"])
+            if block:
+                blocks.append(block)
+            for state in repl:
+                if state.get("error"):
+                    gaps.append("состояние репликации не прочитано: %s"
+                                % state["error"])
+
             for ip, role in cluster_hosts(cluster):
                 diag = await run_diagnostics(cluster, ip)
                 if diag:
@@ -318,6 +391,7 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
                     blocks.append(cfg)
             except Exception as e:
                 logger.error(f"Сравнение конфигураций не удалось: {e}")
+                gaps.append("не прочитаны параметры серверов: %s" % e)
 
             # Планы выполнения — превращают «запрос медленный»
             # в конкретную рекомендацию по индексам
@@ -327,6 +401,7 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
                     blocks.append(plans)
             except Exception as e:
                 logger.error(f"EXPLAIN не выполнен: {e}")
+                gaps.append("не получены планы выполнения (EXPLAIN): %s" % e)
 
             # Лента событий: причинно-следственную связь видно сразу
             tl = build_timeline(await recent_alerts(
@@ -343,10 +418,9 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
             for ip, role in cluster_hosts(cluster):
                 t = await remote_time(ip)
                 if t is None:
-                    blocks.append(
-                        f"## Логи {cluster['label']} · {role} ({ip})\n\n"
-                        f"  Сервер недоступен по SSH под учёткой "
-                        f"{LOG_SSH_USER or '(не задана)'} — логи прочитать нельзя.")
+                    gaps.append("логи с %s (%s) не прочитаны: сервер не "
+                                "отвечает по SSH под учёткой %s"
+                                % (ip, role, LOG_SSH_USER or "(не задана)"))
                     continue
 
                 # Два разных отсчёта. Файлы выбираем по абсолютному времени
@@ -437,5 +511,11 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
                             limit=20)
         blocks.append(fmt_alerts(rows, period,
                                  cluster["label"] if cluster else None))
+
+    if gaps:
+        blocks.append("## Чего собрать не удалось\n\n"
+                      + "\n".join("  - " + g for g in gaps)
+                      + "\n\n  Об этих данных выводов не делай и в ответе "
+                        "прямо скажи, какой проверки не хватило.")
 
     return "\n\n".join(blocks), cluster, hours
