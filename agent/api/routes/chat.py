@@ -21,6 +21,7 @@ from agent.db.repositories.chats import ChatRepository, FeedbackRepository
 from agent.db.repositories.users import normalize
 from agent.schemas.api import ChatRequest, FeedbackRequest
 from agent.services import access
+from agent.services.analysis import system_prompt
 from agent.services.assistant import build_chat_context, llm_with_tools
 from agent.services.intents import detect_chart_intent, detect_export_intent
 from agent.services.llm import llm_complete, llm_probe_tools, llm_stream
@@ -170,6 +171,16 @@ async def websocket_chat(ws: WebSocket):
     stop_event = asyncio.Event()
 
     async def reader():
+        try:
+            await _read_loop()
+        finally:
+            # Разрыв соединения виден только здесь: исключение возникает
+            # внутри этой задачи и до основного цикла не доходит. Без метки
+            # он навсегда остался бы ждать очередь, а вместе с ним — и сама
+            # задача-читатель: по вкладке чата на каждое закрытие.
+            await inbox.put(None)
+
+    async def _read_loop():
         while True:
             raw = await ws.receive_text()
             try:
@@ -190,6 +201,8 @@ async def websocket_chat(ws: WebSocket):
     try:
         while True:
             msg = await inbox.get()
+            if msg is None:            # клиент отключился
+                break
             stop_event.clear()
 
             text = msg.get("text", "").strip()
@@ -290,14 +303,18 @@ async def websocket_chat(ws: WebSocket):
                 await ws.send_json({"type": "token",
                                     "text": "\n\n[остановлено]"})
                 logger.info(f"Генерация остановлена пользователем: {sid}")
-            await ws.send_json({"type": "done", "stopped": stopped})
-
-            # 4. Сохранить историю (без огромного контекста метрик)
+            # 4. Сохранить историю (без огромного контекста метрик) — до
+            # сигнала о завершении: иначе перезагрузка страницы сразу после
+            # ответа не покажет только что состоявшийся обмен
             history.append({"role": "user",      "content": text})
             history.append({"role": "assistant", "content": answer})
             await chat_save(cid, sid, "user",      text,   fp)
             await chat_save(cid, sid, "assistant", answer, fp)
-            # Упёрлись в окно контекста — не выбрасываем старое, а сжимаем
+
+            await ws.send_json({"type": "done", "stopped": stopped})
+
+            # Упёрлись в окно контекста — не выбрасываем старое, а сжимаем.
+            # После done: выжимку строит модель, и ждать её пользователю незачем
             if len(history) > CHAT_CONTEXT_MESSAGES:
                 history[:] = await chat_compact(cid, sid, history)
 

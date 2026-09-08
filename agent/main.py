@@ -67,10 +67,19 @@ async def lifespan(app: FastAPI):
         await ChatRepository(session).purge_old()
 
     # Версии СУБД спрашиваем на старте: без них модель советует синтаксис
-    # наугад — у 5.7 и 8.0 разные имена таблиц performance_schema
-    asyncio.create_task(refresh_db_versions())
+    # наугад — у 5.7 и 8.0 разные имена таблиц performance_schema.
+    # Фоном, чтобы недоступный сервер БД не задерживал запуск агента.
+    versions = asyncio.create_task(refresh_db_versions())
 
     yield
+
+    # Задачу надо снять явно: недоступный сервер БД держит её в таймауте
+    # подключения, и без отмены остановка ждёт её завершения
+    versions.cancel()
+    try:
+        await versions
+    except (asyncio.CancelledError, Exception):
+        pass
 
     # Открытая вкладка чата держит WebSocket часами, и без принудительного
     # закрытия uvicorn ждёт клиента, растягивая рестарт на минуты

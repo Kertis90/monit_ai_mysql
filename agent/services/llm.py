@@ -43,6 +43,9 @@ TOOLS_SUPPORTED = None
 async def llm_probe_tools() -> bool:
     """Поддерживает ли эндпоинт инструменты. Проверяем один раз."""
     global TOOLS_SUPPORTED
+    # Внутри функции, а не сверху: assistant импортирует llm, и импорт
+    # на уровне модуля замкнул бы кольцо
+    from agent.services.assistant import tool_specs
     if TOOLS_SUPPORTED is not None:
         return TOOLS_SUPPORTED
     if LLM_TOOLS == "off":

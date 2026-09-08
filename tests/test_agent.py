@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import secrets
 import sqlite3
@@ -32,6 +33,23 @@ def check(label: str, got, expected=None, show=None) -> None:
     print("  [%s] %-42s %s" % (mark, label, show if show is not None else got))
     if not ok:
         FAILED.append(label)
+
+
+def test_registry() -> str:
+    """Реестр без учёток БД.
+
+    С боевым агент на старте пошёл бы спрашивать версию MySQL по реальным
+    адресам и ждал бы сетевых таймаутов. Проверки должны идти где угодно и
+    ни к чему снаружи не обращаться.
+    """
+    path = os.path.join(tempfile.gettempdir(), "clusters_test.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"clusters": [{"name": "kemerovo", "label": "Кемерово",
+                                 "primary_ip": "10.1.0.1",
+                                 "replica_ip": "10.1.0.2",
+                                 "enabled": True, "tags": []}]}, f,
+                  ensure_ascii=False)
+    return path
 
 
 def tmp_db(name: str) -> str:
@@ -222,8 +240,60 @@ def application() -> None:
         check("Swagger опубликован",
               len(c.get("/openapi.json").json()["paths"]) > 20, True)
 
+        websocket(c)
+
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
+
+
+def websocket(client) -> None:
+    """Разговор по WebSocket от начала до конца.
+
+    Модель и сбор метрик подменяются: проверяем протокол и то, что обработчик
+    доходит до конца. Именно здесь ломается перенос кода — забытый импорт
+    роняет соединение, а внешне это выглядит как «связь прервана».
+    """
+    from agent.api.routes import chat as chat_routes
+
+    async def fake_context(text):
+        return "## Метрики\n  всё в порядке", None, 0
+
+    async def fake_stream(messages):
+        for piece in ("Всё ", "в ", "порядке."):
+            yield piece
+
+    async def no_tools():
+        return False
+
+    original = (chat_routes.build_chat_context, chat_routes.llm_stream,
+                chat_routes.llm_probe_tools)
+    chat_routes.build_chat_context = fake_context
+    chat_routes.llm_stream = fake_stream
+    chat_routes.llm_probe_tools = no_tools
+    try:
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({"type": "ping"})
+            check("сокет отвечает на ping", ws.receive_json().get("type"), "pong")
+
+            ws.send_json({"type": "message", "text": "как дела",
+                          "client_id": "web-1", "session_id": "s1"})
+            kinds, answer = [], ""
+            for _ in range(12):
+                msg = ws.receive_json()
+                kinds.append(msg.get("type"))
+                if msg.get("type") == "token":
+                    answer += msg.get("text", "")
+                if msg.get("type") in ("done", "error"):
+                    break
+            check("соединение не оборвалось", kinds[-1], "done")
+            check("контекст пришёл до ответа", "context" in kinds, True)
+            check("ответ дошёл целиком", answer, "Всё в порядке.")
+    finally:
+        (chat_routes.build_chat_context, chat_routes.llm_stream,
+         chat_routes.llm_probe_tools) = original
+
+    saved = client.get("/chat/history?limit=10").json()
+    check("переписка сохранена", saved["total"] >= 2, True)
 
 
 def main() -> int:
@@ -238,10 +308,14 @@ def main() -> int:
             "pbkdf2_sha256$%d$%s$%s" % (iterations, salt, digest),
         "AUTH_SECRET": secrets.token_hex(32),
         "WEB_DIR": str(ROOT / "web"),
-        "REGISTRY_PATH": str(ROOT / "clusters.json"),
+        "REGISTRY_PATH": test_registry(),
         "INGEST_TOKENS": "test-token",
         "LDAP_ENABLED": "false",
         "NSLCD_CONF": "",
+        # Заведомо закрытый порт: обращение к модели должно падать сразу,
+        # а не ждать разрешения несуществующего имени
+        "LLM_BASE_URL": "http://127.0.0.1:9/v1",
+        "LLM_TOOLS": "off",
     })
 
     print("1. Слой данных")
@@ -272,4 +346,11 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    code = main()
+    # Явный выход вместо sys.exit: TestClient держит собственный поток с
+    # циклом событий (anyio portal), и после сессии с WebSocket он остаётся
+    # жив — интерпретатор ждёт его и не завершается. В бою этого механизма
+    # нет, он только у тестового клиента, поэтому проще выйти сразу.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
