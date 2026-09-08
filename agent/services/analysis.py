@@ -28,6 +28,7 @@ from agent.services.registry import (cluster_hosts, clusters_index_text,
 logger = logging.getLogger("agent.analysis")
 
 BASELINE_OFFSET_DAYS = settings.prometheus.baseline_offset_days
+BASELINE_WEEKS       = settings.prometheus.baseline_weeks
 SERIES_MAX_ROWS      = settings.prometheus.series_max_rows
 MAX_METRICS_HOURS    = settings.prometheus.max_metrics_hours
 ALERTS_RETENTION_DAYS = settings.db.alerts_retention_days
@@ -151,16 +152,51 @@ DIAG_QUERIES = [
 ]
 
 
+def _median(values: list) -> Optional[float]:
+    vals = sorted(v for v in values if isinstance(v, (int, float)))
+    if not vals:
+        return None
+    mid = len(vals) // 2
+    return vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2
+
+
 async def collect_baseline(cluster: dict, hours: float) -> dict:
-    """Те же метрики неделю назад — чтобы было с чем сравнивать.
+    """Те же метрики в обычный такой же день — чтобы было с чем сравнивать.
 
     Без базы «QPS 1200» ничего не значит: модель не знает, много это или мало,
-    и вынуждена гадать. Смещение ровно на неделю берёт тот же день недели
-    и тот же час — по будням и выходным профиль нагрузки разный.
+    и вынуждена гадать.
+
+    Берём не одну точку неделю назад, а медиану по нескольким неделям на тот
+    же день недели и час. Одна точка ненадёжна: если ровно неделю назад был
+    сбой, праздник или разовая выгрузка, база оказывается кривой, и агент
+    объявит аномалией нормальную нагрузку — или наоборот. Медиана выбросы
+    отбрасывает, а суточный и недельный профиль сохраняет: ночной бэкап
+    сравнивается с ночным бэкапом, а не со средним по суткам.
     """
+    # Недели опрашиваем параллельно: последовательно это вчетверо дольше,
+    # а ответ в чате ждёт именно этого блока
+    weeks = await asyncio.gather(
+        *[_baseline_at(cluster, hours, BASELINE_OFFSET_DAYS * w)
+          for w in range(1, BASELINE_WEEKS + 1)])
+    known = [w for w in weeks if w]
+
+    out = {"offset_days": BASELINE_OFFSET_DAYS,
+           "weeks": len(known), "weeks_asked": BASELINE_WEEKS}
+    if not known:
+        return out
+    for key in known[0]:
+        for stat in ("avg", "min", "max"):
+            value = _median([w.get(key, {}).get(stat) for w in known])
+            if value is not None:
+                out.setdefault(key, {})[stat] = round(value, 2)
+    return out
+
+
+async def _baseline_at(cluster: dict, hours: float, days_ago: int) -> dict:
+    """Срез метрик со смещением на указанное число суток назад."""
     prim = cluster["primary_ip"]
     inst = f"{prim}:9104"
-    off  = f"{BASELINE_OFFSET_DAYS * 24}h"
+    off  = f"{days_ago * 24}h"
 
     queries = {
         "qps":             f'rate(mysql_global_status_queries{{instance="{inst}"}}[5m] offset {off})',
@@ -176,8 +212,9 @@ async def collect_baseline(cluster: dict, hours: float) -> dict:
         keys = list(queries.keys())
         res  = await asyncio.gather(
             *[prom_range_summary(client, queries[k], hours) for k in keys])
-    return {"offset_days": BASELINE_OFFSET_DAYS,
-            **{k: v for k, v in zip(keys, res)}}
+    # Пустой срез — эта неделя за пределами хранения Prometheus либо сервер
+    # тогда не опрашивался. В медиану её просто не берём.
+    return {k: v for k, v in zip(keys, res) if v}
 
 
 def fmt_baseline(now: dict, base: dict, label: str) -> str:
@@ -194,14 +231,21 @@ def fmt_baseline(now: dict, base: dict, label: str) -> str:
         except (TypeError, ZeroDivisionError):
             continue
         mark = "выше" if delta > 0 else "ниже"
-        rows.append(f"  {k}: сейчас {cur['avg']}, неделю назад {old['avg']} "
+        rows.append(f"  {k}: сейчас {cur['avg']}, обычно {old['avg']} "
                     f"({abs(delta):.0f}% {mark})")
     if not rows:
         return ""
-    return (f"## Сравнение с обычным днём — {label}\n\n"
-            f"  Те же метрики {base['offset_days']} дн. назад, тот же день "
-            f"недели и час.\n"
-            f"  Отклонение в пределах 20-30% обычно норма.\n\n" + "\n".join(rows))
+    weeks = base.get("weeks", 0)
+    if weeks > 1:
+        source = (f"  Медиана за {weeks} недель на тот же день недели и час — "
+                  f"разовый сбой или праздник в одной из них базу не искажает.")
+    else:
+        source = (f"  Те же метрики {base['offset_days']} дн. назад, тот же "
+                  f"день недели и час. Данных всего за одну неделю, поэтому "
+                  f"разовый выброс в ней мог попасть в базу — учитывай это.")
+    return (f"## Сравнение с обычным днём — {label}\n\n" + source + "\n"
+            f"  Отклонение в пределах 20-30% обычно норма.\n\n"
+            + "\n".join(rows))
 
 
 async def collect_config_diff(cluster: dict) -> str:

@@ -4,9 +4,10 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
-from agent.api.deps import CurrentUser, MaybeUser
+from agent.api.deps import Audit, CurrentUser, MaybeUser
+from agent.services import audit
 from agent.schemas.api import SqlRequest, SqlResult
 from agent.services.analysis import (collect_series_table, explain_top_queries,
                                      fmt_diagnostics, run_diagnostics)
@@ -73,11 +74,16 @@ async def db_versions(user: CurrentUser):
 
 @router.post("/api/query", tags=["Диагностика"], response_model=SqlResult,
              summary="Читающий SQL-запрос к кластеру")
-async def query(req: SqlRequest, user: CurrentUser) -> SqlResult:
+async def query(req: SqlRequest, user: CurrentUser, journal: Audit,
+                request: Request) -> SqlResult:
     """Только чтение. Запрет проверяется до отправки, а не надеждой на грант:
     учётка агента и так имеет лишь SELECT, но ошибка в запросе не должна
     зависеть от того, правильно ли выданы права."""
     result = await sql_execute(_need(req.cluster), req.sql, req.host or None)
+    await journal.add(action="SQL-запрос", username=user.get("username", ""),
+                      target=req.cluster, detail=req.sql[:1000],
+                      ip=audit.client_ip(request),
+                      ok=not result.get("error"))
     return SqlResult(**result)
 
 

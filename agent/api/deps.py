@@ -14,9 +14,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from agent.core.config import settings
 from agent.db.base import get_session
 from agent.db.repositories.alerts import AlertRepository
+from agent.db.repositories.audit import AuditRepository
 from agent.db.repositories.chats import ChatRepository, FeedbackRepository
 from agent.db.repositories.users import UserRepository
-from agent.services import access
+from agent.services import access, ratelimit
 
 DbSession = Annotated[AsyncSession, Depends(get_session)]
 
@@ -37,10 +38,20 @@ async def feedback_repo(session: DbSession) -> FeedbackRepository:
     return FeedbackRepository(session)
 
 
+async def audit_repo(session: DbSession) -> AuditRepository:
+    """Журнал пишется той же сессией, что и действие.
+
+    Своя сессия означала бы вторую транзакцию поверх незакрытой первой —
+    на SQLite это «database is locked», и запись терялась бы.
+    """
+    return AuditRepository(session)
+
+
 Alerts   = Annotated[AlertRepository, Depends(alert_repo)]
 Users    = Annotated[UserRepository, Depends(user_repo)]
 Chats    = Annotated[ChatRepository, Depends(chat_repo)]
 Feedbacks = Annotated[FeedbackRepository, Depends(feedback_repo)]
+Audit     = Annotated[AuditRepository, Depends(audit_repo)]
 
 
 async def optional_user(request: Request) -> Optional[dict]:
@@ -86,3 +97,15 @@ def require_ingest_token(request: Request) -> None:
               or request.headers.get("Authorization", "").removeprefix("Bearer ").strip())
     if header not in settings.ingest_tokens:
         raise HTTPException(status_code=401, detail="Неверный токен приёма событий")
+
+    # Ограничение по отправителю: не ради экономии, а чтобы зациклившийся
+    # скрипт не залил ленту событий и хранилище
+    peer = request.client.host if request.client else "?"
+    ok, left = ratelimit.allow("%s@%s" % (header[:8], peer))
+    if not ok:
+        raise HTTPException(
+            status_code=429,
+            detail="Слишком часто: больше %d событий в минуту от одного "
+                   "отправителя. Проверьте, не зациклился ли скрипт."
+                   % ratelimit.INGEST_RATE_PER_MIN,
+            headers={"Retry-After": "60"})

@@ -10,12 +10,12 @@ import urllib.parse
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse
 
-from agent.api.deps import MaybeUser
+from agent.api.deps import Audit, MaybeUser
 from agent.core.config import settings
 from agent.core.security import AUTH_COOKIE, make_session
 from agent.db.repositories.users import normalize
 from agent.schemas.api import LoginRequest
-from agent.services import access, oidc
+from agent.services import access, audit, oidc
 
 logger = logging.getLogger("agent.api.auth")
 router = APIRouter(tags=["Доступ"])
@@ -34,7 +34,8 @@ def _set_session(response: Response, username: str, source: str) -> None:
 
 
 @router.post("/api/login", summary="Вход")
-async def login(req: LoginRequest, response: Response):
+async def login(req: LoginRequest, response: Response, request: Request,
+                journal: Audit):
     if not settings.auth.enabled:
         return {"ok": True, "username": "anonymous", "source": "disabled"}
 
@@ -42,6 +43,11 @@ async def login(req: LoginRequest, response: Response):
     source, err = await access.authenticate(username, req.password)
     if not source:
         logger.warning("Неудачный вход: %r — %s", username, err)
+        await journal.add(action="вход отклонён", username=username,
+                          detail=err, ip=audit.client_ip(request), ok=False)
+        # Фиксируем до исключения: иначе откат транзакции унесёт с собой
+        # запись именно о том, что важнее всего сохранить
+        await journal.session.commit()
         # 403 именно для «доступ не выдан»: учётка верна, не хватает прав,
         # и человеку надо идти к администратору, а не подбирать пароль
         code = 403 if err == access.ERR_NO_ACCESS else 401
@@ -49,6 +55,9 @@ async def login(req: LoginRequest, response: Response):
 
     _set_session(response, username, source)
     logger.info("Вход: %s (источник: %s)", username, source)
+    await journal.add(action="вход", username=username,
+                      detail="источник: %s" % source,
+                      ip=audit.client_ip(request))
     return {"ok": True, "username": username, "source": source}
 
 

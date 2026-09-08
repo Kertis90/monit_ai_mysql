@@ -241,10 +241,46 @@ def application() -> None:
         check("Swagger опубликован",
               len(c.get("/openapi.json").json()["paths"]) > 20, True)
 
+        extras(c)
         websocket(c)
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
+
+
+def extras(client) -> None:
+    """Ограничение приёма, журнал действий и сводка."""
+    from agent.services import ratelimit
+
+    # 1. Ограничение частоты: зациклившийся отправитель должен упереться
+    ratelimit.reset()
+    codes = set()
+    for _ in range(ratelimit.INGEST_RATE_PER_MIN + 2):
+        codes.add(client.post("/api/alerts/ingest",
+                              headers={"X-Ingest-Token": "test-token"},
+                              json={"alert": "Flood", "source": "loop"}).status_code)
+    check("поток событий отсекается", 429 in codes, True)
+    ratelimit.reset()
+    check("после сброса приём возобновляется",
+          client.post("/api/alerts/ingest", headers={"X-Ingest-Token": "test-token"},
+                      json={"alert": "Ok", "source": "zabbix"}).status_code, 200)
+
+    # 2. Журнал действий: в нём должны быть вход и выдача доступа
+    log = client.get("/api/audit?days=1&limit=200").json()
+    actions = {row["action"] for row in log["items"]}
+    check("вход записан в журнал", "вход" in actions, True)
+    check("выдача доступа записана", "доступ выдан" in actions, True)
+    check("отказ во входе записан", "вход отклонён" in actions, True)
+    denied = [r for r in log["items"] if r["action"] == "вход отклонён"]
+    check("отказ помечен как неуспех", denied[0]["ok"], False)
+    only = client.get("/api/audit?days=1&action=доступ выдан").json()
+    check("фильтр по действию работает",
+          {r["action"] for r in only["items"]}, {"доступ выдан"})
+
+    # 3. Сводка собирается и содержит нерешённые события
+    data = client.get("/api/digest?rebuild=true&hours=24").json()
+    check("сводка собрана", "text" in data and bool(data["text"]), True)
+    check("страница сводки отдаётся", client.get("/digest").status_code, 200)
 
 
 def followup_check(client, alert_id: int) -> None:
@@ -347,6 +383,12 @@ def main() -> int:
         # Заведомо закрытый порт: обращение к модели должно падать сразу,
         # а не ждать разрешения несуществующего имени
         "LLM_BASE_URL": "http://127.0.0.1:9/v1",
+        # Prometheus в проверках недоступен намеренно: отказ должен быть
+        # мгновенным, а не по таймауту в пятнадцать секунд
+        "PROMETHEUS_URL": "http://127.0.0.1:9",
+        # Маленький предел: проверяем саму логику отсечения, а гонять сотню
+        # событий ради этого незачем
+        "INGEST_RATE_PER_MIN": "5",
         "LLM_TOOLS": "off",
     })
 

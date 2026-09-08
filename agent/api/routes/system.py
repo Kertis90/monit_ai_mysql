@@ -8,9 +8,9 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-from agent.api.deps import Alerts, MaybeUser
+from agent.api.deps import AdminUser, Alerts, MaybeUser
 from agent.core.config import settings
-from agent.services import access, directory, oidc
+from agent.services import access, digest, directory, oidc
 from agent.services.analysis import fmt_current, fmt_history, system_prompt
 from agent.services.llm import llm_complete
 from agent.services.mysql import db_versions_text
@@ -117,6 +117,41 @@ async def webhook(request: Request, alerts: Alerts):
         processed += 1
 
     return {"processed": processed}
+
+
+@router.get("/api/digest", tags=["Служебные"], summary="Сводка за период")
+async def digest_now(user: MaybeUser, rebuild: bool = False,
+                     hours: float = 0):
+    """Последняя собранная сводка либо новая по запросу.
+
+    Ждать назначенного часа, чтобы посмотреть, что было ночью, незачем —
+    поэтому есть rebuild.
+    """
+    if rebuild or not digest.last():
+        return await digest.build(hours or digest.HOURS)
+    return digest.last()
+
+
+@router.post("/api/digest/send", tags=["Служебные"],
+             summary="Собрать и разослать сводку сейчас")
+async def digest_send(admin: AdminUser):
+    """Проверить, что письмо и вебхук настроены, не дожидаясь утра."""
+    data = await digest.run_once()
+    return {"ok": not data["delivery_problems"],
+            "problems": data["delivery_problems"],
+            "total_alerts": data["total_alerts"]}
+
+
+@router.get("/digest", include_in_schema=False)
+async def digest_page(request: Request, user: MaybeUser):
+    """Постоянная страница со сводкой: письмо может не дойти, а посмотреть надо."""
+    data = digest.last() or await digest.build()
+    text = (data.get("text") or "").replace("&", "&amp;")                                    .replace("<", "&lt;").replace(">", "&gt;")
+    return HTMLResponse(
+        "<html><head><meta charset=\"utf-8\"><title>Сводка мониторинга</title>"
+        "</head><body style=\"background:#12151b;color:#c9d1d9;"
+        "font:13px/1.6 ui-monospace,Consolas,monospace;padding:24px\">"
+        "<pre>%s</pre></body></html>" % text)
 
 
 @router.get("/health", tags=["Служебные"], summary="Живость агента")

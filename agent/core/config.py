@@ -41,6 +41,9 @@ class PrometheusSettings(BaseModel):
     url:               str = "http://localhost:9090"
     max_metrics_hours: int = 24
     baseline_offset_days: int = 7
+    # Сколько недель усреднять медианой. Одна точка ненадёжна:
+    # сбой или праздник ровно неделю назад искажает базу
+    baseline_weeks:       int = 4
     series_max_rows:   int = 500
 
 
@@ -187,6 +190,7 @@ def load_settings() -> Settings:
             url                  = _env("PROMETHEUS_URL", "http://localhost:9090"),
             max_metrics_hours    = int(_env("MAX_METRICS_HOURS", "24")),
             baseline_offset_days = int(_env("BASELINE_OFFSET_DAYS", "7")),
+            baseline_weeks       = max(1, min(12, int(_env("BASELINE_WEEKS", "4")))),
             series_max_rows      = int(_env("SERIES_MAX_ROWS", "500")),
         ),
         db=DatabaseSettings(

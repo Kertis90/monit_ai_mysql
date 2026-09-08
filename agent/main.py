@@ -33,8 +33,9 @@ from agent.api.routes import (alerts, auth, chat, clusters, system,  # noqa: E40
                               users)
 from agent.db.base import dispose, init_models, session_scope      # noqa: E402
 from agent.db.repositories.alerts import AlertRepository           # noqa: E402
+from agent.db.repositories.audit import AuditRepository            # noqa: E402
 from agent.db.repositories.chats import ChatRepository             # noqa: E402
-from agent.services import access, followup                        # noqa: E402
+from agent.services import access, digest, followup                # noqa: E402
 from agent.services.mysql import refresh_db_versions               # noqa: E402
 
 # Пути, доступные без входа. Всё остальное закрыто: забыть добавить проверку
@@ -65,6 +66,7 @@ async def lifespan(app: FastAPI):
     async with session_scope() as session:
         await AlertRepository(session).purge_old()
         await ChatRepository(session).purge_old()
+        await AuditRepository(session).purge_old()
 
     # Версии СУБД спрашиваем на старте: без них модель советует синтаксис
     # наугад — у 5.7 и 8.0 разные имена таблиц performance_schema.
@@ -74,8 +76,18 @@ async def lifespan(app: FastAPI):
     # теряет — восстанавливаем на оставшееся время
     await followup.catch_up()
 
+    # Сводка по расписанию: агент сам приходит с новостями, а не ждёт вопроса
+    digest_task = (asyncio.create_task(digest.scheduler())
+                   if digest.ENABLED else None)
+
     yield
 
+    if digest_task:
+        digest_task.cancel()
+        try:
+            await digest_task
+        except (asyncio.CancelledError, Exception):
+            pass
     await followup.shutdown()
 
     # Задачу надо снять явно: недоступный сервер БД держит её в таймауте

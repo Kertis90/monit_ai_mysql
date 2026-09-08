@@ -121,7 +121,10 @@ const App = (() => {
       // При SSO выход делает прокси, своя кнопка только путала бы
       if (d.source !== 'sso') $('logout-btn').style.display = '';
       state.isAdmin = !!d.is_admin;
-      if (d.is_admin) $('tab-btn-access').style.display = '';
+      if (d.is_admin) {
+        $('tab-btn-access').style.display = '';
+        $('tab-btn-audit').style.display  = '';
+      }
     } catch (e) {
       console.warn('Не удалось определить пользователя:', e);
     }
@@ -439,7 +442,8 @@ const App = (() => {
   // никогда не показывалась, и на клик страница просто пустела.
   const TAB_LOADERS = { status: () => loadStatus(),
                         alerts: () => loadAlerts(),
-                        access: () => loadAccess() };
+                        access: () => loadAccess(),
+                        audit:  () => loadAudit() };
 
   function showTab(tab) {
     state.currentTab = tab;
@@ -679,6 +683,40 @@ const App = (() => {
         </div>`).join('');
     } catch (e) {
       box.innerHTML = '<div class="muted">Не удалось загрузить список: ' + esc(e) + '</div>';
+    }
+  }
+
+  async function loadAudit() {
+    const box = $('audit-list');
+    box.innerHTML = '<div class="muted">Загрузка…</div>';
+    try {
+      const r = await fetch('api/audit?days=' + encodeURIComponent($('audit-days').value)
+                            + '&action=' + encodeURIComponent($('audit-action').value)
+                            + '&limit=300');
+      if (r.status === 403) {
+        box.innerHTML = '<div class="muted">Нужны права администратора.</div>';
+        return;
+      }
+      const d = await r.json();
+      if (!d.items.length) {
+        box.innerHTML = '<div class="muted">За этот период записей нет.</div>';
+        return;
+      }
+      box.innerHTML = d.items.map(a => `
+        <div class="alert-item" style="display:flex;gap:12px;align-items:baseline">
+          <div class="muted" style="font-size:12px;white-space:nowrap">
+            ${esc(String(a.ts).slice(0, 19).replace('T', ' '))}</div>
+          <div style="flex:1;min-width:0">
+            <div>${a.ok ? '' : '<span class="ctx-chip">отказ</span> '}
+              <b>${esc(a.action)}</b>
+              ${a.target ? ' → ' + esc(a.target) : ''}</div>
+            <div class="muted" style="font-size:12px">
+              ${esc(a.username || '—')}${a.ip ? ' · ' + esc(a.ip) : ''}
+              ${a.detail ? ' · ' + esc(String(a.detail).slice(0, 200)) : ''}</div>
+          </div>
+        </div>`).join('');
+    } catch (e) {
+      box.innerHTML = '<div class="muted">Не удалось загрузить журнал: ' + esc(e) + '</div>';
     }
   }
 
@@ -1211,7 +1249,7 @@ const App = (() => {
   // Публичный API для onclick в HTML
   return { showTab, pickCluster, useSuggestion, toggleAnalysis,
            loadStatus, loadAlerts, refreshClusters, forgetHistory, logout,
-           loadAccess, searchDirectory, grantAgain,
+           loadAccess, loadAudit, searchDirectory, grantAgain,
            grantManual, revokeAccess, deleteAlert, deleteAlertsByName,
            resolveAlert,
            stopGeneration };

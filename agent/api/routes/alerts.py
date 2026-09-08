@@ -3,15 +3,15 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
-from agent.api.deps import (AdminUser, Alerts, MaybeUser,
+from agent.api.deps import (AdminUser, Alerts, Audit, MaybeUser,
                             require_ingest_token)
 from agent.schemas.api import AlertOut, IngestAlert, ResolveRequest
 from agent.services.analysis import fmt_current, fmt_history, system_prompt
 from agent.services.llm import llm_complete
 from agent.services.prometheus import collect_current, collect_history
-from agent.services import followup
+from agent.services import audit, followup
 from agent.services.registry import find_cluster
 
 logger = logging.getLogger("agent.api.alerts")
@@ -103,7 +103,7 @@ async def ingest(payload: IngestAlert, alerts: Alerts):
 @router.post("/api/alerts/{alert_id}/resolve",
              summary="Записать, чем закончился инцидент")
 async def resolve(alert_id: int, req: ResolveRequest, alerts: Alerts,
-                  user: MaybeUser):
+                  journal: Audit, user: MaybeUser, request: Request):
     """Записанное решение подкладывается в разбор при повторе того же
     события — агент предложит проверенное вместо вывода с нуля."""
     if not req.resolution.strip():
@@ -115,6 +115,10 @@ async def resolve(alert_id: int, req: ResolveRequest, alerts: Alerts,
     # Через четверть часа агент сам посмотрит, не повторилось ли, и допишет
     # вывод к решению: иначе в памяти инцидентов копится то, что сделали,
     # а не то, что помогло
+    await journal.add(action="решение записано",
+                      username=(user or {}).get("username", ""),
+                      target=str(alert_id), ip=audit.client_ip(request),
+                      detail=req.resolution.strip()[:500])
     followup.schedule(alert_id)
     return {"ok": True, "id": alert_id,
             "check_in_minutes": followup.CHECK_MINUTES}
@@ -129,18 +133,28 @@ async def incidents(alert_name: str, alerts: Alerts, cluster: str = ""):
 
 
 @router.delete("/api/alerts/{alert_id}", summary="Удалить запись истории")
-async def delete_one(alert_id: int, admin: AdminUser, alerts: Alerts):
+async def delete_one(alert_id: int, admin: AdminUser, alerts: Alerts,
+                     journal: Audit, request: Request):
     if not await alerts.delete(alert_id):
         raise HTTPException(status_code=404, detail="Запись не найдена")
+    await journal.add(action="событие удалено",
+                      username=admin.get("username", ""),
+                      target=str(alert_id), ip=audit.client_ip(request))
     return {"ok": True, "id": alert_id}
 
 
 @router.delete("/api/alerts", summary="Удалить все записи одного типа")
-async def delete_by_name(admin: AdminUser, alerts: Alerts,
-                         name: str = "", cluster: str = ""):
+async def delete_by_name(admin: AdminUser, alerts: Alerts, journal: Audit,
+                         request: Request, name: str = "",
+                         cluster: str = ""):
     """Удалить пачку одинаковых записей — например, ложные срабатывания,
     нагенерированные ошибочным правилом."""
     if not name:
         raise HTTPException(status_code=400, detail="Укажите параметр name")
     removed = await alerts.delete_by_name(name, cluster or None)
+    await journal.add(action="события удалены пачкой",
+                      username=admin.get("username", ""), target=name,
+                      ip=audit.client_ip(request),
+                      detail="кластер: %s, записей: %d"
+                             % (cluster or "все", removed))
     return {"ok": True, "alert": name, "removed": removed}

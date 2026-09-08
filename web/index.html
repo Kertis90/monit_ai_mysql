@@ -46,6 +46,8 @@
       <div class="tab"        data-tab="alerts" onclick="App.showTab('alerts')">🔔 Алерты <span class="alert-count" id="alert-count"></span></div>
       <div class="tab" data-tab="access" id="tab-btn-access" style="display:none"
            onclick="App.showTab('access')">🔑 Доступы</div>
+      <div class="tab" data-tab="audit" id="tab-btn-audit" style="display:none"
+           onclick="App.showTab('audit')">📋 Журнал</div>
     </nav>
 
     <!-- ── ЧАТ ── -->
@@ -127,6 +129,39 @@
       <h4 style="margin:0 0 10px">Выданные доступы</h4>
       <div id="access-list"><div class="muted">Загрузка…</div></div>
       <button class="ghost-btn" onclick="App.loadAccess()">↻ Обновить</button>
+    </section>
+
+    <section id="tab-audit" class="tab-pane" hidden>
+      <h3 style="margin:0 0 4px">Журнал действий</h3>
+      <p class="muted" style="margin:0 0 18px;font-size:13px">
+        Входы, выдача и отзыв доступов, удаление событий, записанные решения
+        и выполненные SQL-запросы. Хранится год.
+      </p>
+      <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center">
+        <select id="audit-action" onchange="App.loadAudit()"
+                style="padding:9px;border-radius:8px;border:1px solid var(--border,#2b313c);
+                       background:var(--bg,#12151b);color:inherit">
+          <option value="">все действия</option>
+          <option value="вход">входы</option>
+          <option value="вход отклонён">отказы во входе</option>
+          <option value="доступ выдан">выдача доступа</option>
+          <option value="доступ отозван">отзыв доступа</option>
+          <option value="событие удалено">удаление событий</option>
+          <option value="события удалены пачкой">удаление пачкой</option>
+          <option value="решение записано">записанные решения</option>
+          <option value="SQL-запрос">SQL-запросы</option>
+        </select>
+        <select id="audit-days" onchange="App.loadAudit()"
+                style="padding:9px;border-radius:8px;border:1px solid var(--border,#2b313c);
+                       background:var(--bg,#12151b);color:inherit">
+          <option value="1">за сутки</option>
+          <option value="7">за неделю</option>
+          <option value="30" selected>за месяц</option>
+          <option value="365">за год</option>
+        </select>
+        <button class="ghost-btn" onclick="App.loadAudit()">↻ Обновить</button>
+      </div>
+      <div id="audit-list"><div class="muted">Загрузка…</div></div>
     </section>
   </main>
 </div>

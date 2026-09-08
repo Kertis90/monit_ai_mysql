@@ -418,6 +418,18 @@ LDAP_SEARCH_MODE="${LDAP_SEARCH_MODE:-prefix}"
 WORKLOAD_WINDOW_S="${WORKLOAD_WINDOW_S:-10}"
 # Через сколько минут после записи решения проверить, не повторилось ли
 FOLLOWUP_MINUTES="${FOLLOWUP_MINUTES:-15}"
+# Сколько недель усреднять для базы сравнения. Одна точка ненадёжна: сбой
+# или праздник ровно неделю назад искажает представление о норме
+BASELINE_WEEKS="${BASELINE_WEEKS:-4}"
+
+# ── Сводка по расписанию ─────────────────────────────────────────────────────
+# Агент сам присылает, что было за период: события, деградация, нерешённое.
+# Почта берётся из настроек Alertmanager выше. DIGEST_WEBHOOK — для мессенджера.
+DIGEST_ENABLED="${DIGEST_ENABLED:-false}"
+DIGEST_AT="${DIGEST_AT:-09:00}"
+DIGEST_HOURS="${DIGEST_HOURS:-24}"
+DIGEST_TO="${DIGEST_TO:-}"
+DIGEST_WEBHOOK="${DIGEST_WEBHOOK:-}"
 
 LDAP_SEARCH_FILTER="${LDAP_SEARCH_FILTER:-}"
 # Откуда дозаполнять пустые настройки LDAP. Пусто — не читать
@@ -479,6 +491,8 @@ CHATS_RETENTION_DAYS=${CHATS_RETENTION_DAYS}
 # Токены для POST /api/alerts/ingest (несколько — через запятую).
 # Пусто = приём алертов из внешних систем выключен.
 INGEST_TOKENS=$(sq "${INGEST_TOKENS}")
+# Событий в минуту от одного отправителя. 0 — не ограничивать
+INGEST_RATE_PER_MIN="${INGEST_RATE_PER_MIN:-120}"
 
 # Версии экспортёров
 NODE_EXPORTER_VERSION="${NODE_EXPORTER_VERSION}"

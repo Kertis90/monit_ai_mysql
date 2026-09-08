@@ -161,3 +161,29 @@ class Feedback(Base):
     comment:   Mapped[Optional[str]] = mapped_column(Text)
 
     __table_args__ = (Index("idx_feedback_ts", "ts"),)
+
+
+class AuditEntry(Base):
+    """Кто что сделал.
+
+    Раньше это оседало в журнале systemd вперемешку с остальным выводом.
+    При разборе «почему у него был доступ» или «кто снёс эти события» искать
+    там неудобно, а после ротации журнала — уже негде.
+
+    Таблица новая, поэтому создаётся сама и на существующих базах: create_all
+    добавляет отсутствующие таблицы, хотя колонки в существующие не дописывает.
+    """
+    __tablename__ = "audit"
+
+    id:       Mapped[int] = mapped_column(Integer, primary_key=True,
+                                          autoincrement=True)
+    ts:       Mapped[str] = mapped_column(String(TS_LEN), nullable=False)
+    username: Mapped[Optional[str]] = mapped_column(String(NAME_LEN))
+    action:   Mapped[str] = mapped_column(String(64), nullable=False)
+    target:   Mapped[Optional[str]] = mapped_column(String(LABEL_LEN))
+    detail:   Mapped[Optional[str]] = mapped_column(Text)
+    ip:       Mapped[Optional[str]] = mapped_column(String(64))
+    ok:       Mapped[int] = mapped_column(Integer, nullable=False,
+                                          default=1, server_default="1")
+
+    __table_args__ = (Index("idx_audit_ts", "ts"),)

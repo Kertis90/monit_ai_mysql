@@ -176,6 +176,9 @@ DB_URL=${DB_URL:-}
 ALERTS_RETENTION_DAYS=${ALERTS_RETENTION_DAYS:-30}
 CHATS_RETENTION_DAYS=${CHATS_RETENTION_DAYS:-30}
 INGEST_TOKENS=${INGEST_TOKENS:-}
+# Событий в минуту от одного отправителя. 0 — не ограничивать.
+# Защита не от расходов, а от зациклившегося скрипта на той стороне
+INGEST_RATE_PER_MIN=${INGEST_RATE_PER_MIN:-120}
 # Чтение логов на серверах БД идёт по SSH под той же учёткой,
 # что и установка экспортёров
 SSH_USER=${SSH_USER:-}
@@ -189,6 +192,18 @@ CHAT_CONTEXT_MESSAGES=${CHAT_CONTEXT_MESSAGES:-10}
 WORKLOAD_WINDOW_S=${WORKLOAD_WINDOW_S:-10}
 # Через сколько минут после записи решения проверить, не повторилось ли
 FOLLOWUP_MINUTES=${FOLLOWUP_MINUTES:-15}
+# Сводка по расписанию: во сколько, за какой период и кому
+DIGEST_ENABLED=${DIGEST_ENABLED:-false}
+DIGEST_AT=${DIGEST_AT:-09:00}
+DIGEST_HOURS=${DIGEST_HOURS:-24}
+DIGEST_TO=${DIGEST_TO:-}
+DIGEST_WEBHOOK=${DIGEST_WEBHOOK:-}
+# Почта берётся из тех же настроек, что и у Alertmanager
+ALERT_EMAIL_FROM=${ALERT_EMAIL_FROM:-}
+ALERT_SMTP_HOST=${ALERT_SMTP_HOST:-}
+ALERT_SMTP_USER=${ALERT_SMTP_USER:-}
+ALERT_SMTP_PASSWORD=${ALERT_SMTP_PASSWORD:-}
+BASELINE_WEEKS=${BASELINE_WEEKS:-4}
 LOG_MAX_LINES=${LOG_MAX_LINES:-400}
 LOG_SSH_TIMEOUT=${LOG_SSH_TIMEOUT:-25}
 AUTH_ENABLED=${AUTH_ENABLED:-true}
