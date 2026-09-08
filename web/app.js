@@ -26,6 +26,7 @@ const App = (() => {
     lastQuestion:  '',     // вопрос — сохраняем вместе с оценкой
     pendingCharts: null,   // графики, ждущие конца ответа
     awaitingReply: false,
+    replyTimer:    null,
     pingTimer:     null,
   };
 
@@ -132,6 +133,24 @@ const App = (() => {
   function setChatTitle(text) {
     const el = $('chat-title');
     if (el) el.textContent = text;
+  }
+
+  const CLUSTERS_KEY = 'mysql-ai-agent.clusters_collapsed';
+
+  function toggleClusters() {
+    const layout = document.querySelector('.layout');
+    const on = layout.classList.toggle('clusters-collapsed');
+    $('collapse-btn').title = on ? 'Показать список кластеров'
+                                 : 'Свернуть список кластеров';
+    // Запоминаем выбор: разворачивать панель при каждой перезагрузке
+    // раздражает того, кто её свернул осознанно
+    try { localStorage.setItem(CLUSTERS_KEY, on ? '1' : '0'); } catch (e) {}
+  }
+
+  function restoreClustersState() {
+    let collapsed = false;
+    try { collapsed = localStorage.getItem(CLUSTERS_KEY) === '1'; } catch (e) {}
+    if (collapsed) toggleClusters();
   }
 
   function toggleSidebar() {
@@ -255,19 +274,6 @@ const App = (() => {
       scrollToBottom();
     } catch (e) {
       console.warn('История чата недоступна:', e);
-    }
-  }
-
-  async function forgetHistory() {
-    if (!confirm('Очистить переписку текущего чата?')) return;
-    try {
-      await fetch('chat/history?' + cid() +
-                  (state.threadId ? '&thread=' + encodeURIComponent(state.threadId) : ''),
-                  { method: 'DELETE' });
-      $('messages').innerHTML = '';
-      addAssistantMsg('История очищена.');
-    } catch (e) {
-      addAssistantMsg('Не удалось очистить историю: ' + e);
     }
   }
 
@@ -418,22 +424,40 @@ const App = (() => {
   }
 
   function finishStreaming(suffix) {
-    if (state.streamingEl) {
-      const think = state.streamingEl.querySelector('.thinking');
-      if (think) think.remove();
-      if (suffix) state.streamBuf += suffix;
-      state.streamingEl.innerHTML = renderMarkdown(state.streamBuf);
-      state.streamingEl.classList.remove('streaming');
-      state.streamBuf = '';
-      // Графики встраиваем в само сообщение, а не отдельным блоком снизу
-      if (state.pendingCharts) {
-        attachCharts(state.streamingEl.parentElement, state.pendingCharts);
-        state.pendingCharts = null;
+    // Отрисовка в try, снятие блокировки — в finally. Раньше флаг ожидания
+    // снимался после отрисовки: любая ошибка в разметке, графиках или
+    // кнопках оценки оставляла его поднятым навсегда, поле ввода —
+    // заблокированным, а все следующие отправки молча не уходили. Внешне
+    // это выглядело как «запрос висит» до перезагрузки страницы.
+    try {
+      if (state.streamingEl) {
+        const think = state.streamingEl.querySelector('.thinking');
+        if (think) think.remove();
+        if (suffix) state.streamBuf += suffix;
+        state.streamingEl.innerHTML = renderMarkdown(state.streamBuf);
+        state.streamingEl.classList.remove('streaming');
+        state.streamBuf = '';
+        // Графики встраиваем в само сообщение, а не отдельным блоком снизу
+        if (state.pendingCharts) {
+          attachCharts(state.streamingEl.parentElement, state.pendingCharts);
+          state.pendingCharts = null;
+        }
+        attachFeedback(state.streamingEl.parentElement, state.lastQuestion,
+                       state.streamingEl.textContent || '');
       }
-      attachFeedback(state.streamingEl.parentElement, state.lastQuestion,
-                     state.streamingEl.textContent || '');
+    } catch (e) {
+      console.error('Не удалось показать ответ:', e);
+      if (state.streamingEl) state.streamingEl.textContent = state.streamBuf;
+    } finally {
       state.streamingEl = null;
+      state.streamBuf = '';
+      state.pendingCharts = null;
+      unlockInput();
     }
+  }
+
+  function unlockInput() {
+    clearTimeout(state.replyTimer);
     state.awaitingReply = false;
     $('input').disabled = false;
     $('send-btn').style.display = '';
@@ -475,6 +499,14 @@ const App = (() => {
     el.innerHTML = '<span class="thinking"><i></i><i></i><i></i></span>';
     state.streamingEl   = el;
     state.awaitingReply = true;
+    // Сторож: если сервер замолчал, не закрыв соединение, поле ввода должно
+    // разблокироваться само — иначе чат выглядит зависшим без причины
+    clearTimeout(state.replyTimer);
+    state.replyTimer = setTimeout(() => {
+      if (state.awaitingReply) {
+        finishStreaming('\n\n[ответ не пришёл за 5 минут — попробуйте ещё раз]');
+      }
+    }, 300000);
 
     input.value    = '';
     autoResize(input);
@@ -1419,15 +1451,17 @@ const App = (() => {
     $('stop-btn').addEventListener('click', stopGeneration);
     bindDirResults();
     bindThreadList();
+    restoreClustersState();
   }
 
   document.addEventListener('DOMContentLoaded', init);
 
   // Публичный API для onclick в HTML
   return { showTab, pickCluster, useSuggestion, toggleAnalysis,
-           loadStatus, loadAlerts, refreshClusters, forgetHistory, logout,
+           loadStatus, loadAlerts, refreshClusters, logout,
            loadAccess, loadAudit, searchDirectory, grantAgain,
            newThread, deleteThread, switchThread, toggleSidebar,
+           toggleClusters,
            grantManual, revokeAccess, deleteAlert, deleteAlertsByName,
            resolveAlert,
            stopGeneration };

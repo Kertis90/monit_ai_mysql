@@ -324,6 +324,13 @@ def threads(client) -> None:
     first = client.get("/chat/threads").json()["items"]
     check("прежняя переписка собрана в чат", len(first) >= 1, True)
 
+    # Чтение истории не должно ничего создавать: из-за этого открытие
+    # страницы заводило чат, и «Новый чат» давал сразу два
+    before = len(client.get("/chat/threads").json()["items"])
+    client.get("/chat/history?limit=10")
+    check("чтение истории не создаёт чат",
+          len(client.get("/chat/threads").json()["items"]), before)
+
     created = client.post("/chat/threads?title=Разбор аварии").json()
     check("чат создан", bool(created["id"]), True)
     listed = client.get("/chat/threads").json()["items"]

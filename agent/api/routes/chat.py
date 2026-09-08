@@ -453,13 +453,18 @@ async def chat_history(request: Request, chats: Chats, client_id: str = "",
     key = await chat_key(request, client_id)
     if not key:
         raise HTTPException(status_code=400, detail="client_id обязателен")
-    if not thread:
-        thread = (await chats.current_thread(key)).id
-    elif await chats.get_thread(key, thread) is None:
-        raise HTTPException(status_code=404, detail="Чат не найден")
+    if thread:
+        if await chats.get_thread(key, thread) is None:
+            raise HTTPException(status_code=404, detail="Чат не найден")
+    else:
+        # Чат НЕ создаём: чтение не должно ничего создавать. Раньше открытие
+        # страницы заводило чат, и нажатие «Новый чат» давало сразу два.
+        existing = await chats.threads(key)
+        thread = existing[0]["id"] if existing else ""
 
-    rows = await chats.history(key, limit=limit, thread_id=thread)
-    return {"client_id": key, "thread_id": thread, "total": len(rows),
+    rows = (await chats.history(key, limit=limit, thread_id=thread)
+            if thread else [])
+    return {"client_id": key, "thread_id": thread or None, "total": len(rows),
             "items": [{"ts": r.ts, "role": r.role, "content": r.content}
                       for r in rows],
             "retention_days": settings.db.chats_retention_days,

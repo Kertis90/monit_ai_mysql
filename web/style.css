@@ -704,3 +704,48 @@ textarea#input:disabled { opacity: .55; }
   }
   .chat-pane { position: relative; }
 }
+
+/* ── Сворачивание списка кластеров ───────────────────────────────────
+   Полоса в 290 пикселей нужна не всегда: при разборе по логам и таблицам
+   место важнее. Панель уезжает влево, оставляя узкую полоску с кнопкой —
+   так её видно, куда вернуть, в отличие от полностью скрытой. */
+
+.side-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.collapse-btn {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  transition: transform .18s, color .15s, border-color .15s;
+}
+.collapse-btn:hover { color: var(--text-hl); border-color: var(--border-hl); }
+
+.layout.clusters-collapsed .sidebar {
+  width: 34px;
+  min-width: 34px;
+}
+.layout.clusters-collapsed .cluster-list,
+.layout.clusters-collapsed .side-footer,
+.layout.clusters-collapsed .side-title-text { display: none; }
+
+.layout.clusters-collapsed .side-title {
+  padding-left: 5px;
+  padding-right: 5px;
+  justify-content: center;
+}
+/* Стрелка разворачивается: свёрнутая панель предлагает раскрыть */
+.layout.clusters-collapsed .collapse-btn { transform: rotate(180deg); }
+
+.sidebar { transition: width .18s ease; }

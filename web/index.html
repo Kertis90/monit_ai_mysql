@@ -18,8 +18,6 @@
   <span class="hbadge" id="ws-badge">подключение…</span>
   <div class="spacer"></div>
   <span class="hint">Enter — отправить · Shift+Enter — новая строка</span>
-  <span class="hbadge" id="forget-btn" title="Удалить переписку текущего чата, сам чат останется"
-        style="cursor:pointer" onclick="App.forgetHistory()">Очистить чат</span>
   <span class="hbadge" id="user-badge" style="display:none"></span>
   <span class="hbadge" id="logout-btn" title="Выйти"
         style="cursor:pointer;display:none" onclick="App.logout()">Выйти</span>
@@ -28,8 +26,12 @@
 <div class="layout">
 
   <!-- ═══ Сайдбар: кластеры ═══ -->
-  <aside class="sidebar">
-    <div class="side-title">Кластеры</div>
+  <aside class="sidebar" id="sidebar">
+    <div class="side-title">
+      <span class="side-title-text">Кластеры</span>
+      <button class="collapse-btn" id="collapse-btn" onclick="App.toggleClusters()"
+              title="Свернуть список кластеров">›</button>
+    </div>
     <div class="cluster-list" id="cluster-list">
       <div class="muted pad">Загрузка…</div>
     </div>
