@@ -127,6 +127,15 @@ LDAP_SEARCH_PASSWORD  = os.environ.get("LDAP_SEARCH_PASSWORD", "")
 # сервера. Жёсткий фильтр под AD ронял поиск в OpenLDAP: ldap3 сверяет имена
 # атрибутов со схемой и на sAMAccountName выдавал LDAPAttributeError.
 LDAP_SEARCH_FILTER    = os.environ.get("LDAP_SEARCH_FILTER", "").strip()
+# Ветка, в которой лежат люди. В nslcd это отдельная строка "base passwd
+# ou=people,dc=...", и она заметно уже общей: перебирать весь каталог ради
+# поиска человека — верный способ упереться в административный лимит сервера.
+LDAP_USER_BASE        = os.environ.get("LDAP_USER_BASE", "").strip()
+# prefix — искать по началу строки, contains — по вхождению.
+# Ведущая звёздочка в (атрибут=*текст*) отключает индекс: сервер перебирает
+# ветку целиком и обрывает поиск с adminLimitExceeded. По умолчанию ищем по
+# началу — для фамилии и логина этого достаточно.
+LDAP_SEARCH_MODE      = os.environ.get("LDAP_SEARCH_MODE", "prefix").strip().lower()
 
 
 def nslcd_defaults() -> None:
@@ -137,7 +146,8 @@ def nslcd_defaults() -> None:
     а агент — свой .env, и они разъезжаются. Поэтому пустые значения берём
     прямо из nslcd. Заполненные не трогаем: явная настройка всегда главнее.
     """
-    global LDAP_URL, LDAP_BASE_DN, LDAP_USER_FILTER, LDAP_BIND_TEMPLATE
+    global LDAP_URL, LDAP_BASE_DN, LDAP_USER_BASE
+    global LDAP_USER_FILTER, LDAP_BIND_TEMPLATE
     global LDAP_SEARCH_USER, LDAP_SEARCH_PASSWORD
     global LDAP_NETGROUP_BASE, LDAP_NETGROUP_FILTER
 
@@ -157,8 +167,8 @@ def nslcd_defaults() -> None:
 
     here = globals()
     taken = []
-    for key in ("LDAP_URL", "LDAP_BASE_DN", "LDAP_USER_FILTER",
-                "LDAP_BIND_TEMPLATE", "LDAP_SEARCH_USER",
+    for key in ("LDAP_URL", "LDAP_BASE_DN", "LDAP_USER_BASE",
+                "LDAP_USER_FILTER", "LDAP_BIND_TEMPLATE", "LDAP_SEARCH_USER",
                 "LDAP_SEARCH_PASSWORD", "LDAP_NETGROUP_BASE",
                 "LDAP_NETGROUP_FILTER"):
         if here.get(key) or not vals.get(key):
@@ -937,8 +947,34 @@ def build_search_filter(known: set, safe_query: str) -> str:
     """Фильтр поиска только из тех атрибутов, что есть в схеме."""
     usable = [a for a in SEARCH_ATTRS
               if not known or a.lower() in known] or ["cn"]
+    tmpl = "*%s*" if LDAP_SEARCH_MODE == "contains" else "%s*"
+    pat  = tmpl % safe_query
     return ("(&" + user_object_class() + "(|"
-            + "".join("(%s=*%s*)" % (a, safe_query) for a in usable) + "))")
+            + "".join("(%s=%s)" % (a, pat) for a in usable) + "))")
+
+
+# Коды, при которых каталог обрывает поиск сам. Различать обязательно: это
+# не "никого нет", а "искать так нельзя".
+LDAP_LIMIT_CODES = {
+    3:  ("timeLimitExceeded", "каталог прервал поиск по времени"),
+    4:  ("sizeLimitExceeded", "каталог вернул не всё: превышен предел записей"),
+    11: ("adminLimitExceeded",
+         "каталог прервал поиск по административному лимиту"),
+}
+
+
+def limit_advice(base: str) -> str:
+    """Что делать, если сервер оборвал поиск."""
+    tips = []
+    if LDAP_SEARCH_MODE == "contains":
+        tips.append("уберите LDAP_SEARCH_MODE=contains — поиск по вхождению "
+                    "не может использовать индекс")
+    if not LDAP_USER_BASE:
+        tips.append("сузьте ветку поиска: задайте LDAP_USER_BASE, например "
+                    "ou=people,%s" % base)
+    tips.append("либо задайте свой LDAP_SEARCH_FILTER по индексированному "
+                "атрибуту")
+    return "; ".join(tips)
 
 
 def login_attr() -> str:
@@ -961,8 +997,8 @@ def directory_search_status() -> str:
         return "LDAP выключен: LDAP_ENABLED=false в config.env"
     if not LDAP_URL:
         return "не задан LDAP_URL"
-    if not LDAP_BASE_DN:
-        return "не задан LDAP_BASE_DN — неизвестно, в какой ветке искать"
+    if not (LDAP_USER_BASE or LDAP_BASE_DN):
+        return "не заданы ни LDAP_USER_BASE, ни LDAP_BASE_DN — негде искать"
     return ""
 
 
@@ -999,9 +1035,10 @@ def ldap_search_users(query: str, limit: int = 25) -> tuple:
         known = schema_attrs(conn)
         flt = (LDAP_SEARCH_FILTER.replace("{query}", safe)
                if LDAP_SEARCH_FILTER else build_search_filter(known, safe))
+        base = LDAP_USER_BASE or LDAP_BASE_DN
         logger.info(
-            "Поиск в каталоге: сервер %s, вход %s, база %s",
-            LDAP_URL, LDAP_SEARCH_USER or "анонимно", LDAP_BASE_DN)
+            "Поиск в каталоге: сервер %s, вход %s, база %s, режим %s",
+            LDAP_URL, LDAP_SEARCH_USER or "анонимно", base, LDAP_SEARCH_MODE)
         logger.info("Поиск в каталоге: схема %s, фильтр %s",
                     ("прочитана, %d атрибутов" % len(known)) if known
                     else "НЕ прочитана", flt)
@@ -1020,20 +1057,27 @@ def ldap_search_users(query: str, limit: int = 25) -> tuple:
                         % ", ".join((primary, "sAMAccountName", "uid")))
         extra = [a for a in ("displayName", "cn", "mail")
                  if not known or a.lower() in known]
-        conn.search(LDAP_BASE_DN, flt, search_scope=SUBTREE,
+        conn.search(base, flt, search_scope=SUBTREE,
                     attributes=names + extra, size_limit=limit)
         res = getattr(conn, "result", None) or {}
         logger.info(
             "Поиск в каталоге: запрошены %s, ответ %s (%s), записей %d",
             names + extra, res.get("description", "?"),
             res.get("message") or "без пояснений", len(conn.entries))
+
+        code = res.get("result")
+        if code in LDAP_LIMIT_CODES and not conn.entries:
+            name, human = LDAP_LIMIT_CODES[code]
+            advice = limit_advice(LDAP_BASE_DN)
+            logger.error("Поиск в каталоге: %s (%s). %s", human, name, advice)
+            return [], "%s (%s). %s" % (human, name, advice)
         if not conn.entries:
             # Тот же поиск без условия по objectClass: если так находится,
             # значит дело именно в нём, а не в атрибутах или базе
             probe = "(|" + "".join("(%s=*%s*)" % (a, safe)
                                    for a in (names + extra)) + ")"
             try:
-                conn.search(LDAP_BASE_DN, probe, search_scope=SUBTREE,
+                conn.search(base, probe, search_scope=SUBTREE,
                             attributes=[], size_limit=5)
                 if conn.entries:
                     logger.warning(
@@ -1046,11 +1090,11 @@ def ldap_search_users(query: str, limit: int = 25) -> tuple:
                     logger.info(
                         "Поиск в каталоге: и без условия по objectClass "
                         "ничего нет — под базой %s такого текста не найдено",
-                        LDAP_BASE_DN)
+                        base)
             except Exception as probe_err:
                 logger.info("Поиск в каталоге: проверочный запрос не удался: %s",
                             probe_err)
-            conn.search(LDAP_BASE_DN, flt, search_scope=SUBTREE,
+            conn.search(base, flt, search_scope=SUBTREE,
                         attributes=names + extra, size_limit=limit)
         out = []
         for e in conn.entries:

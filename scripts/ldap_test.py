@@ -312,24 +312,36 @@ def schema_attrs(conn) -> set:
         return set()
 
 
+LIMIT_CODES = {
+    3:  ("timeLimitExceeded", "каталог прервал поиск по времени"),
+    4:  ("sizeLimitExceeded", "каталог вернул не всё: превышен предел записей"),
+    11: ("adminLimitExceeded",
+         "каталог прервал поиск по административному лимиту"),
+}
+
+
 def check_search(cfg: dict, conn, query: str) -> None:
     """Ровно тот поиск, который делает агент во вкладке «Доступы»."""
-    base  = cfg.get("LDAP_BASE_DN", "")
+    base  = cfg.get("LDAP_USER_BASE") or cfg.get("LDAP_BASE_DN", "")
     known = schema_attrs(conn)
     usable = [a for a in SEARCH_ATTRS if not known or a.lower() in known] or ["cn"]
     m = re.search(r"\(objectClass=([A-Za-z0-9_-]+)\)",
                   cfg.get("LDAP_USER_FILTER", ""), re.I)
     guard = ("(objectClass=%s)" % m.group(1) if m
              else "(|(objectClass=person)(objectClass=posixAccount))")
-    own = cfg.get("LDAP_SEARCH_FILTER", "").strip()
+    own  = cfg.get("LDAP_SEARCH_FILTER", "").strip()
+    mode = (cfg.get("LDAP_SEARCH_MODE") or "prefix").lower()
     safe = escape_filter_chars(query)
-    flt = (own.replace("{query}", safe) if own else
-           "(&" + guard + "(|"
-           + "".join("(%s=*%s*)" % (a, safe) for a in usable) + "))")
+    pat  = ("*%s*" if mode == "contains" else "%s*") % safe
+    flt  = (own.replace("{query}", safe) if own else
+            "(&" + guard + "(|"
+            + "".join("(%s=%s)" % (a, pat) for a in usable) + "))")
 
     print("  база    : %s" % (base or "(пусто!)"))
     print("  схема   : %s" % (("прочитана, %d атрибутов" % len(known))
                               if known else "НЕ прочитана"))
+    print("  режим   : %s" % ("по вхождению (индекс не работает!)"
+                              if mode == "contains" else "по началу строки"))
     print("  атрибуты: %s" % ", ".join(usable))
     print("  фильтр  : %s" % flt)
     try:
@@ -342,6 +354,26 @@ def check_search(cfg: dict, conn, query: str) -> None:
     print("  ответ   : %s%s" % (res.get("description", "?"),
                                 (" — " + res["message"]) if res.get("message") else ""))
     print("  найдено : %d" % len(conn.entries))
+
+    code = res.get("result")
+    if code in LIMIT_CODES:
+        name, human = LIMIT_CODES[code]
+        print("")
+        print("  ПРИЧИНА: %s (%s)." % (human, name))
+        print("           Искать так каталог не даёт — это не «никого нет».")
+        if mode == "contains":
+            print("           Уберите LDAP_SEARCH_MODE=contains: ведущая")
+            print("           звёздочка отключает индекс, и сервер перебирает")
+            print("           ветку целиком.")
+        if not cfg.get("LDAP_USER_BASE"):
+            print("           Сузьте ветку — задайте LDAP_USER_BASE, например")
+            print("             LDAP_USER_BASE=\"ou=people,%s\""
+                  % cfg.get("LDAP_BASE_DN", ""))
+            print("           В nslcd это строка «base passwd».")
+        print("           Либо задайте LDAP_SEARCH_FILTER по атрибуту,")
+        print("           который в каталоге проиндексирован.")
+        if not conn.entries:
+            return
     for e in conn.entries[:5]:
         vals = ["%s=%s" % (a, attr(e, a)[0]) for a in usable if attr(e, a)]
         print("    %s" % e.entry_dn)

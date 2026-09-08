@@ -403,6 +403,12 @@ LDAP_NETGROUP_BASE="${LDAP_NETGROUP_BASE:-}"
 LDAP_NETGROUP_FILTER="${LDAP_NETGROUP_FILTER:-(objectClass=nisNetgroup)}"
 LDAP_TLS_VERIFY="${LDAP_TLS_VERIFY}"
 # Сервисная учётка — только для поиска по каталогу при выдаче доступов
+# Ветка, где лежат люди (в nslcd — строка "base passwd").
+# Пусто — искать от LDAP_BASE_DN. Своя ветка заметно уже и не упирается
+# в административный лимит сервера.
+LDAP_USER_BASE="${LDAP_USER_BASE:-}"
+# prefix — искать по началу строки (использует индекс), contains — по вхождению
+LDAP_SEARCH_MODE="${LDAP_SEARCH_MODE:-prefix}"
 # Фильтр поиска людей во вкладке «Доступы». Пусто — агент соберёт его сам
 # из атрибутов, которые есть в схеме каталога. Подстановка: {query}
 LDAP_SEARCH_FILTER="${LDAP_SEARCH_FILTER:-}"

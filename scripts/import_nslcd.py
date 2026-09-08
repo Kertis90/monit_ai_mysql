@@ -22,6 +22,7 @@
     filter passwd           LDAP_USER_FILTER (шаблон с {username})
     ssl / tls_reqcert       LDAP_TLS_VERIFY
     bind_timelimit          LDAP_TIMEOUT
+    base passwd             LDAP_USER_BASE
     base netgroup           LDAP_NETGROUP_BASE
     filter netgroup         LDAP_NETGROUP_FILTER
 
@@ -147,6 +148,7 @@ def build(cfg: dict, groups: str, netgroups: str = "") -> dict:
         "LDAP_ENABLED":         "true",
         "LDAP_URL":             uri,
         "LDAP_BASE_DN":         b.get("") or b.get("passwd", ""),
+        "LDAP_USER_BASE":       b.get("passwd", ""),
         "LDAP_ALLOWED_NETGROUPS": netgroups,
         "LDAP_NETGROUP_BASE":   ng_base,
         "LDAP_NETGROUP_FILTER": ng_filter,

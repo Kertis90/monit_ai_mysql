@@ -180,6 +180,9 @@ LDAP_TLS_VERIFY=${LDAP_TLS_VERIFY:-true}
 LDAP_SEARCH_USER=${LDAP_SEARCH_USER:-}
 LDAP_SEARCH_PASSWORD=${LDAP_SEARCH_PASSWORD:-}
 LDAP_SEARCH_FILTER=${LDAP_SEARCH_FILTER:-}
+LDAP_USER_BASE=${LDAP_USER_BASE:-}
+# prefix — по началу строки (использует индекс), contains — по вхождению
+LDAP_SEARCH_MODE=${LDAP_SEARCH_MODE:-prefix}
 # Откуда дозаполнять пустые настройки LDAP. Пусто в NSLCD_CONF — не читать
 NSLCD_CONF=${NSLCD_CONF:-/etc/nslcd.conf}
 OIDC_ENABLED=${OIDC_ENABLED:-false}
