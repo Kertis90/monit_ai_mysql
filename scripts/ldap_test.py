@@ -12,6 +12,7 @@ DN группы. Каталог это знает, но агент пишет в
 
     sudo ./scripts/ldap_test.py
     sudo ./scripts/ldap_test.py --user ivkop
+    sudo ./scripts/ldap_test.py --user ivkop --search Иванов
 """
 import getpass
 import os
@@ -294,6 +295,123 @@ def check_netgroups(cfg: dict, username: str, conn) -> None:
         print("  и переустановите агента: sudo ./scripts/install_agent.sh")
 
 
+SEARCH_ATTRS = ("sAMAccountName", "uid", "cn", "displayName",
+                "sn", "givenName", "gecos", "mail")
+
+
+def schema_attrs(conn) -> set:
+    """Имена атрибутов, известные серверу. Пусто — схему прочитать не вышло."""
+    try:
+        out = set()
+        for key, val in (conn.server.schema.attribute_types or {}).items():
+            out.add(str(key).lower())
+            for alias in (getattr(val, "name", None) or ()):
+                out.add(str(alias).lower())
+        return out
+    except Exception:
+        return set()
+
+
+def check_search(cfg: dict, conn, query: str) -> None:
+    """Ровно тот поиск, который делает агент во вкладке «Доступы»."""
+    base  = cfg.get("LDAP_BASE_DN", "")
+    known = schema_attrs(conn)
+    usable = [a for a in SEARCH_ATTRS if not known or a.lower() in known] or ["cn"]
+    m = re.search(r"\(objectClass=([A-Za-z0-9_-]+)\)",
+                  cfg.get("LDAP_USER_FILTER", ""), re.I)
+    guard = ("(objectClass=%s)" % m.group(1) if m
+             else "(|(objectClass=person)(objectClass=posixAccount))")
+    own = cfg.get("LDAP_SEARCH_FILTER", "").strip()
+    safe = escape_filter_chars(query)
+    flt = (own.replace("{query}", safe) if own else
+           "(&" + guard + "(|"
+           + "".join("(%s=*%s*)" % (a, safe) for a in usable) + "))")
+
+    print("  база    : %s" % (base or "(пусто!)"))
+    print("  схема   : %s" % (("прочитана, %d атрибутов" % len(known))
+                              if known else "НЕ прочитана"))
+    print("  атрибуты: %s" % ", ".join(usable))
+    print("  фильтр  : %s" % flt)
+    try:
+        conn.search(base, flt, search_scope=SUBTREE, attributes=usable,
+                    size_limit=10)
+    except Exception as e:
+        print("  ОШИБКА  : %s" % e)
+        return
+    res = getattr(conn, "result", None) or {}
+    print("  ответ   : %s%s" % (res.get("description", "?"),
+                                (" — " + res["message"]) if res.get("message") else ""))
+    print("  найдено : %d" % len(conn.entries))
+    for e in conn.entries[:5]:
+        vals = ["%s=%s" % (a, attr(e, a)[0]) for a in usable if attr(e, a)]
+        print("    %s" % e.entry_dn)
+        if vals:
+            print("      %s" % ", ".join(vals))
+    if conn.entries:
+        return
+
+    # Ничего не нашли — выясняем, в условии ли по objectClass дело
+    probe = "(|" + "".join("(%s=*%s*)" % (a, safe) for a in usable) + ")"
+    try:
+        conn.search(base, probe, search_scope=SUBTREE, size_limit=5)
+    except Exception as e:
+        print("  проверочный запрос не удался: %s" % e)
+        return
+    print("")
+    if conn.entries:
+        print("  ПРИЧИНА: без условия %s находится %d записей, например"
+              % (guard, len(conn.entries)))
+        print("           %s" % conn.entries[0].entry_dn)
+        print("           Мешает именно условие по objectClass. Задайте свой")
+        print("           фильтр в config.env:")
+        print("             LDAP_SEARCH_FILTER=\"(|%s)\""
+              % "".join("(%s=*{query}*)" % a for a in usable))
+    else:
+        print("  ПРИЧИНА: под базой %s нет записей с таким текстом ни в одном" % base)
+        print("           из перечисленных атрибутов. Проверьте базу поиска.")
+
+
+AGENT_ENV = "/opt/ai-alert-agent/.env"
+
+
+def compare_with_agent(cfg: dict) -> None:
+    """Совпадают ли настройки в config.env и в том, что читает агент.
+
+    Частая причина «скрипт находит, а агент нет»: config.env поправили, а
+    установку не перезапускали. Скрипт читает config.env, агент — свой .env,
+    и они живут раздельно.
+    """
+    if not os.path.exists(AGENT_ENV):
+        print("  %s не найден — агент не установлен?" % AGENT_ENV)
+        return
+    try:
+        live = read_config(AGENT_ENV)
+    except PermissionError:
+        print("  %s не читается — запустите через sudo" % AGENT_ENV)
+        return
+
+    keys = [k for k in cfg if k.startswith("LDAP_")]
+    keys += [k for k in live if k.startswith("LDAP_") and k not in keys]
+    diff = []
+    for k in sorted(keys):
+        a, b = cfg.get(k, ""), live.get(k, "")
+        if a != b:
+            hide = k.endswith("PASSWORD")
+            diff.append((k, "***" if hide and a else (a or "(пусто)"),
+                            "***" if hide and b else (b or "(пусто)")))
+    if not diff:
+        print("  Настройки совпадают — агент видит ровно то же самое.")
+        return
+    print("  РАСХОЖДЕНИЕ: агент работает не с теми настройками, что проверены")
+    print("  выше. Скрипт читает config.env, агент — %s" % AGENT_ENV)
+    print("")
+    for k, a, b in diff:
+        print("    %-24s config.env: %s" % (k, a))
+        print("    %-24s агент:      %s" % ("", b))
+    print("")
+    print("  Перенести настройки в агента: sudo ./scripts/install_agent.sh")
+
+
 def main():
     args = sys.argv[1:]
     here = os.path.dirname(os.path.abspath(__file__))
@@ -320,9 +438,12 @@ def main():
     print("")
 
     username = ""
+    query    = ""
     for i, a in enumerate(args):
         if a == "--user" and i + 1 < len(args):
             username = args[i + 1]
+        if a == "--search" and i + 1 < len(args):
+            query = args[i + 1]
     if not username:
         username = input("Логин: ").strip()
     password = getpass.getpass("Пароль (не отображается): ")
@@ -381,9 +502,14 @@ def main():
     tpl_now = cfg.get("LDAP_BIND_TEMPLATE", "")
     tpl_ok  = good[0].replace(username, "{username}")
     if tpl_now != tpl_ok:
-        print("Сейчас в config.env: LDAP_BIND_TEMPLATE=\"%s\"" % tpl_now)
-        print("Замените на:         LDAP_BIND_TEMPLATE=\"%s\"" % tpl_ok)
-        print("и переустановите агента: sudo ./scripts/install_agent.sh")
+        print("")
+        print("НУЖНО ПОПРАВИТЬ. Настроенный шаблон имени не подошёл, вход по")
+        print("нему работать не будет — сработал другой вариант.")
+        print("  сейчас:   LDAP_BIND_TEMPLATE=\"%s\"" % tpl_now)
+        print("  замените: LDAP_BIND_TEMPLATE=\"%s\"" % tpl_ok)
+        print("  затем:    sudo ./scripts/install_agent.sh")
+    else:
+        print("Настроенный LDAP_BIND_TEMPLATE подходит — менять нечего.")
 
     print("")
     print("Проверка групп доступа:")
@@ -396,6 +522,20 @@ def main():
         conn.unbind()
     except Exception as e:
         print("  не удалось проверить: %s" % e)
+
+    print("")
+    print("Поиск во вкладке «Доступы», запрос «%s»:" % (query or username))
+    try:
+        conn = connect(cfg, cfg.get("LDAP_SEARCH_USER", ""),
+                       cfg.get("LDAP_SEARCH_PASSWORD", ""))
+        check_search(cfg, conn, query or username)
+        conn.unbind()
+    except Exception as e:
+        print("  подключиться для поиска не удалось: %s" % e)
+
+    print("")
+    print("Сверка с настройками, которые видит сам агент:")
+    compare_with_agent(cfg)
 
 
 if __name__ == "__main__":

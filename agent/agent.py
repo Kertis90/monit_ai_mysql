@@ -128,6 +128,49 @@ LDAP_SEARCH_PASSWORD  = os.environ.get("LDAP_SEARCH_PASSWORD", "")
 # атрибутов со схемой и на sAMAccountName выдавал LDAPAttributeError.
 LDAP_SEARCH_FILTER    = os.environ.get("LDAP_SEARCH_FILTER", "").strip()
 
+
+def nslcd_defaults() -> None:
+    """Дозаполнить пустые настройки LDAP из nslcd.conf.
+
+    Настройки каталога уже описаны в nslcd, и держать их в двух местах значит
+    рано или поздно получить расхождение: скрипт проверки читает config.env,
+    а агент — свой .env, и они разъезжаются. Поэтому пустые значения берём
+    прямо из nslcd. Заполненные не трогаем: явная настройка всегда главнее.
+    """
+    global LDAP_URL, LDAP_BASE_DN, LDAP_USER_FILTER, LDAP_BIND_TEMPLATE
+    global LDAP_SEARCH_USER, LDAP_SEARCH_PASSWORD
+    global LDAP_NETGROUP_BASE, LDAP_NETGROUP_FILTER
+
+    path = os.environ.get("NSLCD_CONF", "/etc/nslcd.conf")
+    if not (path and os.path.exists(path)):
+        return
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "nslcd_import", str(Path(__file__).with_name("import_nslcd.py")))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        vals = mod.build(mod.parse_nslcd(path), "")
+    except Exception as e:
+        logger.warning(f"Не удалось прочитать {path}: {e}")
+        return
+
+    here = globals()
+    taken = []
+    for key in ("LDAP_URL", "LDAP_BASE_DN", "LDAP_USER_FILTER",
+                "LDAP_BIND_TEMPLATE", "LDAP_SEARCH_USER",
+                "LDAP_SEARCH_PASSWORD", "LDAP_NETGROUP_BASE",
+                "LDAP_NETGROUP_FILTER"):
+        if here.get(key) or not vals.get(key):
+            continue
+        here[key] = vals[key]
+        taken.append("%s=%s" % (key, "***" if key.endswith("PASSWORD")
+                                else vals[key]))
+    if taken:
+        logger.info(f"Настройки LDAP дозаполнены из {path}: "
+                    + ", ".join(taken))
+
+
 # ── SSO через доверенный обратный прокси ─────────────────────────────────────
 # nginx с Kerberos/SAML/oauth2-proxy аутентифицирует пользователя и передаёт
 # его имя заголовком. Заголовку можно верить ТОЛЬКО если запрос пришёл с
@@ -168,6 +211,11 @@ logging.basicConfig(
               logging.FileHandler("/var/log/ai-alert-agent.log")],
 )
 logger = logging.getLogger("agent")
+
+# Дозаполняем настройки LDAP из nslcd.conf только здесь: функция пишет в лог,
+# а logger создаётся строкой выше
+if LDAP_ENABLED:
+    nslcd_defaults()
 
 API_DESCRIPTION = """
 API AI-агента мониторинга MySQL.
@@ -862,18 +910,34 @@ def schema_attrs(conn) -> set:
         return set()
 
 
-# По этим атрибутам ищем человека: логин в AD и в OpenLDAP называется
-# по-разному, а искать хочется и по имени, и по почте
-SEARCH_ATTRS = ("sAMAccountName", "uid", "cn", "displayName", "mail")
+# По этим атрибутам ищем человека. Логин в AD и в OpenLDAP называется
+# по-разному, а фамилия — отдельная история: в posix-каталогах cn обычно
+# равен логину, и настоящее ФИО лежит в sn, givenName или gecos. Без них
+# поиск по фамилии не находил никого.
+SEARCH_ATTRS = ("sAMAccountName", "uid", "cn", "displayName",
+                "sn", "givenName", "gecos", "mail")
+
+
+def user_object_class() -> str:
+    """Условие «это учётная запись человека» — из LDAP_USER_FILTER.
+
+    Фильтр приходит из nslcd (строка `filter passwd`), то есть описывает
+    ровно те объекты, которые каталог считает пользователями. Это надёжнее
+    любых догадок про objectClass. Если условия там нет, перечисляем
+    привычные варианты для AD и posix-каталогов.
+    """
+    m = re.search(r"\(objectClass=([A-Za-z0-9_-]+)\)", LDAP_USER_FILTER or "",
+                  re.I)
+    if m:
+        return "(objectClass=%s)" % m.group(1)
+    return "(|(objectClass=person)(objectClass=posixAccount))"
 
 
 def build_search_filter(known: set, safe_query: str) -> str:
     """Фильтр поиска только из тех атрибутов, что есть в схеме."""
     usable = [a for a in SEARCH_ATTRS
               if not known or a.lower() in known] or ["cn"]
-    # objectClass есть всегда; значения, которых в каталоге нет, просто
-    # ни с чем не совпадут, поэтому перечисляем варианты для AD и OpenLDAP
-    return ("(&(|(objectClass=person)(objectClass=posixAccount))(|"
+    return ("(&" + user_object_class() + "(|"
             + "".join("(%s=*%s*)" % (a, safe_query) for a in usable) + "))")
 
 
@@ -935,6 +999,12 @@ def ldap_search_users(query: str, limit: int = 25) -> tuple:
         known = schema_attrs(conn)
         flt = (LDAP_SEARCH_FILTER.replace("{query}", safe)
                if LDAP_SEARCH_FILTER else build_search_filter(known, safe))
+        logger.info(
+            "Поиск в каталоге: сервер %s, вход %s, база %s",
+            LDAP_URL, LDAP_SEARCH_USER or "анонимно", LDAP_BASE_DN)
+        logger.info("Поиск в каталоге: схема %s, фильтр %s",
+                    ("прочитана, %d атрибутов" % len(known)) if known
+                    else "НЕ прочитана", flt)
         # Порядок важен: сначала атрибут, по которому идёт вход, иначе доступ
         # будет выдан на имя, под которым человек не входит
         primary = login_attr()
@@ -952,6 +1022,36 @@ def ldap_search_users(query: str, limit: int = 25) -> tuple:
                  if not known or a.lower() in known]
         conn.search(LDAP_BASE_DN, flt, search_scope=SUBTREE,
                     attributes=names + extra, size_limit=limit)
+        res = getattr(conn, "result", None) or {}
+        logger.info(
+            "Поиск в каталоге: запрошены %s, ответ %s (%s), записей %d",
+            names + extra, res.get("description", "?"),
+            res.get("message") or "без пояснений", len(conn.entries))
+        if not conn.entries:
+            # Тот же поиск без условия по objectClass: если так находится,
+            # значит дело именно в нём, а не в атрибутах или базе
+            probe = "(|" + "".join("(%s=*%s*)" % (a, safe)
+                                   for a in (names + extra)) + ")"
+            try:
+                conn.search(LDAP_BASE_DN, probe, search_scope=SUBTREE,
+                            attributes=[], size_limit=5)
+                if conn.entries:
+                    logger.warning(
+                        "Поиск в каталоге: без условия %s нашлось %d записей "
+                        "(например %s). Условие не подходит вашему каталогу — "
+                        "задайте LDAP_SEARCH_FILTER вручную",
+                        user_object_class(), len(conn.entries),
+                        conn.entries[0].entry_dn)
+                else:
+                    logger.info(
+                        "Поиск в каталоге: и без условия по objectClass "
+                        "ничего нет — под базой %s такого текста не найдено",
+                        LDAP_BASE_DN)
+            except Exception as probe_err:
+                logger.info("Поиск в каталоге: проверочный запрос не удался: %s",
+                            probe_err)
+            conn.search(LDAP_BASE_DN, flt, search_scope=SUBTREE,
+                        attributes=names + extra, size_limit=limit)
         out = []
         for e in conn.entries:
             def attr(name):

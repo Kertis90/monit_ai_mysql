@@ -33,6 +33,8 @@ log_section "Файлы агента"
 mkdir -p "${AGENT_DIR}/web"
 
 cp "${SCRIPT_DIR}/../agent/agent.py"      "${AGENT_DIR}/agent.py"
+# Парсер nslcd.conf: агент дозаполняет им пустые настройки LDAP на старте
+cp "${SCRIPT_DIR}/import_nslcd.py"        "${AGENT_DIR}/import_nslcd.py"
 cp "${SCRIPT_DIR}/../clusters.json"       "${AGENT_DIR}/clusters.json"
 cp "${SCRIPT_DIR}/../web/index.html"      "${AGENT_DIR}/web/"
 cp "${SCRIPT_DIR}/../web/style.css"       "${AGENT_DIR}/web/"
@@ -177,6 +179,9 @@ LDAP_NETGROUP_FILTER=${LDAP_NETGROUP_FILTER:-(objectClass=nisNetgroup)}
 LDAP_TLS_VERIFY=${LDAP_TLS_VERIFY:-true}
 LDAP_SEARCH_USER=${LDAP_SEARCH_USER:-}
 LDAP_SEARCH_PASSWORD=${LDAP_SEARCH_PASSWORD:-}
+LDAP_SEARCH_FILTER=${LDAP_SEARCH_FILTER:-}
+# Откуда дозаполнять пустые настройки LDAP. Пусто в NSLCD_CONF — не читать
+NSLCD_CONF=${NSLCD_CONF:-/etc/nslcd.conf}
 OIDC_ENABLED=${OIDC_ENABLED:-false}
 OIDC_ISSUER=${OIDC_ISSUER:-}
 OIDC_CLIENT_ID=${OIDC_CLIENT_ID:-}

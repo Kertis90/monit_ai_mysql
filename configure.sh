@@ -403,6 +403,11 @@ LDAP_NETGROUP_BASE="${LDAP_NETGROUP_BASE:-}"
 LDAP_NETGROUP_FILTER="${LDAP_NETGROUP_FILTER:-(objectClass=nisNetgroup)}"
 LDAP_TLS_VERIFY="${LDAP_TLS_VERIFY}"
 # Сервисная учётка — только для поиска по каталогу при выдаче доступов
+# Фильтр поиска людей во вкладке «Доступы». Пусто — агент соберёт его сам
+# из атрибутов, которые есть в схеме каталога. Подстановка: {query}
+LDAP_SEARCH_FILTER="${LDAP_SEARCH_FILTER:-}"
+# Откуда дозаполнять пустые настройки LDAP. Пусто — не читать
+NSLCD_CONF="${NSLCD_CONF:-/etc/nslcd.conf}"
 LDAP_SEARCH_USER="${LDAP_SEARCH_USER}"
 LDAP_SEARCH_PASSWORD=$(sq "${LDAP_SEARCH_PASSWORD}")
 
