@@ -52,6 +52,16 @@
 
     <!-- ── ЧАТ ── -->
     <section id="tab-chat" class="tab-pane chat-pane">
+      <div class="thread-bar">
+        <select id="thread-select" onchange="App.switchThread(this.value)"
+                title="Выбрать чат"></select>
+        <button class="ghost-btn" onclick="App.newThread()"
+                title="Начать новый чат">+ Новый</button>
+        <button class="ghost-btn" onclick="App.renameThread()"
+                title="Переименовать текущий чат">Переименовать</button>
+        <button class="ghost-btn" onclick="App.deleteThread()"
+                title="Удалить текущий чат вместе с перепиской">Удалить</button>
+      </div>
       <div class="messages" id="messages">
         <div class="msg assistant">
           <div class="msg-meta">AI Agent</div>

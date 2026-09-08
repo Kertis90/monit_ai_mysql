@@ -187,3 +187,26 @@ class AuditEntry(Base):
                                           default=1, server_default="1")
 
     __table_args__ = (Index("idx_audit_ts", "ts"),)
+
+
+class ChatThread(Base):
+    """Отдельный разговор.
+
+    Сообщения привязываются к нему уже существующей колонкой
+    chat_messages.session_id — новую заводить нельзя: create_all добавляет
+    только отсутствующие таблицы, но не колонки в существующие, и на всех
+    установленных базах её бы просто не оказалось.
+
+    Владелец — тот же ключ, что и у истории: имя вошедшего пользователя либо
+    идентификатор браузера, когда вход выключен.
+    """
+    __tablename__ = "chat_threads"
+
+    id:         Mapped[str] = mapped_column(String(NAME_LEN), primary_key=True)
+    owner:      Mapped[str] = mapped_column(String(NAME_LEN), nullable=False)
+    title:      Mapped[str] = mapped_column(String(LABEL_LEN), nullable=False,
+                                            default="", server_default="")
+    created_at: Mapped[str] = mapped_column(String(TS_LEN), nullable=False)
+    updated_at: Mapped[str] = mapped_column(String(TS_LEN), nullable=False)
+
+    __table_args__ = (Index("idx_threads_owner", "owner", "updated_at"),)

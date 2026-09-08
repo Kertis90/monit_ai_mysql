@@ -243,6 +243,7 @@ def application() -> None:
 
         extras(c)
         websocket(c)
+        threads(c)
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -312,6 +313,45 @@ def followup_check(client, alert_id: int) -> None:
                 json={"alert": "DiskLow", "severity": "critical",
                       "summary": "снова", "source": "zabbix"})
     check("повтор после решения замечен", "ПОВТОРИЛОСЬ" in verify(), True)
+
+
+def threads(client) -> None:
+    """Создание чатов, переключение и изоляция.
+
+    Сообщения из разных чатов не должны смешиваться: разбор аварии и вопрос
+    про настройку — разные истории.
+    """
+    first = client.get("/chat/threads").json()["items"]
+    check("прежняя переписка собрана в чат", len(first) >= 1, True)
+
+    created = client.post("/chat/threads?title=Разбор аварии").json()
+    check("чат создан", bool(created["id"]), True)
+    listed = client.get("/chat/threads").json()["items"]
+    check("чат появился в списке",
+          any(t["title"] == "Разбор аварии" for t in listed), True)
+
+    client.patch("/chat/threads/%s?title=Ночная авария" % created["id"])
+    listed = client.get("/chat/threads").json()["items"]
+    check("переименование применилось",
+          any(t["title"] == "Ночная авария" for t in listed), True)
+
+    # История нового чата пуста, хотя в прежнем сообщения есть
+    fresh = client.get("/chat/history?thread=%s" % created["id"]).json()
+    check("новый чат начинается с чистого листа", fresh["total"], 0)
+    old_id = next(t["id"] for t in listed if t["id"] != created["id"])
+    check("прежний чат сохранил сообщения",
+          client.get("/chat/history?thread=%s" % old_id).json()["total"] > 0, True)
+
+    check("чужой чат не отдаётся",
+          client.get("/chat/history?thread=t-нетакого").status_code, 404)
+
+    removed = client.delete("/chat/threads/%s" % created["id"])
+    check("чат удалён", removed.status_code, 200)
+    check("удаление несуществующего",
+          client.delete("/chat/threads/%s" % created["id"]).status_code, 404)
+    check("в списке его больше нет",
+          any(t["id"] == created["id"]
+              for t in client.get("/chat/threads").json()["items"]), False)
 
 
 def websocket(client) -> None:

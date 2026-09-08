@@ -54,13 +54,14 @@ def history_to_messages(history: list[dict]) -> list[dict]:
     return out
 
 
-async def chat_restore(client_id: str) -> list[dict]:
-    """Поднять переписку из базы при первом сообщении в этом процессе."""
+async def chat_restore(client_id: str, thread_id: str = "") -> list[dict]:
+    """Поднять переписку разговора при первом сообщении в этом процессе."""
     if not client_id:
         return []
     async with session_scope() as session:
         rows = await ChatRepository(session).history(
-            client_id, limit=CHAT_CONTEXT_MESSAGES * 2)
+            client_id, limit=CHAT_CONTEXT_MESSAGES * 2,
+            thread_id=thread_id or None)
     return [{"role": r.role, "content": r.content} for r in rows]
 
 
@@ -220,13 +221,26 @@ async def websocket_chat(ws: WebSocket):
             fp  = str(msg.get("fingerprint") or "").strip()[:128]
             cid = (f"user:{normalize(ws_user['username'])}"
                    if ws_user else browser_id)
-            key = cid or sid
+            owner = cid or sid
 
-            history = ws_sessions.get(key)
+            # В каком разговоре отвечаем. Клиент присылает выбранный; если
+            # не прислал — берём последний, а при первом обращении заводим
+            # новый. Ключ истории — именно разговор: у одного человека их
+            # несколько, и мешать их в одну ленту значит портить контекст.
+            thread_id = str(msg.get("thread_id") or "").strip()[:128]
+            async with session_scope() as db:
+                repo = ChatRepository(db)
+                thread = (await repo.get_thread(owner, thread_id)
+                          if thread_id else None)
+                if thread is None:
+                    thread = await repo.current_thread(owner)
+                thread_id, thread_title = thread.id, thread.title
+
+            history = ws_sessions.get(thread_id)
             if history is None:
                 # первое сообщение в этом процессе — поднимаем историю из БД
-                history = await chat_restore(cid) if cid else []
-                ws_sessions[key] = history
+                history = await chat_restore(owner, thread_id)
+                ws_sessions[thread_id] = history
 
             # 1. Собрать контекст (метрики) — сообщаем клиенту что нашли
             try:
@@ -238,9 +252,11 @@ async def websocket_chat(ws: WebSocket):
                 continue
 
             await ws.send_json({
-                "type":    "context",
-                "cluster": cluster["label"] if cluster else None,
-                "hours":   hours if hours > 0 else None,
+                "type":      "context",
+                "cluster":   cluster["label"] if cluster else None,
+                "hours":     hours if hours > 0 else None,
+                "thread_id": thread_id,
+                "title":     thread_title,
             })
 
             # Графики строим ТОЛЬКО если их попросили. Иначе шлём лёгкое
@@ -308,15 +324,18 @@ async def websocket_chat(ws: WebSocket):
             # ответа не покажет только что состоявшийся обмен
             history.append({"role": "user",      "content": text})
             history.append({"role": "assistant", "content": answer})
-            await chat_save(cid, sid, "user",      text,   fp)
-            await chat_save(cid, sid, "assistant", answer, fp)
+            await chat_save(owner, thread_id, "user",      text,   fp)
+            await chat_save(owner, thread_id, "assistant", answer, fp)
+            # Отмечаем разговор свежим; если названия нет — берём из вопроса
+            async with session_scope() as db:
+                await ChatRepository(db).touch_thread(thread_id, text)
 
             await ws.send_json({"type": "done", "stopped": stopped})
 
             # Упёрлись в окно контекста — не выбрасываем старое, а сжимаем.
             # После done: выжимку строит модель, и ждать её пользователю незачем
             if len(history) > CHAT_CONTEXT_MESSAGES:
-                history[:] = await chat_compact(cid, sid, history)
+                history[:] = await chat_compact(owner, thread_id, history)
 
     except WebSocketDisconnect:
         logger.info(f"WS disconnected: {session_id}")
@@ -386,29 +405,81 @@ async def chat_key(request: Request, client_id: str = "") -> str:
     return client_id
 
 
-@router.get("/chat/history", summary="История переписки")
-async def chat_history(request: Request, chats: Chats,
-                       client_id: str = "", limit: int = 50):
+@router.get("/chat/threads", summary="Список своих чатов")
+async def list_threads(request: Request, chats: Chats, client_id: str = ""):
+    """Разбор аварии и вопрос про настройку — разные истории, и держать их
+    в одной ленте значит портить контекст обеим."""
     key = await chat_key(request, client_id)
     if not key:
         raise HTTPException(status_code=400, detail="client_id обязателен")
-    rows = await chats.history(key, limit=limit)
-    return {"client_id": key, "total": len(rows),
+    return {"owner": key, "items": await chats.threads(key)}
+
+
+@router.post("/chat/threads", summary="Создать чат")
+async def create_thread(request: Request, chats: Chats,
+                        client_id: str = "", title: str = ""):
+    key = await chat_key(request, client_id)
+    if not key:
+        raise HTTPException(status_code=400, detail="client_id обязателен")
+    thread = await chats.create_thread(key, title)
+    return {"id": thread.id, "title": thread.title,
+            "created_at": thread.created_at}
+
+
+@router.patch("/chat/threads/{thread_id}", summary="Переименовать чат")
+async def rename_thread(thread_id: str, request: Request, chats: Chats,
+                        title: str = "", client_id: str = ""):
+    key = await chat_key(request, client_id)
+    if not await chats.rename_thread(key, thread_id, title):
+        raise HTTPException(status_code=404, detail="Чат не найден")
+    return {"id": thread_id, "title": title.strip()[:200]}
+
+
+@router.delete("/chat/threads/{thread_id}", summary="Удалить чат")
+async def delete_thread(thread_id: str, request: Request, chats: Chats,
+                        client_id: str = ""):
+    key = await chat_key(request, client_id)
+    removed = await chats.delete_thread(key, thread_id)
+    if removed < 0:
+        raise HTTPException(status_code=404, detail="Чат не найден")
+    ws_sessions.pop(thread_id, None)        # и из памяти процесса тоже
+    return {"id": thread_id, "removed": removed}
+
+
+@router.get("/chat/history", summary="История переписки")
+async def chat_history(request: Request, chats: Chats, client_id: str = "",
+                       limit: int = 50, thread: str = ""):
+    """Сообщения выбранного чата. Без параметра — последнего активного."""
+    key = await chat_key(request, client_id)
+    if not key:
+        raise HTTPException(status_code=400, detail="client_id обязателен")
+    if not thread:
+        thread = (await chats.current_thread(key)).id
+    elif await chats.get_thread(key, thread) is None:
+        raise HTTPException(status_code=404, detail="Чат не найден")
+
+    rows = await chats.history(key, limit=limit, thread_id=thread)
+    return {"client_id": key, "thread_id": thread, "total": len(rows),
             "items": [{"ts": r.ts, "role": r.role, "content": r.content}
                       for r in rows],
             "retention_days": settings.db.chats_retention_days,
             "persistent": True}
 
 
-@router.delete("/chat/history", summary="Очистить свою историю")
+@router.delete("/chat/history", summary="Очистить историю")
 async def chat_history_clear(request: Request, chats: Chats,
-                             client_id: str = ""):
+                             client_id: str = "", thread: str = ""):
+    """Без параметра thread очищается вся переписка владельца, с ним — один чат."""
     key = await chat_key(request, client_id)
     if not key:
         raise HTTPException(status_code=400, detail="client_id обязателен")
-    removed = await chats.forget(key)
-    ws_sessions.pop(key, None)      # и из памяти процесса тоже
-    return {"client_id": key, "removed": removed}
+    removed = await chats.forget(key, thread_id=thread or None)
+    if thread:
+        ws_sessions.pop(thread, None)
+    else:
+        for item in await chats.threads(key):
+            ws_sessions.pop(item["id"], None)
+    return {"client_id": key, "thread_id": thread or None, "removed": removed}
 
 
 @router.post("/api/feedback", summary="Оценить ответ агента")

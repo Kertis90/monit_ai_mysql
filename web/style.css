@@ -539,3 +539,26 @@ textarea#input:disabled { opacity: .55; }
 .resolution { margin-top: 6px; padding: 6px 10px; font-size: 12px;
               border-left: 3px solid var(--accent, #4c8dff);
               background: rgba(76,141,255,.07); border-radius: 0 6px 6px 0; }
+
+/* Панель выбора чата. Один человек ведёт несколько разговоров: разбор
+   аварии и вопрос про настройку не должны мешаться в одной ленте. */
+.thread-bar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border, #2b313c);
+  flex-wrap: wrap;
+}
+
+.thread-bar select {
+  flex: 1;
+  min-width: 180px;
+  max-width: 460px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border, #2b313c);
+  background: var(--bg, #12151b);
+  color: inherit;
+  font: inherit;
+}

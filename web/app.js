@@ -17,6 +17,8 @@ const App = (() => {
     dirItems:      [],     // результаты поиска по каталогу целиком
     dirPage:       0,      // показанная страница результатов
     dirQuery:      '',
+    threads:       [],     // чаты владельца
+    threadId:      null,   // текущий чат
     clusters:      [],
     currentTab:    'chat',
     streamingEl:   null,   // элемент .msg-body куда стримятся токены
@@ -67,12 +69,96 @@ const App = (() => {
     return h.toString(16).padStart(8, '0');
   }
 
-  async function restoreHistory() {
+  // ═══ ЧАТЫ ══════════════════════════════════════════════════════
+
+  const cid = () => 'client_id=' + encodeURIComponent(state.clientId);
+
+  async function loadThreads(select) {
     try {
-      const r = await fetch('chat/history?limit=50&client_id=' +
-                            encodeURIComponent(state.clientId));
+      const r = await fetch('chat/threads?' + cid());
       if (!r.ok) return;
       const d = await r.json();
+      state.threads = d.items || [];
+      if (select) state.threadId = select;
+      // Если выбранного больше нет (удалили) — берём самый свежий
+      if (!state.threads.some(t => t.id === state.threadId)) {
+        state.threadId = state.threads.length ? state.threads[0].id : null;
+      }
+      renderThreads();
+    } catch (e) {
+      console.warn('Список чатов недоступен:', e);
+    }
+  }
+
+  function renderThreads() {
+    const sel = $('thread-select');
+    if (!sel) return;
+    if (!state.threads.length) {
+      sel.innerHTML = '<option value="">Новый чат</option>';
+      return;
+    }
+    sel.innerHTML = state.threads.map(t => {
+      const name = t.title || 'Без названия';
+      const when = String(t.updated_at || '').slice(5, 16).replace('T', ' ');
+      return `<option value="${esc(t.id)}"${t.id === state.threadId ? ' selected' : ''}>` +
+             `${esc(name)} · ${esc(when)} · ${t.messages}</option>`;
+    }).join('');
+  }
+
+  async function switchThread(id) {
+    if (!id || id === state.threadId) return;
+    state.threadId = id;
+    $('messages').innerHTML = '';
+    await restoreHistory();
+    renderThreads();
+  }
+
+  async function newThread() {
+    try {
+      const r = await fetch('chat/threads?' + cid(), { method: 'POST' });
+      if (!r.ok) { alert('Не удалось создать чат'); return; }
+      const d = await r.json();
+      state.threadId = d.id;
+      $('messages').innerHTML = '';
+      addAssistantMsg('Новый чат. Прежняя переписка сохранена — она в списке сверху.');
+      await loadThreads(d.id);
+    } catch (e) {
+      alert('Не удалось создать чат: ' + e);
+    }
+  }
+
+  async function renameThread() {
+    if (!state.threadId) return;
+    const now = (state.threads.find(t => t.id === state.threadId) || {}).title || '';
+    const title = prompt('Название чата:', now);
+    if (title === null) return;
+    await fetch('chat/threads/' + encodeURIComponent(state.threadId) +
+                '?' + cid() + '&title=' + encodeURIComponent(title),
+                { method: 'PATCH' });
+    await loadThreads(state.threadId);
+  }
+
+  async function deleteThread() {
+    if (!state.threadId) return;
+    const t = state.threads.find(x => x.id === state.threadId) || {};
+    if (!confirm('Удалить чат «' + (t.title || 'без названия') +
+                 '» вместе с перепиской?')) return;
+    await fetch('chat/threads/' + encodeURIComponent(state.threadId) + '?' + cid(),
+                { method: 'DELETE' });
+    state.threadId = null;
+    $('messages').innerHTML = '';
+    await loadThreads();
+    await restoreHistory();
+  }
+
+  async function restoreHistory() {
+    try {
+      const r = await fetch('chat/history?limit=50&' + cid() +
+                            (state.threadId ? '&thread=' + encodeURIComponent(state.threadId) : ''));
+      if (!r.ok) return;
+      const d = await r.json();
+      // Сервер сам решает, какой чат считать текущим, если мы не указали
+      if (d.thread_id) state.threadId = d.thread_id;
       if (!d.items || !d.items.length) return;
 
       for (const m of d.items) {
@@ -93,9 +179,10 @@ const App = (() => {
   }
 
   async function forgetHistory() {
-    if (!confirm('Удалить сохранённую историю чата для этого браузера?')) return;
+    if (!confirm('Очистить переписку текущего чата?')) return;
     try {
-      await fetch('chat/history?client_id=' + encodeURIComponent(state.clientId),
+      await fetch('chat/history?' + cid() +
+                  (state.threadId ? '&thread=' + encodeURIComponent(state.threadId) : ''),
                   { method: 'DELETE' });
       $('messages').innerHTML = '';
       addAssistantMsg('История очищена.');
@@ -194,6 +281,11 @@ const App = (() => {
         break;
 
       case 'context': {
+        // Сервер мог завести чат сам (первое сообщение) или переименовать
+        if (msg.thread_id && msg.thread_id !== state.threadId) {
+          state.threadId = msg.thread_id;
+          loadThreads(msg.thread_id);
+        }
         // Агент определил кластер/период — показать чип в метаданных
         if (state.streamingEl) {
           const meta = state.streamingEl.parentElement.querySelector('.msg-meta');
@@ -313,6 +405,7 @@ const App = (() => {
       text:       text,
       session_id:  state.sessionId,
       client_id:   state.clientId,
+      thread_id:   state.threadId,
       fingerprint: state.fingerprint,
     }));
   }
@@ -1223,7 +1316,8 @@ const App = (() => {
 
     loadUser();
 
-    restoreHistory();
+    // Сначала история (она же скажет, какой чат текущий), затем список
+    restoreHistory().then(loadThreads);
     connect();
     refreshClusters();
     setInterval(refreshClusters, 60000);
@@ -1250,6 +1344,7 @@ const App = (() => {
   return { showTab, pickCluster, useSuggestion, toggleAnalysis,
            loadStatus, loadAlerts, refreshClusters, forgetHistory, logout,
            loadAccess, loadAudit, searchDirectory, grantAgain,
+           newThread, renameThread, deleteThread, switchThread,
            grantManual, revokeAccess, deleteAlert, deleteAlertsByName,
            resolveAlert,
            stopGeneration };
