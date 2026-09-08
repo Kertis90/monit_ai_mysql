@@ -4331,9 +4331,23 @@ def api_users(request: Request):
 @app.post("/api/users")
 def api_users_grant(req: GrantRequest, request: Request):
     admin = require_admin(request)
+    # Разбираем причины по отдельности: раньше любая давала одно и то же
+    # «Не удалось выдать доступ», и понять что чинить было нельзя
+    if not norm_username(req.username):
+        raise HTTPException(status_code=400, detail="Пустой логин")
+    if req.role not in ("user", "admin"):
+        raise HTTPException(status_code=400,
+                            detail="Роль должна быть user или admin")
+    if not USERS_DB_OK:
+        raise HTTPException(
+            status_code=500,
+            detail="База доступов недоступна — смотрите журнал агента: "
+                   "journalctl -u ai-alert-agent | grep -i доступ")
     if not user_grant(req.username, req.display_name, req.email,
                       req.role, admin.get("username", "")):
-        raise HTTPException(status_code=400, detail="Не удалось выдать доступ")
+        raise HTTPException(status_code=500,
+                            detail="Запись в базу доступов не удалась — "
+                                   "подробности в журнале агента")
     return {"ok": True, "username": norm_username(req.username)}
 
 
@@ -4351,7 +4365,10 @@ def api_users_revoke(username: str, request: Request, hard: bool = False):
 def api_directory_search(request: Request, q: str = "", limit: int = 25):
     """Поиск в AD, чтобы выдавать доступ выбором из списка, а не вводом руками."""
     require_admin(request)
-    found, err = ldap_search_users(q, min(limit, 100))
+    # Потолок выше, чем раньше: список листается страницами, и обрезать его
+    # на сотне значит прятать людей, которых админ ищет
+    found, err = ldap_search_users(q, min(max(limit, 1), 500))
+    found.sort(key=lambda f: (f.get("display_name") or "", f["username"]))
     granted = {u["username"] for u in users_list() if u["enabled"]}
     for f in found:
         f["already_granted"] = f["username"] in granted

@@ -14,6 +14,9 @@ const App = (() => {
     clientId:      null,   // стабильный id браузера (localStorage)
     fingerprint:   '',     // грубый отпечаток — только как подсказка
     isAdmin:       false,  // от /api/me — показывать ли действия админа
+    dirItems:      [],     // результаты поиска по каталогу целиком
+    dirPage:       0,      // показанная страница результатов
+    dirQuery:      '',
     clusters:      [],
     currentTab:    'chat',
     streamingEl:   null,   // элемент .msg-body куда стримятся токены
@@ -641,14 +644,17 @@ const App = (() => {
       const why = d.ldap_search_reason || '';
       $('dir-query').disabled      = !!why;
       $('dir-search-btn').disabled = !!why;
-      $('dir-results').innerHTML = why
-        ? '<div class="muted" style="font-size:12px;line-height:1.5">' +
+      // Затираем результаты только когда есть что сказать вместо них:
+      // список обновляется и после выдачи доступа, а найденное должно остаться
+      if (why) {
+        $('dir-results').innerHTML =
+          '<div class="muted" style="font-size:12px;line-height:1.5">' +
           'Поиск по каталогу недоступен: ' + esc(why) + '.<br>' +
           'Поправьте <code>config.env</code> (или запустите ' +
           '<code>sudo ./scripts/import_nslcd.py --write</code>) и переустановите ' +
           'агента: <code>sudo ./scripts/install_agent.sh</code>.<br>' +
-          'Выдать доступ по логину вручную можно и сейчас — форма ниже.</div>'
-        : '';
+          'Выдать доступ по логину вручную можно и сейчас — форма ниже.</div>';
+      }
 
       if (!d.items.length) {
         box.innerHTML = '<div class="muted">Пока никому не выдан. ' +
@@ -676,37 +682,80 @@ const App = (() => {
     }
   }
 
+  const DIR_PAGE_SIZE = 10;
+
   async function searchDirectory() {
     const q   = $('dir-query').value.trim();
     const box = $('dir-results');
     if (q.length < 2) { box.innerHTML = '<div class="muted">Введите хотя бы 2 символа.</div>'; return; }
     box.innerHTML = '<div class="muted">Ищу в каталоге…</div>';
+    state.dirItems = []; state.dirPage = 0; state.dirQuery = q;
     try {
-      const r = await fetch('api/directory/search?q=' + encodeURIComponent(q));
+      const r = await fetch('api/directory/search?q=' + encodeURIComponent(q) +
+                            '&limit=200');
       const d = await r.json();
       if (d.error) {
         box.innerHTML = '<div class="muted">Поиск не выполнен: ' + esc(d.error) + '</div>';
         return;
       }
-      if (!d.items.length) {
-        box.innerHTML = '<div class="muted">Никого не найдено по запросу «' +
-                        esc(q) + '».</div>';
-        return;
-      }
-      box.innerHTML = d.items.map(u => `
-        <div class="alert-item" style="display:flex;align-items:center;gap:12px">
-          <div style="flex:1">
-            <div><b>${esc(u.username)}</b></div>
-            <div class="muted" style="font-size:12px">
-              ${esc(u.display_name || '')}${u.email ? ' · ' + esc(u.email) : ''}</div>
-          </div>
-          ${u.already_granted
-            ? '<span class="ctx-chip">уже выдан</span>'
-            : `<button class="ghost-btn" onclick="App.grantFound('${esc(u.username)}','${esc(u.display_name || '')}','${esc(u.email || '')}')">Выдать доступ</button>`}
-        </div>`).join('');
+      state.dirItems = d.items || [];
+      renderDirResults();
     } catch (e) {
       box.innerHTML = '<div class="muted">Поиск не удался: ' + esc(e) + '</div>';
     }
+  }
+
+  function dirPageStep(delta) {
+    const last = Math.max(0, Math.ceil(state.dirItems.length / DIR_PAGE_SIZE) - 1);
+    state.dirPage = Math.min(last, Math.max(0, state.dirPage + delta));
+    renderDirResults();
+  }
+
+  function renderDirResults() {
+    const box   = $('dir-results');
+    const items = state.dirItems;
+    if (!items.length) {
+      box.innerHTML = '<div class="muted">Никого не найдено по запросу «' +
+                      esc(state.dirQuery) + '».</div>';
+      return;
+    }
+    const pages = Math.ceil(items.length / DIR_PAGE_SIZE);
+    const from  = state.dirPage * DIR_PAGE_SIZE;
+    const shown = items.slice(from, from + DIR_PAGE_SIZE);
+
+    // Данные передаём через data-атрибуты, а не подстановкой в onclick:
+    // имя из каталога может содержать кавычку или апостроф, и обработчик
+    // разваливался прямо в разметке
+    const rows = shown.map(u => `
+      <div class="alert-item" style="display:flex;align-items:center;gap:12px">
+        <div style="flex:1;min-width:0">
+          <div><b>${esc(u.username)}</b></div>
+          <div class="muted" style="font-size:12px">
+            ${esc(u.display_name || '')}${u.email ? ' · ' + esc(u.email) : ''}</div>
+        </div>
+        ${u.already_granted
+          ? '<span class="ctx-chip">уже выдан</span>'
+          : `<select class="dir-role" style="padding:7px;border-radius:8px;border:1px solid var(--border,#2b313c);background:var(--bg,#12151b);color:inherit">
+               <option value="user">пользователь</option>
+               <option value="admin">администратор</option>
+             </select>
+             <button class="ghost-btn dir-grant"
+                     data-username="${esc(u.username)}"
+                     data-display="${esc(u.display_name || '')}"
+                     data-email="${esc(u.email || '')}">Выдать доступ</button>`}
+      </div>`).join('');
+
+    const nav = pages > 1 ? `
+      <div style="display:flex;align-items:center;gap:10px;margin-top:10px">
+        <button class="ghost-btn dir-prev" ${state.dirPage === 0 ? 'disabled' : ''}>← Назад</button>
+        <span class="muted" style="font-size:12px">
+          ${from + 1}–${from + shown.length} из ${items.length} ·
+          страница ${state.dirPage + 1} из ${pages}</span>
+        <button class="ghost-btn dir-next" ${state.dirPage >= pages - 1 ? 'disabled' : ''}>Вперёд →</button>
+      </div>`
+      : `<div class="muted" style="font-size:12px;margin-top:8px">Найдено: ${items.length}</div>`;
+
+    box.innerHTML = rows + nav;
   }
 
   async function grant(payload) {
@@ -720,16 +769,42 @@ const App = (() => {
       alert('Не удалось выдать доступ: ' + (d.detail || r.status));
       return;
     }
+    // Помечаем найденного на месте и перерисовываем текущую страницу.
+    // Повторный поиск сбросил бы её на первую.
+    const done = state.dirItems.find(u => u.username === payload.username);
+    if (done) { done.already_granted = true; renderDirResults(); }
     await loadAccess();
-    await searchDirectoryIfOpen();
   }
 
   async function searchDirectoryIfOpen() {
     if ($('dir-query').value.trim().length >= 2) await searchDirectory();
   }
 
-  function grantFound(username, displayName, email) {
-    grant({ username, display_name: displayName, email, role: 'user' });
+  // Один обработчик на весь блок результатов. Строки перерисовываются при
+  // каждом переключении страницы, и слушатель на каждой кнопке плодился бы
+  // заново; заодно данные берутся из data-атрибутов, а не из текста onclick.
+  function bindDirResults() {
+    $('dir-results').addEventListener('click', ev => {
+      const btn = ev.target.closest('.dir-grant');
+      if (btn) {
+        const sel = btn.closest('.alert-item').querySelector('.dir-role');
+        grant({ username:     btn.dataset.username,
+                display_name: btn.dataset.display || '',
+                email:        btn.dataset.email  || '',
+                role:         sel ? sel.value : 'user' });
+        return;
+      }
+      if (ev.target.closest('.dir-prev')) dirPageStep(-1);
+      if (ev.target.closest('.dir-next')) dirPageStep(1);
+    });
+
+    // Enter в строке поиска — то же, что кнопка «Найти»
+    $('dir-query').addEventListener('keydown', ev => {
+      if (ev.key === 'Enter') { ev.preventDefault(); searchDirectory(); }
+    });
+    $('manual-login').addEventListener('keydown', ev => {
+      if (ev.key === 'Enter') { ev.preventDefault(); grantManual(); }
+    });
   }
 
   function grantAgain(username, role) {
@@ -1092,8 +1167,11 @@ const App = (() => {
   // ═══ УТИЛИТЫ ════════════════════════════════════════════════════
 
   function esc(s) {
+    // Кавычки экранируем обязательно: строка попадает и внутрь атрибутов.
+    // Без этого имя из каталога вида O'Brien рвало разметку и обработчик.
     return String(s ?? '')
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
   function num(v) { const n = parseFloat(v); return isNaN(n) ? NaN : n; }
@@ -1125,6 +1203,7 @@ const App = (() => {
     input.addEventListener('input', () => autoResize(input));
     $('send-btn').addEventListener('click', sendMessage);
     $('stop-btn').addEventListener('click', stopGeneration);
+    bindDirResults();
   }
 
   document.addEventListener('DOMContentLoaded', init);
@@ -1132,7 +1211,7 @@ const App = (() => {
   // Публичный API для onclick в HTML
   return { showTab, pickCluster, useSuggestion, toggleAnalysis,
            loadStatus, loadAlerts, refreshClusters, forgetHistory, logout,
-           loadAccess, searchDirectory, grantFound, grantAgain,
+           loadAccess, searchDirectory, grantAgain,
            grantManual, revokeAccess, deleteAlert, deleteAlertsByName,
            resolveAlert,
            stopGeneration };
