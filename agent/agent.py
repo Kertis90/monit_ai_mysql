@@ -18,6 +18,7 @@ import asyncio
 import re
 import sqlite3
 import shlex
+import socket
 import secrets
 import hmac
 import hashlib
@@ -1902,10 +1903,15 @@ def cluster_db_creds(cluster: dict) -> Optional[tuple]:
     return user, cluster.get("db_password") or ""
 
 
-def sql_run(cluster: dict, sql: str, host: Optional[str] = None) -> dict:
-    """Выполнить читающий запрос напрямую по TCP.
+def sql_run(cluster: dict, sql: str, host: Optional[str] = None,
+            endpoint: Optional[tuple] = None) -> dict:
+    """Выполнить читающий запрос по TCP.
 
-    Для режима через SSH есть sql_run_ssh; выбор делает sql_execute.
+    endpoint — куда реально подключаться (адрес, порт). Нужен для туннеля: там
+    соединение идёт на 127.0.0.1 со случайным портом, а в отчёте должен стоять
+    адрес сервера БД. Пусто — подключаемся прямо к host:3306.
+
+    Для режима exec есть sql_run_ssh; выбор делает sql_execute.
     """
     creds = cluster_db_creds(cluster)
     if not creds:
@@ -1925,9 +1931,10 @@ def sql_run(cluster: dict, sql: str, host: Optional[str] = None) -> dict:
     user, password = creds
     ip = host or cluster["primary_ip"]
     query = sql_add_limit(sql)
+    conn_host, conn_port = endpoint or (ip, 3306)
     try:
         conn = pymysql.connect(
-            host=ip, user=user, password=password,
+            host=conn_host, port=conn_port, user=user, password=password,
             connect_timeout=SQL_TIMEOUT_S, read_timeout=SQL_TIMEOUT_S,
             charset="utf8mb4", cursorclass=pymysql.cursors.Cursor,
             autocommit=True)
@@ -1962,12 +1969,33 @@ def sql_run(cluster: dict, sql: str, host: Optional[str] = None) -> dict:
 # Подключились по SSH, выполнили запрос клиентом mysql на самом сервере, вышли.
 # Порт 3306 наружу открывать не нужно, а учётка может быть 'ai_agent'@'localhost'.
 
-def cluster_via_ssh(cluster: dict) -> bool:
-    """Ходить ли в этот кластер через SSH, а не напрямую по TCP."""
+def cluster_db_mode(cluster: dict) -> str:
+    """Как ходить в MySQL этого кластера: direct, exec или tunnel.
+
+      direct — прямое TCP-соединение на 3306 сервера БД;
+      exec   — SSH, запрос выполняет клиент mysql на самом сервере;
+      tunnel — SSH пробрасывает локальный порт на 3306, дальше pymysql.
+
+    Туннель отличается от exec тем, что на сервере не нужен клиент mysql, а
+    значения приходят типами MySQL, а не текстом из TSV. Порт наружу при этом
+    всё равно не открывается.
+
+    Старое булево значение db_via_ssh продолжает работать и означает exec.
+    """
     v = cluster.get("db_via_ssh")
     if v is None:
         v = os.environ.get("DB_VIA_SSH", "false")
-    return str(v).strip().lower() in ("1", "true", "yes")
+    v = str(v).strip().lower()
+    if v in ("tunnel", "ssh_tunnel", "туннель"):
+        return "tunnel"
+    if v in ("1", "true", "yes", "exec", "ssh"):
+        return "exec"
+    return "direct"
+
+
+def cluster_via_ssh(cluster: dict) -> bool:
+    """Не прямое TCP-соединение (exec или tunnel)."""
+    return cluster_db_mode(cluster) != "direct"
 
 
 def parse_mysql_batch(text: str) -> tuple:
@@ -2032,11 +2060,109 @@ async def sql_run_ssh(cluster: dict, sql: str,
             "rows": rows[:SQL_MAX_ROWS],
             "truncated": len(rows) > SQL_MAX_ROWS, "via": "ssh"}
 
+def free_local_port() -> int:
+    """Свободный порт на локальном интерфейсе для проброса.
+
+    Между освобождением и тем, как ssh его займёт, порт теоретически может
+    перехватить кто-то ещё. На сервере мониторинга это маловероятно, а ssh с
+    ExitOnForwardFailure в таком случае сразу завершится с ошибкой, и мы это
+    увидим, а не зависнем.
+    """
+    with closing(socket.socket()) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+async def wait_port(port: int, deadline: float) -> bool:
+    """Дождаться, пока проброшенный порт начнёт принимать соединения."""
+    while time.time() < deadline:
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return True
+        except OSError:
+            await asyncio.sleep(0.15)
+    return False
+
+
+async def sql_run_tunnel(cluster: dict, sql: str,
+                         host: Optional[str] = None) -> dict:
+    """Запрос через SSH-туннель: локальный порт → 3306 на сервере БД.
+
+    Туннель поднимается на время запроса и закрывается сразу после: держать
+    постоянное соединение значит следить за его живостью и чинить обрывы, а
+    выигрыш в доли секунды того не стоит.
+
+    MySQL видит подключение как пришедшее с самого сервера, поэтому учётке
+    достаточно прав 'ai_agent'@'localhost'.
+    """
+    ip = host or cluster["primary_ip"]
+    if not LOG_SSH_USER:
+        return {"error": "Не задан SSH_USER — туннель поднять не под кем. "
+                         "Заполните его в config.env и переустановите агента."}
+    if not cluster_db_creds(cluster):
+        return {"error": "Для этого кластера не задана учётка db_user — "
+                         "SQL-запросы отключены"}
+
+    port = free_local_port()
+    argv = ["ssh", "-N", "-o", "StrictHostKeyChecking=no",
+            "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes",
+            "-o", "ConnectTimeout=" + str(LOG_SSH_TIMEOUT),
+            "-p", str(LOG_SSH_PORT)]
+    if LOG_SSH_KEY:
+        argv += ["-i", LOG_SSH_KEY]
+    argv += ["-L", "127.0.0.1:%d:127.0.0.1:3306" % port,
+             LOG_SSH_USER + "@" + ip]
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv, stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE)
+    except Exception as e:
+        return {"error": f"Не удалось запустить ssh для туннеля к {ip}: {e}"}
+
+    try:
+        ready = await wait_port(port, time.time() + LOG_SSH_TIMEOUT)
+        if not ready:
+            err = ""
+            if proc.returncode is not None:      # ssh уже умер — есть причина
+                try:
+                    err = (await proc.stderr.read()).decode("utf-8", "replace")
+                except Exception:
+                    pass
+            return {"error": f"Туннель к {ip} не поднялся"
+                             + (f": {err.strip()[:200]}" if err.strip() else
+                                f" за {LOG_SSH_TIMEOUT} с")}
+        res = await asyncio.to_thread(sql_run, cluster, sql, ip,
+                                      ("127.0.0.1", port))
+        if not res.get("error"):
+            res["via"] = "tunnel"
+        return res
+    finally:
+        try:
+            proc.terminate()
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+
 async def sql_execute(cluster: dict, sql: str,
                       host: Optional[str] = None) -> dict:
-    """Единая точка входа: сама выбирает режим — напрямую или через SSH."""
-    if cluster_via_ssh(cluster):
+    """Единая точка входа: сама выбирает режим доступа к БД."""
+    mode = cluster_db_mode(cluster)
+    if mode == "exec":
         return await sql_run_ssh(cluster, sql, host)
+    if mode == "tunnel":
+        return await sql_run_tunnel(cluster, sql, host)
     # pymysql блокирующий, поэтому уводим его из цикла событий
     return await asyncio.to_thread(sql_run, cluster, sql, host)
 
@@ -2045,7 +2171,8 @@ def fmt_sql_result(res: dict) -> str:
     if res.get("error"):
         return f"## Результат SQL\n\n  {res['error']}"
     cols, rows = res["columns"], res["rows"]
-    via = " через SSH" if res.get("via") == "ssh" else ""
+    via = {"ssh": " через SSH", "tunnel": " через SSH-туннель"}.get(
+        res.get("via"), "")
     head = [f"## Результат SQL ({res['host']}{via})",
             f"  Запрос: {res['query']}", ""]
     if not rows:
@@ -2289,6 +2416,36 @@ async def log_grep(host: str, path: str, patterns: list,
     return await log_ssh(host, cmd)
 
 
+async def log_list_files(host: str, dirs: list, pattern: str) -> list:
+    """Файлы логов на сервере: путь, размер, время изменения. Свежие первыми.
+
+    Одним find по всем каталогам сразу: текущий и архивный лог ищутся по одной
+    маске, а лишний SSH-заход на каждый каталог только замедлил бы ответ.
+    Несуществующий каталог даёт код 1 — он в списке допустимых, остальные
+    каталоги при этом обрабатываются.
+    """
+    if not dirs:
+        return []
+    where = " ".join(shlex.quote(d) for d in dirs)
+    cmd = ("find " + where + " -maxdepth 1 -type f -name "
+           + shlex.quote(pattern)
+           + r" -printf '%T@ %s %p\n' 2>/dev/null")
+    ok, text = await log_ssh(host, cmd)
+    if not ok:
+        return []
+    files = []
+    for line in text.splitlines():
+        bits = line.strip().split(" ", 2)
+        if len(bits) != 3:
+            continue
+        try:
+            files.append({"mtime": float(bits[0]), "size": int(bits[1]),
+                          "path": bits[2]})
+        except ValueError:
+            continue          # мусор в выводе find игнорируем молча
+    return sorted(files, key=lambda f: -f["mtime"])
+
+
 async def read_log_group(host: str, dirs: list, pattern: str, since, until,
                          title: str, extra: str = "", hint: str = "",
                          since_epoch: float = 0, until_epoch: float = 0,
@@ -2354,11 +2511,11 @@ async def read_slow_log(cluster: dict, host: str, since, until,
                         extra: str = "",
                         since_epoch: float = 0, until_epoch: float = 0) -> str:
     """Slow-лог MySQL за период. Ротированные файлы тоже просматриваются."""
-    raw = (cluster.get("slow_log_path") or "/var/log/mysql/slow.log").strip()
+    raw = slow_log_path(cluster, host)
     directory, pattern = log_dir_and_pattern(raw)
     dirs = [directory]
     # архив slow-лога может лежать в отдельном каталоге
-    arch = (cluster.get("slow_log_archive_dir") or "").strip()
+    arch = slow_log_archive(cluster, host)
     if arch and arch not in dirs:
         dirs.append(arch)
     return await read_log_group(
@@ -2372,7 +2529,11 @@ async def read_slow_log(cluster: dict, host: str, since, until,
 async def read_app_log(cluster: dict, host: str, since, until,
                        extra: str = "",
                        since_epoch: float = 0, until_epoch: float = 0) -> str:
-    """Логи приложения: текущие и архивные, включая tar.gz."""
+    """Логи ядра системы: текущие и архивные, включая tar.gz.
+
+    host здесь — сервер ядра (app_ip), а не сервер БД: приложение пишет свои
+    логи у себя.
+    """
     dirs = [d.strip() for d in (cluster.get("app_log_dirs") or "").split(",")
             if d.strip()]
     if not dirs:
@@ -3050,6 +3211,37 @@ async def collect_series_table(cluster: dict, hours: float, step_s: int,
             "names": names, "stamps": stamps, "series": series}
 
 
+def app_host(cluster: dict) -> str:
+    """Адрес ядра системы, работающей с этой БД (Lanbilling и подобные).
+
+    Логи ядра лежат на своём сервере, а не на серверах БД. Если адрес не задан,
+    считаем, что ядро стоит рядом с primary — так было до появления поля.
+    """
+    return (cluster.get("app_ip") or "").strip() or cluster["primary_ip"]
+
+
+def slow_log_path(cluster: dict, host: str) -> str:
+    """Путь к slow-логу конкретного сервера.
+
+    У реплики он часто другой: другой диск, другое имя файла. Пусто —
+    берём общий путь кластера.
+    """
+    if host and host == (cluster.get("replica_ip") or "").strip():
+        own = (cluster.get("replica_slow_log_path") or "").strip()
+        if own:
+            return own
+    return (cluster.get("slow_log_path") or "/var/log/mysql/slow.log").strip()
+
+
+def slow_log_archive(cluster: dict, host: str) -> str:
+    """Каталог архивов slow-лога конкретного сервера."""
+    if host and host == (cluster.get("replica_ip") or "").strip():
+        own = (cluster.get("replica_slow_log_archive_dir") or "").strip()
+        if own:
+            return own
+    return (cluster.get("slow_log_archive_dir") or "").strip()
+
+
 def cluster_hosts(cluster: dict) -> list:
     """[(адрес, роль)] всех серверов кластера — primary и, если есть, replica."""
     hosts = [(cluster["primary_ip"], "primary")]
@@ -3251,7 +3443,19 @@ async def run_tool(name: str, args: dict) -> str:
                 ls = lu - datetime.timedelta(hours=hours)
                 flt = str(args.get("filter") or "")
                 out.append(await read_slow_log(cluster, ip, ls, lu, flt, se, ue))
-                app = await read_app_log(cluster, ip, ls, lu, flt, se, ue)
+
+            # Логи ядра лежат на своём сервере — читаем их один раз, а не
+            # по разу на каждый сервер БД
+            ah = app_host(cluster)
+            t  = await remote_time(ah)
+            if t is None:
+                out.append(f"{ah}: сервер ядра недоступен по SSH")
+            else:
+                ue, se = t["epoch"], t["epoch"] - hours * 3600
+                lu = t["local"]
+                ls = lu - datetime.timedelta(hours=hours)
+                app = await read_app_log(cluster, ah, ls, lu,
+                                         str(args.get("filter") or ""), se, ue)
                 if app:
                     out.append(app)
             return "\n\n".join(p for p in out if p) or "Логи прочитать не удалось."
@@ -3441,20 +3645,39 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
                 local_until = t["local"]
                 local_since = local_until - datetime.timedelta(hours=win)
 
-                parts = [await read_slow_log(cluster, ip, local_since,
-                                             local_until, "",
-                                             since_epoch, until_epoch),
-                         await read_app_log(cluster, ip, local_since,
-                                            local_until, "",
-                                            since_epoch, until_epoch)]
-                parts = [p for p in parts if p]
-                if parts:
+                part = await read_slow_log(cluster, ip, local_since,
+                                           local_until, "",
+                                           since_epoch, until_epoch)
+                if part:
                     blocks.append(
                         f"## Логи {cluster['label']} · {role} ({ip}), "
                         f"период {local_since:%Y-%m-%d %H:%M} — "
                         f"{local_until:%H:%M} по времени сервера "
                         f"(пояс {t['tz'] or t['offset']}, смещение {t['offset']})"
-                        f"\n\n" + ("\n\n".join(parts)))
+                        f"\n\n" + part)
+
+            # Ядро системы — отдельный сервер, у него свой часовой пояс
+            ah = app_host(cluster)
+            t  = await remote_time(ah)
+            if t is None:
+                blocks.append(
+                    f"## Логи ядра {cluster['label']} ({ah})\n\n"
+                    f"  Сервер недоступен по SSH под учёткой "
+                    f"{LOG_SSH_USER or '(не задана)'} — логи прочитать нельзя.")
+            else:
+                until_epoch = t["epoch"]
+                since_epoch = until_epoch - win * 3600
+                local_until = t["local"]
+                local_since = local_until - datetime.timedelta(hours=win)
+                part = await read_app_log(cluster, ah, local_since, local_until,
+                                          "", since_epoch, until_epoch)
+                if part:
+                    blocks.append(
+                        f"## Логи ядра {cluster['label']} ({ah}), "
+                        f"период {local_since:%Y-%m-%d %H:%M} — "
+                        f"{local_until:%H:%M} по времени сервера "
+                        f"(пояс {t['tz'] or t['offset']}, смещение {t['offset']})"
+                        f"\n\n" + part)
     else:
         # Обзор всех
         clusters = enabled_clusters()

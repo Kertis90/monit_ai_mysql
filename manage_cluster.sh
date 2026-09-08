@@ -124,6 +124,10 @@ cmd_add() {
         DELAY_C="${DELAY_C:-7200}"
         [[ "$DELAY_C" =~ ^[0-9]+$ ]] || { log_error "Задержка должна быть целым числом секунд"; exit 1; }
     fi
+    echo "  Адрес ядра системы, работающего с этой БД (Lanbilling и т. п.)."
+    echo "  Оттуда читаются логи приложения. Enter — ядро стоит на primary."
+    read -rp "  IP сервера ядра (Enter — как primary): "           APP_IP_C
+
     echo "  Учётка для SQL-запросов агента (только SELECT)."
     echo "  Одна на все серверы кластера. Enter — запросы к БД отключить."
     read -rp  "  Логин для SQL-запросов (Enter — пропустить): "      DB_USER_C
@@ -132,42 +136,71 @@ cmd_add() {
         read -rsp "  Пароль этой учётки: "                            DB_PASS_C
         echo ""
     fi
+    DB_VIA_C="false"
+    if [[ -n "$DB_USER_C" ]]; then
+        echo "  Как ходить в MySQL:"
+        echo "    direct — напрямую на порт 3306 сервера БД"
+        echo "    tunnel — SSH пробрасывает локальный порт на 3306 (порт наружу"
+        echo "             открывать не нужно, клиент mysql на сервере не нужен)"
+        echo "    exec   — по SSH, запрос выполняет клиент mysql на сервере"
+        read -rp "  Режим доступа к БД [direct]: "                    DB_VIA_C
+        DB_VIA_C="${DB_VIA_C:-direct}"
+        case "$DB_VIA_C" in
+            direct|tunnel|exec) ;;
+            *) log_error "Режим должен быть direct, tunnel или exec"; exit 1 ;;
+        esac
+    fi
+
+    echo "  Пути логов. Enter — значения по умолчанию."
+    read -rp "  Slow-лог на primary [/var/log/mysql/slow.log]: "   SLOW_C
+    SLOW_C="${SLOW_C:-/var/log/mysql/slow.log}"
+    SLOW_REPL_C=""
+    if [[ -n "$REPLICA_IP_C" ]]; then
+        read -rp "  Slow-лог на replica (Enter — как на primary): " SLOW_REPL_C
+    fi
+    read -rp "  Каталоги логов ядра через запятую: "               APP_DIRS_C
+    read -rp "  Маска файлов логов ядра [*.log*]: "                APP_PAT_C
+    APP_PAT_C="${APP_PAT_C:-*.log*}"
+
     read -rsp "  Пароль пользователя exporter в MySQL: "           EXPORTER_PASS
     echo ""
     read -rp "  Теги через запятую (напр. siberia,production): "   TAGS_STR
 
-    IFS=',' read -ra TAGS_ARR <<< "$TAGS_STR"
-    TAGS_JSON=$(python3 -c "
-import json, sys
-tags = [t.strip() for t in sys.argv[1].split(',') if t.strip()]
-print(json.dumps(tags))
-" "$TAGS_STR")
+    # Значения передаём переменными окружения, а не подстановкой в код:
+    # пароль с кавычкой или обратным слэшем иначе ломает JSON
+    NAME="$NAME" LABEL="$LABEL" DESCRIPTION="$DESCRIPTION"     PRIMARY_IP_C="$PRIMARY_IP_C" REPLICA_IP_C="$REPLICA_IP_C"     APP_IP_C="$APP_IP_C" DELAY_C="$DELAY_C"     EXPORTER_PASS="$EXPORTER_PASS" DB_USER_C="$DB_USER_C"     DB_PASS_C="$DB_PASS_C" DB_VIA_C="$DB_VIA_C" SLOW_C="$SLOW_C"     SLOW_REPL_C="$SLOW_REPL_C" APP_DIRS_C="$APP_DIRS_C"     APP_PAT_C="$APP_PAT_C" TAGS_STR="$TAGS_STR"     python3 - "$REGISTRY" << 'PYEOF'
+import json, os, sys
 
-    python3 - "$REGISTRY" << EOF
-import json
-
-with open('$REGISTRY', 'r') as f:
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
     d = json.load(f)
 
-new_cluster = {
-    "name":                    "$NAME",
-    "label":                   "$LABEL",
-    "description":             "$DESCRIPTION",
-    "primary_ip":              "$PRIMARY_IP_C",
-    "replica_ip":              "$REPLICA_IP_C",
-    "replica_delay_seconds":   $DELAY_C,
-    "mysql_exporter_password": "$EXPORTER_PASS",
-    "db_user":                 "$DB_USER_C",
-    "db_password":             "$DB_PASS_C",
+env = os.environ.get
+d["clusters"].append({
+    "name":                    env("NAME", ""),
+    "label":                   env("LABEL", ""),
+    "description":             env("DESCRIPTION", ""),
+    "primary_ip":              env("PRIMARY_IP_C", ""),
+    "replica_ip":              env("REPLICA_IP_C", ""),
+    "app_ip":                  env("APP_IP_C", ""),
+    "replica_delay_seconds":   int(env("DELAY_C") or 0),
+    "mysql_exporter_password": env("EXPORTER_PASS", ""),
+    "db_user":                 env("DB_USER_C", ""),
+    "db_password":             env("DB_PASS_C", ""),
+    "db_via_ssh":              env("DB_VIA_C", "direct"),
+    "slow_log_path":           env("SLOW_C", ""),
+    "replica_slow_log_path":   env("SLOW_REPL_C", ""),
+    "app_log_dirs":            env("APP_DIRS_C", ""),
+    "app_log_pattern":         env("APP_PAT_C", "*.log*"),
     "enabled":                 True,
-    "tags":                    $TAGS_JSON,
-}
-d['clusters'].append(new_cluster)
+    "tags":                    [t.strip() for t in env("TAGS_STR", "").split(",")
+                                if t.strip()],
+})
 
-with open('$REGISTRY', 'w') as f:
+with open(path, "w", encoding="utf-8") as f:
     json.dump(d, f, ensure_ascii=False, indent=2)
 print("OK")
-EOF
+PYEOF
 
     log_info "Кластер '${LABEL}' (${NAME}) добавлен ✓"
     echo ""
@@ -237,6 +270,18 @@ for c in d['clusters']:
             d_s = int(c.get('replica_delay_seconds', 0) or 0)
             human = f"{d_s // 3600} ч {d_s % 3600 // 60} мин" if d_s else "нет (реальное время)"
             print(f"  Задержка:  {human}" + (f" ({d_s} с)" if d_s else ""))
+        print(f"  Ядро:      {c.get('app_ip') or c['primary_ip'] + ' (не задано, берём primary)'}")
+        mode = str(c.get('db_via_ssh', 'direct')).lower()
+        mode = {'true': 'exec', '1': 'exec', 'yes': 'exec',
+                'false': 'direct', '': 'direct'}.get(mode, mode)
+        print(f"  Доступ к БД: {mode}" + ("" if c.get('db_user')
+              else "  (db_user не задан — SQL отключён)"))
+        print(f"  Slow-лог:  primary {c.get('slow_log_path') or '/var/log/mysql/slow.log'}")
+        if c.get('replica_ip'):
+            print(f"             replica {c.get('replica_slow_log_path') or '(как на primary)'}")
+        print(f"  Логи ядра: {c.get('app_log_dirs') or '(не заданы)'}"
+              + (f"  маска {c.get('app_log_pattern', '*.log*')}"
+                 if c.get('app_log_dirs') else ""))
         print(f"  Статус:    {'✓ enabled' if c.get('enabled',True) else '✗ disabled'}")
         print(f"  Теги:      {', '.join(c.get('tags',[]))}")
         break
