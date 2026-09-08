@@ -1144,6 +1144,9 @@ def users_init() -> bool:
                     granted_at   TEXT
                 )
             """)
+        # Версия важна: на старых сборках (RHEL/CentOS 7 — SQLite 3.7) нет
+        # части современного синтаксиса, и запрос падает не там, где ищут
+        logger.info(f"Таблица доступов готова, SQLite {sqlite3.sqlite_version}")
         return True
     except Exception as e:
         logger.error(f"Таблица доступов недоступна: {e}")
@@ -1398,20 +1401,23 @@ def user_grant(username: str, display_name: str = "", email: str = "",
     if role not in ("user", "admin"):
         role = "user"
     try:
+        now = datetime.datetime.utcnow().isoformat()
         with closing(agent_db()) as conn, conn:
+            # Не UPSERT: "INSERT ... ON CONFLICT DO UPDATE" появился в
+            # SQLite 3.24, а в RHEL/CentOS 7 идёт 3.7 — там это синтаксическая
+            # ошибка "near ON". INSERT OR IGNORE плюс UPDATE понимают все
+            # версии и заодно не ломаются при одновременной выдаче.
             conn.execute(
-                "INSERT INTO users (username, display_name, email, role,"
-                "                   enabled, granted_by, granted_at)"
-                " VALUES (?, ?, ?, ?, 1, ?, ?)"
-                " ON CONFLICT(username) DO UPDATE SET"
-                "   display_name = excluded.display_name,"
-                "   email        = excluded.email,"
-                "   role         = excluded.role,"
-                "   enabled      = 1,"
-                "   granted_by   = excluded.granted_by,"
-                "   granted_at   = excluded.granted_at",
-                (uname, display_name, email, role, granted_by,
-                 datetime.datetime.utcnow().isoformat()))
+                "INSERT OR IGNORE INTO users (username, display_name, email,"
+                "                             role, enabled, granted_by,"
+                "                             granted_at)"
+                " VALUES (?, ?, ?, ?, 1, ?, ?)",
+                (uname, display_name, email, role, granted_by, now))
+            conn.execute(
+                "UPDATE users SET display_name = ?, email = ?, role = ?,"
+                "                 enabled = 1, granted_by = ?, granted_at = ?"
+                " WHERE username = ?",
+                (display_name, email, role, granted_by, now, uname))
         logger.info(f"Доступ выдан: {uname} (роль {role}, выдал {granted_by})")
         return True
     except Exception as e:
