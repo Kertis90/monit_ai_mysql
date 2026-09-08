@@ -414,6 +414,13 @@ LDAP_SEARCH_MODE="${LDAP_SEARCH_MODE:-prefix}"
 LDAP_SEARCH_FILTER="${LDAP_SEARCH_FILTER:-}"
 # Откуда дозаполнять пустые настройки LDAP. Пусто — не читать
 NSLCD_CONF="${NSLCD_CONF:-/etc/nslcd.conf}"
+
+# ── Хранилище агента ─────────────────────────────────────────────────────────
+# Пусто — SQLite по пути ALERTS_DB_PATH: ставить нечего, переживает рестарт.
+# Несколько экземпляров агента или общая история — переключитесь на MySQL:
+#   DB_URL="mysql+asyncmy://agent:пароль@10.0.0.5:3306/ai_agent"
+# Схема создаётся сама, драйвер ставит install_agent.sh.
+DB_URL="${DB_URL:-}"
 LDAP_SEARCH_USER="${LDAP_SEARCH_USER}"
 LDAP_SEARCH_PASSWORD=$(sq "${LDAP_SEARCH_PASSWORD}")
 

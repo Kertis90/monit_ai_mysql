@@ -1,0 +1,410 @@
+
+
+"""
+Чат: WebSocket со стримингом, тот же разговор через REST, история и оценки.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from typing import Optional
+
+from fastapi import (APIRouter, HTTPException, Request, WebSocket,
+                     WebSocketDisconnect)
+from fastapi.responses import JSONResponse
+
+from agent.api.deps import AdminUser, Chats, Feedbacks, MaybeUser
+from agent.core.config import settings
+from agent.db.base import session_scope
+from agent.db.repositories.chats import ChatRepository, FeedbackRepository
+from agent.db.repositories.users import normalize
+from agent.schemas.api import ChatRequest, FeedbackRequest
+from agent.services import access
+from agent.services.assistant import build_chat_context, llm_with_tools
+from agent.services.intents import detect_chart_intent, detect_export_intent
+from agent.services.llm import llm_complete, llm_probe_tools, llm_stream
+from agent.services.prometheus import build_charts
+
+logger = logging.getLogger("agent.api.chat")
+router = APIRouter(tags=["Чат"])
+
+# Живые соединения: при остановке агента их надо закрыть самим, иначе uvicorn
+# ждёт, пока клиент отключится сам, а вкладка чата держит сокет часами
+ws_clients: set = set()
+# История разговоров в памяти процесса; постоянная копия лежит в базе
+ws_sessions: dict[str, list[dict]] = {}
+
+AUTH_ENABLED          = settings.auth.enabled
+CHAT_CONTEXT_MESSAGES = settings.chat_context_messages
+
+
+def history_to_messages(history: list[dict]) -> list[dict]:
+    """Роль summary в OpenAI-совместимый API отправлять нельзя — подаём её
+    системным сообщением с пометкой, что это конспект."""
+    out = []
+    for m in history:
+        if m.get("role") == "summary":
+            out.append({"role": "system",
+                        "content": "Конспект более ранней части разговора:\n"
+                                   + m["content"]})
+        else:
+            out.append({"role": m["role"], "content": m["content"]})
+    return out
+
+
+async def chat_restore(client_id: str) -> list[dict]:
+    """Поднять переписку из базы при первом сообщении в этом процессе."""
+    if not client_id:
+        return []
+    async with session_scope() as session:
+        rows = await ChatRepository(session).history(
+            client_id, limit=CHAT_CONTEXT_MESSAGES * 2)
+    return [{"role": r.role, "content": r.content} for r in rows]
+
+
+async def chat_save(client_id: str, session_id: str, role: str,
+                    content: str, fingerprint: str = "") -> None:
+    if not client_id:
+        return
+    async with session_scope() as session:
+        await ChatRepository(session).add(
+            client_id=client_id, session_id=session_id, role=role,
+            content=content, fingerprint=fingerprint)
+
+
+async def chat_summarize(client_id: str, older: list[dict]) -> str:
+    """Сжать вытесняемую часть переписки в короткую выжимку.
+
+    Вызывается, когда история упирается в окно контекста. Без этого старые
+    сообщения просто отбрасывались, и агент «забывал» ранее выясненное —
+    например, что отставание реплики уже разобрали и оно плановое.
+    """
+    if not older:
+        return ""
+    dialog = "\n".join(
+        f"{'Пользователь' if m['role'] == 'user' else 'Агент'}: {m['content']}"
+        for m in older)[:12000]
+
+    prompt = [
+        {"role": "system",
+         "content": "Ты ведёшь конспект технической переписки по мониторингу MySQL."},
+        {"role": "user",
+         "content": (
+             "Сожми переписку ниже в выжимку до 15 строк. Сохрани только то, "
+             "что понадобится дальше: какие кластеры обсуждали, какие проблемы "
+             "нашли и чем закончилось, какие выводы уже сделаны (в том числе "
+             "«проблемы нет»), какие значения метрик назывались, что решили "
+             "сделать. Без вступлений и без воды.\n\n" + dialog)},
+    ]
+    try:
+        return (await llm_complete(prompt)).strip()
+    except Exception as e:
+        logger.error(f"Не удалось построить выжимку истории: {e}")
+        return ""
+
+
+async def chat_save_summary(client_id: str, session_id: str, text: str) -> None:
+    if text:
+        await chat_save(client_id, session_id, "summary", text)
+
+
+async def chat_compact(client_id: str, session_id: str,
+                       history: list[dict]) -> list[dict]:
+    """Ужать историю до окна контекста, вытесненное — в выжимку.
+
+    Возвращает новую историю: [выжимка] + последние сообщения.
+    """
+    if len(history) <= CHAT_CONTEXT_MESSAGES:
+        return history
+
+    keep  = CHAT_CONTEXT_MESSAGES // 2          # что оставляем дословно
+    older = [m for m in history[:-keep] if m.get("role") in ("user", "assistant")]
+    tail  = history[-keep:]
+
+    digest = await chat_summarize(client_id, older)
+    if not digest:
+        # выжимка не получилась — ведём себя как раньше, просто обрезаем
+        return history[-CHAT_CONTEXT_MESSAGES:]
+
+    await chat_save_summary(client_id, session_id, digest)
+    logger.info("История %s: %d сообщений сжаты в выжимку", client_id, len(older))
+    return [{"role": "summary", "content": digest}] + tail
+
+
+@router.websocket("/ws")
+async def websocket_chat(ws: WebSocket):
+    """
+    Протокол:
+      Клиент → {"type": "message", "text": "...", "session_id": "...",
+                "client_id": "...", "fingerprint": "..."}
+      Сервер → {"type": "context",  "cluster": "...", "hours": N}   — что определил агент
+      Сервер → {"type": "token",    "text": "..."}                  — стриминг токенов
+      Сервер → {"type": "done"}                                     — конец ответа
+      Сервер → {"type": "error",    "text": "..."}
+      Клиент → {"type": "ping"} / Сервер → {"type": "pong"}
+      Клиент → {"type": "stop"}  — прервать генерацию текущего ответа
+    """
+    await ws.accept()
+
+    # HTTP-middleware на WebSocket не распространяется — проверяем отдельно.
+    # У WebSocket те же .cookies/.headers/.client, поэтому current_user подходит.
+    ws_user = None
+    if AUTH_ENABLED:
+        ws_user = await access.current_user(ws)
+        if not ws_user:
+            await ws.send_json({"type": "error",
+                                "text": "Сессия истекла — обновите страницу и войдите."})
+            await ws.close(code=4401)
+            return
+
+    ws_clients.add(ws)
+    session_id = f"ws-{id(ws)}"
+    logger.info(f"WS connected: {session_id}"
+                + (f" user={ws_user['username']}" if ws_user else ""))
+
+    # Пока идёт стриминг, основной цикл занят и receive_text() не вызывается —
+    # значит «стоп» никто бы не услышал. Поэтому чтение вынесено в отдельную
+    # задачу: она разбирает служебные сообщения сразу, а вопросы кладёт в очередь.
+    inbox: asyncio.Queue = asyncio.Queue()
+    stop_event = asyncio.Event()
+
+    async def reader():
+        while True:
+            raw = await ws.receive_text()
+            try:
+                m = json.loads(raw)
+            except json.JSONDecodeError:
+                await ws.send_json({"type": "error", "text": "Невалидный JSON"})
+                continue
+            kind = m.get("type")
+            if kind == "ping":
+                await ws.send_json({"type": "pong"})
+            elif kind == "stop":
+                stop_event.set()
+            elif kind == "message":
+                await inbox.put(m)
+
+    reader_task = asyncio.create_task(reader())
+
+    try:
+        while True:
+            msg = await inbox.get()
+            stop_event.clear()
+
+            text = msg.get("text", "").strip()
+            sid  = msg.get("session_id", session_id)
+            if not text:
+                continue
+
+            # Чей это разговор. Когда включена аутентификация, ключ — ИМЯ
+            # ПОЛЬЗОВАТЕЛЯ: агентом пользуются несколько человек, и history
+            # одного не должна попадать в контекст другого. По браузеру
+            # (client_id) делим только когда логина нет вовсе — иначе двое
+            # за одной машиной видели бы переписку друг друга, а один человек
+            # с ноутбука и с телефона имел бы две несвязанные истории.
+            browser_id = str(msg.get("client_id") or "").strip()[:128]
+            fp  = str(msg.get("fingerprint") or "").strip()[:128]
+            cid = (f"user:{normalize(ws_user['username'])}"
+                   if ws_user else browser_id)
+            key = cid or sid
+
+            history = ws_sessions.get(key)
+            if history is None:
+                # первое сообщение в этом процессе — поднимаем историю из БД
+                history = await chat_restore(cid) if cid else []
+                ws_sessions[key] = history
+
+            # 1. Собрать контекст (метрики) — сообщаем клиенту что нашли
+            try:
+                context_text, cluster, hours = await build_chat_context(text)
+            except Exception as e:
+                logger.error(f"Context error: {e}")
+                await ws.send_json({"type": "error",
+                                    "text": f"Ошибка сбора метрик: {e}"})
+                continue
+
+            await ws.send_json({
+                "type":    "context",
+                "cluster": cluster["label"] if cluster else None,
+                "hours":   hours if hours > 0 else None,
+            })
+
+            # Графики строим ТОЛЬКО если их попросили. Иначе шлём лёгкое
+            # предложение без данных: строка со ссылками под ответом, десять
+            # запросов в Prometheus зря не делаем.
+            if cluster and hours > 0:
+                want_charts = detect_chart_intent(text)
+                want_export = detect_export_intent(text)
+                try:
+                    charts = (await build_charts(cluster, hours)
+                              if want_charts else [])
+                    await ws.send_json({
+                        "type":          "charts",
+                        "mode":          "inline" if want_charts else "offer",
+                        "highlight_pdf": want_export,
+                        "cluster":       cluster["name"],
+                        "cluster_label": cluster["label"],
+                        "hours":         hours,
+                        "charts":        charts,
+                    })
+                except Exception as e:
+                    logger.error(f"Не удалось собрать графики: {e}")
+
+            # 2. Собрать messages
+            messages = [{"role": "system", "content": system_prompt()}]
+            # Выжимка вытесненной части + последние реплики дословно
+            messages += history_to_messages(history[-CHAT_CONTEXT_MESSAGES:])
+            messages.append({
+                "role": "user",
+                "content": f"{context_text}\n\n## Вопрос\n\n{text}",
+            })
+
+            # Если эндпоинт умеет инструменты — даём модели дозапросить
+            # недостающее самой, вместо угадывания по ключевым словам.
+            # Собранный контекст остаётся: он покрывает типовые вопросы
+            # без лишних раундов к LLM.
+            if await llm_probe_tools():
+                try:
+                    messages, used = await llm_with_tools(messages)
+                    if used:
+                        await ws.send_json({"type": "tools", "used": used})
+                except Exception as e:
+                    logger.error(f"Режим инструментов не сработал: {e}")
+
+            # 3. Стримить ответ
+            full_answer = []
+            stopped = False
+            async for token in llm_stream(messages):
+                if stop_event.is_set():
+                    stopped = True
+                    break
+                full_answer.append(token)
+                await ws.send_json({"type": "token", "text": token})
+
+            answer = "".join(full_answer)
+            if stopped:
+                # Прерванный ответ всё равно сохраняем: пользователь его видел,
+                # и в следующем вопросе на него может ссылаться.
+                answer += "\n\n[генерация остановлена]"
+                await ws.send_json({"type": "token",
+                                    "text": "\n\n[остановлено]"})
+                logger.info(f"Генерация остановлена пользователем: {sid}")
+            await ws.send_json({"type": "done", "stopped": stopped})
+
+            # 4. Сохранить историю (без огромного контекста метрик)
+            history.append({"role": "user",      "content": text})
+            history.append({"role": "assistant", "content": answer})
+            await chat_save(cid, sid, "user",      text,   fp)
+            await chat_save(cid, sid, "assistant", answer, fp)
+            # Упёрлись в окно контекста — не выбрасываем старое, а сжимаем
+            if len(history) > CHAT_CONTEXT_MESSAGES:
+                history[:] = await chat_compact(cid, sid, history)
+
+    except WebSocketDisconnect:
+        logger.info(f"WS disconnected: {session_id}")
+        ws_sessions.pop(session_id, None)
+    except Exception as e:
+        logger.error(f"WS error: {e}")
+        try:
+            await ws.close()
+        except Exception:
+            pass
+    finally:
+        ws_clients.discard(ws)
+        # Без этого задача-читатель переживёт соединение и повиснет
+        reader_task.cancel()
+        try:
+            await reader_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+@router.post("/chat", summary="Задать вопрос агенту (без стриминга)")
+async def rest_chat(req: ChatRequest):
+    """REST-версия чата (без стриминга) — для curl и интеграций."""
+    context_text, cluster, hours = await build_chat_context(req.message)
+    history = ws_sessions.setdefault(req.session_id, [])
+
+    messages = [{"role": "system", "content": system_prompt()}]
+    for m in history[-6:]:
+        messages.append(m)
+    messages.append({"role": "user",
+                     "content": f"{context_text}\n\n## Вопрос\n\n{req.message}"})
+
+    answer = await llm_complete(messages)
+
+    history.append({"role": "user",      "content": req.message})
+    history.append({"role": "assistant", "content": answer})
+    if len(history) > 16:
+        history[:] = history[-16:]
+
+    return {
+        "answer":        answer,
+        "cluster":       cluster["name"]  if cluster else None,
+        "cluster_label": cluster["label"] if cluster else None,
+        "hours":         hours if hours > 0 else None,
+    }
+
+
+@router.get("/chat", summary="Задать вопрос агенту (GET)")
+async def rest_chat_get(message: str, session_id: str = "rest"):
+    """Тот же ответ, что и POST /chat. Удобен для быстрой проверки из curl."""
+    return await rest_chat(ChatRequest(message=message, session_id=session_id))
+
+
+async def chat_key(request: Request, client_id: str = "") -> str:
+    """Чей это разговор.
+
+    Когда вход включён, ключ — имя пользователя: агентом пользуются несколько
+    человек, и переписка одного не должна попадать в контекст другого. По
+    браузеру делим только при выключенном входе — иначе двое за одной машиной
+    видели бы историю друг друга, а один человек с ноутбука и с телефона имел
+    бы две несвязанные.
+    """
+    if settings.auth.enabled:
+        user = await access.current_user(request)
+        if user:
+            return "user:" + normalize(user["username"])
+    return client_id
+
+
+@router.get("/chat/history", summary="История переписки")
+async def chat_history(request: Request, chats: Chats,
+                       client_id: str = "", limit: int = 50):
+    key = await chat_key(request, client_id)
+    if not key:
+        raise HTTPException(status_code=400, detail="client_id обязателен")
+    rows = await chats.history(key, limit=limit)
+    return {"client_id": key, "total": len(rows),
+            "items": [{"ts": r.ts, "role": r.role, "content": r.content}
+                      for r in rows],
+            "retention_days": settings.db.chats_retention_days,
+            "persistent": True}
+
+
+@router.delete("/chat/history", summary="Очистить свою историю")
+async def chat_history_clear(request: Request, chats: Chats,
+                             client_id: str = ""):
+    key = await chat_key(request, client_id)
+    if not key:
+        raise HTTPException(status_code=400, detail="client_id обязателен")
+    removed = await chats.forget(key)
+    ws_sessions.pop(key, None)      # и из памяти процесса тоже
+    return {"client_id": key, "removed": removed}
+
+
+@router.post("/api/feedback", summary="Оценить ответ агента")
+async def add_feedback(req: FeedbackRequest, request: Request,
+                       feedbacks: Feedbacks, user: MaybeUser):
+    await feedbacks.add(rating=req.rating, question=req.question,
+                        answer=req.answer, comment=req.comment,
+                        client_id=req.client_id,
+                        username=(user or {}).get("username", ""))
+    return {"ok": True}
+
+
+@router.get("/api/feedback/stats", summary="Сводка по оценкам ответов")
+async def feedback_stats(admin: AdminUser, feedbacks: Feedbacks,
+                         days: int = 30):
+    return await feedbacks.stats(days)

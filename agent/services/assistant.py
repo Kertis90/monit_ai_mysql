@@ -1,0 +1,441 @@
+"""
+Сборка ответа: инструменты модели и подготовка контекста.
+
+Инструменты — основной путь. Модель сама решает, какие данные ей нужны:
+список ключевых слов приходилось расширять после каждой новой формулировки,
+и «статистика», «детально», «за последний час» промахивались по очереди.
+Ключевые слова остались запасным путём для эндпоинтов без tool calling.
+"""
+from __future__ import annotations
+
+import asyncio
+import datetime
+import json
+import logging
+from typing import Optional
+
+import httpx
+
+from agent.core.config import settings
+from agent.db.base import session_scope
+from agent.db.repositories.alerts import AlertRepository
+from agent.db.repositories.chats import ChatRepository
+from agent.services.analysis import (build_timeline, collect_baseline,
+                                     collect_config_diff, collect_series_table,
+                                     collect_series_tables, explain_top_queries,
+                                     fmt_alerts, fmt_baseline, fmt_current,
+                                     fmt_diagnostics, fmt_history,
+                                     fmt_series_table, run_diagnostics,
+                                     system_prompt)
+from agent.services.intents import (detect_alert_intent, detect_breakdown_intent,
+                                    detect_chart_intent, detect_diagnose_intent,
+                                    detect_history_intent, detect_time_hours,
+                                    extract_sql, parse_step_seconds)
+from agent.services.llm import (AUTH_HEADER, LLM_BASE_URL, LLM_MAX_TOKENS,
+                                LLM_MODEL, LLM_TEMPERATURE, LLM_TOOL_ROUNDS,
+                                llm_complete)
+from agent.services.logs import detect_log_intent, read_app_log, read_slow_log
+from agent.services.mysql import (cluster_db_creds, fmt_sql_result, sql_execute)
+from agent.services.prometheus import (build_charts, collect_current,
+                                       collect_history)
+from agent.services.registry import (app_host, cluster_hosts,
+                                     detect_cluster_in_text, enabled_clusters,
+                                     find_cluster)
+from agent.services.ssh import remote_time
+
+logger = logging.getLogger("agent.assistant")
+
+LOG_SSH_USER = settings.ssh.user
+SERIES_MAX_ROWS = settings.prometheus.series_max_rows
+ALERTS_RETENTION_DAYS = settings.db.alerts_retention_days
+
+
+async def recent_alerts(cluster: Optional[str] = None, hours: float = 24,
+                        limit: int = 20) -> list[dict]:
+    """Свежие события словарями — в том виде, в каком их ждут форматтеры."""
+    async with session_scope() as session:
+        rows = await AlertRepository(session).recent(
+            cluster=cluster, hours=hours, limit=limit)
+        return [r.as_context() for r in rows]
+
+CHAT_CONTEXT_MESSAGES = settings.chat_context_messages
+MAX_METRICS_HOURS     = settings.prometheus.max_metrics_hours
+
+
+def tool_specs() -> list:
+    """Описание инструментов в формате OpenAI function calling."""
+    names = [c["name"] for c in enabled_clusters()] or ["<нет кластеров>"]
+    cl = {"type": "string", "description": "имя кластера: " + ", ".join(names)}
+    hrs = {"type": "number",
+           "description": f"окно в часах, максимум {MAX_METRICS_HOURS:g}"}
+    return [
+        {"type": "function", "function": {
+            "name": "get_current_metrics",
+            "description": "Текущие метрики кластера: доступность, QPS, "
+                           "подключения, CPU, отставание реплики.",
+            "parameters": {"type": "object", "properties": {"cluster": cl},
+                           "required": ["cluster"]}}},
+        {"type": "function", "function": {
+            "name": "get_history",
+            "description": "Агрегаты min/avg/max за период и сравнение "
+                           "с тем же периодом неделю назад.",
+            "parameters": {"type": "object",
+                           "properties": {"cluster": cl, "hours": hrs},
+                           "required": ["cluster", "hours"]}}},
+        {"type": "function", "function": {
+            "name": "get_breakdown",
+            "description": "Детальная статистика по интервалам: значения "
+                           "CPU, iowait, памяти, дисков, QPS по каждому шагу. "
+                           "Отдельная таблица на каждый сервер кластера.",
+            "parameters": {"type": "object", "properties": {
+                "cluster": cl, "hours": hrs,
+                "step_seconds": {"type": "integer",
+                                 "description": "шаг разбивки, по умолчанию 300"}},
+                "required": ["cluster", "hours"]}}},
+        {"type": "function", "function": {
+            "name": "run_diagnostics",
+            "description": "Диагностика Performance Schema: тяжёлые запросы, "
+                           "полные сканирования, блокировки, ожидания, "
+                           "планы выполнения и схемы таблиц.",
+            "parameters": {"type": "object", "properties": {"cluster": cl},
+                           "required": ["cluster"]}}},
+        {"type": "function", "function": {
+            "name": "run_sql",
+            "description": "Читающий SQL-запрос к кластеру. Разрешены только "
+                           "SELECT, SHOW, EXPLAIN, DESCRIBE.",
+            "parameters": {"type": "object", "properties": {
+                "cluster": cl,
+                "sql": {"type": "string", "description": "текст запроса"}},
+                "required": ["cluster", "sql"]}}},
+        {"type": "function", "function": {
+            "name": "read_logs",
+            "description": "Slow-лог MySQL и логи приложения за период "
+                           "с серверов кластера.",
+            "parameters": {"type": "object", "properties": {
+                "cluster": cl, "hours": hrs,
+                "filter": {"type": "string",
+                           "description": "дополнительная строка поиска"}},
+                "required": ["cluster", "hours"]}}},
+        {"type": "function", "function": {
+            "name": "get_alerts",
+            "description": "История сработавших алертов с разбором.",
+            "parameters": {"type": "object", "properties": {
+                "cluster": cl, "hours": hrs},
+                "required": []}}},
+    ]
+
+
+async def run_tool(name: str, args: dict) -> str:
+    """Выполнить инструмент и вернуть текст для модели."""
+    cname   = str(args.get("cluster") or "").strip()
+    cluster = find_cluster(cname) if cname else None
+    hours   = min(float(args.get("hours") or 6), MAX_METRICS_HOURS)
+
+    if name in ("get_current_metrics", "get_history", "get_breakdown",
+                "run_diagnostics", "run_sql", "read_logs") and not cluster:
+        return f"Кластер «{cname}» не найден. Доступные: " + \
+               ", ".join(c["name"] for c in enabled_clusters())
+
+    try:
+        if name == "get_current_metrics":
+            return fmt_current(await collect_current(cluster))
+
+        if name == "get_history":
+            hist  = await collect_history(cluster, hours)
+            parts = [fmt_history(hist, cluster["label"])]
+            base  = await collect_baseline(cluster, hours)
+            cmp_  = fmt_baseline(hist, base, cluster["label"])
+            if cmp_:
+                parts.append(cmp_)
+            return "\n\n".join(parts)
+
+        if name == "get_breakdown":
+            step = int(args.get("step_seconds") or 300)
+            tabs = await collect_series_tables(cluster, hours, max(step, 15))
+            return "\n\n".join(fmt_series_table(t, cluster["label"]) for t in tabs)
+
+        if name == "run_diagnostics":
+            out = []
+            for ip, role in cluster_hosts(cluster):
+                diag = await run_diagnostics(cluster, ip)
+                if diag:
+                    out.append(fmt_diagnostics(
+                        diag, f"{cluster['label']} · {role}", ip))
+            cfg = await collect_config_diff(cluster)
+            if cfg:
+                out.append(cfg)
+            plans = await explain_top_queries(cluster, cluster["primary_ip"])
+            if plans:
+                out.append(plans)
+            return "\n\n".join(out) or "Диагностика недоступна: не задан db_user."
+
+        if name == "run_sql":
+            return fmt_sql_result(
+                await sql_execute(cluster, str(args.get("sql") or "")))
+
+        if name == "read_logs":
+            out = []
+            for ip, role in cluster_hosts(cluster):
+                t = await remote_time(ip)
+                if t is None:
+                    out.append(f"{ip}: сервер недоступен по SSH")
+                    continue
+                ue, se = t["epoch"], t["epoch"] - hours * 3600
+                lu = t["local"]
+                ls = lu - datetime.timedelta(hours=hours)
+                flt = str(args.get("filter") or "")
+                out.append(await read_slow_log(cluster, ip, ls, lu, flt, se, ue))
+
+            # Логи ядра лежат на своём сервере — читаем их один раз, а не
+            # по разу на каждый сервер БД
+            ah = app_host(cluster)
+            t  = await remote_time(ah)
+            if t is None:
+                out.append(f"{ah}: сервер ядра недоступен по SSH")
+            else:
+                ue, se = t["epoch"], t["epoch"] - hours * 3600
+                lu = t["local"]
+                ls = lu - datetime.timedelta(hours=hours)
+                app = await read_app_log(cluster, ah, ls, lu,
+                                         str(args.get("filter") or ""), se, ue)
+                if app:
+                    out.append(app)
+            return "\n\n".join(p for p in out if p) or "Логи прочитать не удалось."
+
+        if name == "get_alerts":
+            rows = await recent_alerts(cluster=cluster["name"] if cluster else None,
+                                hours=hours, limit=20)
+            return fmt_alerts(rows, f"последние {hours:g} ч.",
+                              cluster["label"] if cluster else None)
+
+        return f"Неизвестный инструмент: {name}"
+    except Exception as e:
+        logger.error(f"Инструмент {name} упал: {e}")
+        return f"Инструмент {name} завершился ошибкой: {e}"
+
+
+async def llm_with_tools(messages: list) -> tuple:
+    """Диалог с инструментами. Возвращает (сообщения для финального ответа,
+    список выполненных инструментов)."""
+    headers = {"Content-Type": "application/json", "Authorization": AUTH_HEADER}
+    used = []
+    convo = list(messages)
+
+    for _ in range(LLM_TOOL_ROUNDS):
+        payload = {"model": LLM_MODEL, "max_tokens": LLM_MAX_TOKENS,
+                   "temperature": LLM_TEMPERATURE, "messages": convo,
+                   "tools": tool_specs(), "tool_choice": "auto"}
+        try:
+            async with httpx.AsyncClient(timeout=90) as client:
+                r = await client.post(f"{LLM_BASE_URL}/chat/completions",
+                                      headers=headers, json=payload)
+                r.raise_for_status()
+                msg = r.json()["choices"][0]["message"]
+        except Exception as e:
+            logger.error(f"Раунд с инструментами не удался: {e}")
+            break
+
+        calls = msg.get("tool_calls") or []
+        if not calls:
+            break                      # модель готова отвечать
+
+        convo.append(msg)
+        for call in calls:
+            fn = call.get("function", {})
+            name = fn.get("name", "")
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            logger.info(f"Инструмент: {name} {args}")
+            result = await run_tool(name, args)
+            used.append(name)
+            convo.append({"role": "tool", "tool_call_id": call.get("id", ""),
+                          "name": name, "content": result[:20000]})
+    return convo, used
+
+
+async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], float]:
+    """Определить кластер и временное окно, собрать контекст метрик."""
+    cluster = detect_cluster_in_text(user_message)
+    hours   = detect_time_hours(user_message)
+    blocks  = []
+
+    # Обрезаем окно метрик, но не молча: если просили неделю, а отдаём сутки,
+    # LLM должна об этом сказать, иначе ответ будет вводить в заблуждение.
+    asked_hours = hours
+    if hours > MAX_METRICS_HOURS:
+        hours = MAX_METRICS_HOURS
+        blocks.append(
+            f"## Ограничение периода\n\n"
+            f"  Запрошено {asked_hours:g} ч, метрики отданы за последние "
+            f"{hours:g} ч — это максимум для одного разбора.\n"
+            f"  Обязательно предупреди об этом в ответе.")
+
+    if cluster:
+        if hours > 0:
+            hist = await collect_history(cluster, hours)
+            blocks.append(fmt_history(hist, cluster["label"]))
+            # С чем сравнивать: те же метрики неделю назад
+            try:
+                base = await collect_baseline(cluster, hours)
+                cmp_block = fmt_baseline(hist, base, cluster["label"])
+                if cmp_block:
+                    blocks.append(cmp_block)
+            except Exception as e:
+                logger.error(f"База для сравнения не собрана: {e}")
+            # Просили разбивку по интервалам — агрегатов недостаточно:
+            # по min/avg/max не видно, когда был всплеск и с чем он совпал
+            if detect_breakdown_intent(user_message):
+                step = parse_step_seconds(user_message) or 300
+                # по таблице на каждый сервер: у кластера с репликой их два,
+                # и ресурсы у них разные
+                for tb in await collect_series_tables(cluster, hours, step):
+                    blocks.append(fmt_series_table(tb, cluster["label"]))
+        current = await collect_current(cluster)
+        blocks.append(fmt_current(current))
+
+        # Пользователь написал SQL — выполняем и кладём результат рядом
+        # с метриками. Валидатор пропустит только читающие конструкции.
+        user_sql = extract_sql(user_message)
+        if user_sql and cluster_db_creds(cluster):
+            blocks.append(fmt_sql_result(await sql_execute(cluster, user_sql)))
+
+        # Просят разобраться, почему медленно — собираем диагностический
+        # набор сами, по каждому серверу. Советовать «посмотрите
+        # performance_schema» бессмысленно, если можно просто посмотреть.
+        if detect_diagnose_intent(user_message) and cluster_db_creds(cluster):
+            for ip, role in cluster_hosts(cluster):
+                diag = await run_diagnostics(cluster, ip)
+                if diag:
+                    blocks.append(fmt_diagnostics(
+                        diag, f"{cluster['label']} · {role}", ip))
+
+            # Расхождения параметров между серверами кластера
+            try:
+                cfg = await collect_config_diff(cluster)
+                if cfg:
+                    blocks.append(cfg)
+            except Exception as e:
+                logger.error(f"Сравнение конфигураций не удалось: {e}")
+
+            # Планы выполнения — превращают «запрос медленный»
+            # в конкретную рекомендацию по индексам
+            try:
+                plans = await explain_top_queries(cluster, cluster["primary_ip"])
+                if plans:
+                    blocks.append(plans)
+            except Exception as e:
+                logger.error(f"EXPLAIN не выполнен: {e}")
+
+            # Лента событий: причинно-следственную связь видно сразу
+            tl = build_timeline(await recent_alerts(
+                cluster=cluster["name"], hours=hours if hours > 0 else 24,
+                limit=40))
+            if tl:
+                blocks.append(tl)
+
+        # Логи читаем по SSH с самих серверов. Период приводим к ВРЕМЕНИ
+        # СЕРВЕРА: метки в логах пишутся в его часовом поясе, и разница
+        # с сервером мониторинга дала бы grep не по тем датам.
+        if detect_log_intent(user_message):
+            win = hours if hours > 0 else 2.0
+            for ip, role in cluster_hosts(cluster):
+                t = await remote_time(ip)
+                if t is None:
+                    blocks.append(
+                        f"## Логи {cluster['label']} · {role} ({ip})\n\n"
+                        f"  Сервер недоступен по SSH под учёткой "
+                        f"{LOG_SSH_USER or '(не задана)'} — логи прочитать нельзя.")
+                    continue
+
+                # Два разных отсчёта. Файлы выбираем по абсолютному времени
+                # (mtime), а grep идёт по локальным меткам внутри логов.
+                # Пояса серверов различаются, смешивать нельзя.
+                until_epoch = t["epoch"]
+                since_epoch = until_epoch - win * 3600
+                local_until = t["local"]
+                local_since = local_until - datetime.timedelta(hours=win)
+
+                part = await read_slow_log(cluster, ip, local_since,
+                                           local_until, "",
+                                           since_epoch, until_epoch)
+                if part:
+                    blocks.append(
+                        f"## Логи {cluster['label']} · {role} ({ip}), "
+                        f"период {local_since:%Y-%m-%d %H:%M} — "
+                        f"{local_until:%H:%M} по времени сервера "
+                        f"(пояс {t['tz'] or t['offset']}, смещение {t['offset']})"
+                        f"\n\n" + part)
+
+            # Ядро системы — отдельный сервер, у него свой часовой пояс
+            ah = app_host(cluster)
+            t  = await remote_time(ah)
+            if t is None:
+                blocks.append(
+                    f"## Логи ядра {cluster['label']} ({ah})\n\n"
+                    f"  Сервер недоступен по SSH под учёткой "
+                    f"{LOG_SSH_USER or '(не задана)'} — логи прочитать нельзя.")
+            else:
+                until_epoch = t["epoch"]
+                since_epoch = until_epoch - win * 3600
+                local_until = t["local"]
+                local_since = local_until - datetime.timedelta(hours=win)
+                part = await read_app_log(cluster, ah, local_since, local_until,
+                                          "", since_epoch, until_epoch)
+                if part:
+                    blocks.append(
+                        f"## Логи ядра {cluster['label']} ({ah}), "
+                        f"период {local_since:%Y-%m-%d %H:%M} — "
+                        f"{local_until:%H:%M} по времени сервера "
+                        f"(пояс {t['tz'] or t['offset']}, смещение {t['offset']})"
+                        f"\n\n" + part)
+    else:
+        # Обзор всех
+        clusters = enabled_clusters()
+        results  = await asyncio.gather(*[collect_current(c) for c in clusters])
+        lines = ["## Краткий статус всех кластеров\n"]
+        for s in results:
+            p   = s["primary"]
+            lag = s.get("replica", {}).get("replication_lag_over_plan_s", "—")
+            lines.append(
+                f"  {s['cluster_label']:20} up={p.get('mysql_up','?')}  "
+                f"QPS={p.get('qps','?')}  slow={p.get('slow_qps','?')}/s  "
+                f"conn={p.get('connections_pct','?')}%  "
+                f"CPU={p.get('cpu_pct','?')}%  лаг={lag}s")
+        blocks.append("\n".join(lines))
+
+        # Спросили про историю, но город не назвали — раньше в контекст
+        # уходил только текущий статус, и агент отвечал, что данных нет.
+        # Собираем историю по всем кластерам (их обычно единицы).
+        if hours > 0 and clusters:
+            hists = await asyncio.gather(
+                *[collect_history(c, hours) for c in clusters])
+            for c, h in zip(clusters, hists):
+                if h:
+                    blocks.append(fmt_history(h, c["label"]))
+
+            # И детализацию тоже: раньше таблица строилась только когда
+            # в вопросе назван город, а «по метрикам ОС» города не содержит
+            if detect_breakdown_intent(user_message):
+                step = parse_step_seconds(user_message) or 300
+                # бюджет строк делим между кластерами, иначе контекст распухнет
+                budget = max(SERIES_MAX_ROWS // max(len(clusters), 1), 40)
+                grouped = await asyncio.gather(
+                    *[collect_series_tables(c, hours, step, budget)
+                      for c in clusters])
+                for c, tables in zip(clusters, grouped):
+                    for tb in tables:
+                        blocks.append(fmt_series_table(tb, c["label"]))
+
+    # Спросили про алерты/инциденты — подмешиваем историю из БД
+    if detect_alert_intent(user_message):
+        period = (f"последние {hours:g} ч."
+                  if hours > 0 else f"последние {ALERTS_RETENTION_DAYS} дн.")
+        rows = await recent_alerts(cluster=cluster["name"] if cluster else None,
+                            hours=hours if hours > 0 else None,
+                            limit=20)
+        blocks.append(fmt_alerts(rows, period,
+                                 cluster["label"] if cluster else None))
+
+    return "\n\n".join(blocks), cluster, hours

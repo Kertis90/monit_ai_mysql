@@ -32,9 +32,13 @@ log_section "Файлы агента"
 # =============================================================================
 mkdir -p "${AGENT_DIR}/web"
 
-cp "${SCRIPT_DIR}/../agent/agent.py"      "${AGENT_DIR}/agent.py"
+# Агент теперь пакет, а не один файл. Старую копию убираем целиком:
+# оставшийся рядом agent.py прошлой версии сбил бы импорт.
+rm -rf "${AGENT_DIR}/agent" "${AGENT_DIR}/agent.py"
+cp -r "${SCRIPT_DIR}/../agent"            "${AGENT_DIR}/agent"
+find "${AGENT_DIR}/agent" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true
 # Парсер nslcd.conf: агент дозаполняет им пустые настройки LDAP на старте
-cp "${SCRIPT_DIR}/import_nslcd.py"        "${AGENT_DIR}/import_nslcd.py"
+cp "${SCRIPT_DIR}/import_nslcd.py"        "${AGENT_DIR}/agent/import_nslcd.py"
 cp "${SCRIPT_DIR}/../clusters.json"       "${AGENT_DIR}/clusters.json"
 cp "${SCRIPT_DIR}/../web/index.html"      "${AGENT_DIR}/web/"
 cp "${SCRIPT_DIR}/../web/style.css"       "${AGENT_DIR}/web/"
@@ -99,7 +103,23 @@ log_info "trusted-host: ${PIP_TRUSTED[*]}"
     "uvicorn[standard]==0.29.0" \
     "httpx==0.27.0" \
     "pydantic==2.7.1" \
-    "websockets==12.0"
+    "websockets==12.0" \
+    "sqlalchemy==2.0.30" \
+    "aiosqlite==0.20.0"
+
+# Драйвер MySQL для хранилища агента ставим, только если на него перешли.
+# По умолчанию хранилище в SQLite, и тянуть лишнее в закрытый контур незачем.
+if [[ "${DB_URL:-}" == mysql* ]]; then
+    if "${AGENT_DIR}/venv/bin/pip" install -q "${PIP_ARGS[@]}" "asyncmy==0.2.9"; then
+        log_info "Хранилище агента: MySQL (asyncmy)"
+    else
+        log_error "Не удалось поставить asyncmy — хранилище MySQL не заработает."
+        log_error "Положите пакет во внутренний индекс pip или уберите DB_URL."
+        exit 1
+    fi
+else
+    log_info "Хранилище агента: SQLite"
+fi
 
 # pymysql — только если хоть у одного кластера заполнен db_user.
 # Чистый Python, без системных библиотек: в закрытый pip-репозиторий ложится.
@@ -150,6 +170,9 @@ ROOT_PATH=${ROOT_PATH:-}
 REGISTRY_PATH=${AGENT_DIR}/clusters.json
 WEB_DIR=${AGENT_DIR}/web
 ALERTS_DB_PATH=${AGENT_DIR}/alerts.db
+# Хранилище агента. Пусто — SQLite по пути ALERTS_DB_PATH.
+# MySQL: mysql+asyncmy://user:pass@host:3306/agent
+DB_URL=${DB_URL:-}
 ALERTS_RETENTION_DAYS=${ALERTS_RETENTION_DAYS:-30}
 CHATS_RETENTION_DAYS=${CHATS_RETENTION_DAYS:-30}
 INGEST_TOKENS=${INGEST_TOKENS:-}
@@ -226,7 +249,7 @@ User=aiagent
 Group=aiagent
 WorkingDirectory=${AGENT_DIR}
 EnvironmentFile=${AGENT_DIR}/.env
-ExecStart=${AGENT_DIR}/venv/bin/python agent.py
+ExecStart=${AGENT_DIR}/venv/bin/python -m agent.main
 Restart=always
 RestartSec=3s
 # Без этого systemd ждёт остановки 90 секунд по умолчанию
