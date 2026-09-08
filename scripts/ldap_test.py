@@ -81,6 +81,8 @@ def connect(cfg: dict, user: str, password: str):
     timeout = max(1, int(float(cfg.get("LDAP_TIMEOUT") or 8)))
     server = Server(cfg["LDAP_URL"], get_info=ALL, tls=tls,
                     connect_timeout=timeout)
+    if not user:                       # пустое имя — анонимный bind
+        return Connection(server, auto_bind=True, receive_timeout=timeout)
     return Connection(server, user=user, password=password, auto_bind=True,
                       receive_timeout=timeout)
 
@@ -123,15 +125,16 @@ def candidates(cfg: dict, username: str) -> list:
 
 def find_user_dn(cfg: dict, username: str):
     """Найти DN пользователя сервисной учёткой — самый надёжный вариант."""
-    if not (cfg.get("LDAP_SEARCH_USER") and cfg.get("LDAP_BASE_DN")):
-        return None, "не задан LDAP_SEARCH_USER — поиск по каталогу пропущен"
+    if not cfg.get("LDAP_BASE_DN"):
+        return None, "не задан LDAP_BASE_DN — поиск по каталогу пропущен"
+    how = "сервисной учёткой" if cfg.get("LDAP_SEARCH_USER") else "анонимно"
     try:
-        conn = connect(cfg, cfg["LDAP_SEARCH_USER"],
+        conn = connect(cfg, cfg.get("LDAP_SEARCH_USER", ""),
                        cfg.get("LDAP_SEARCH_PASSWORD", ""))
     except Exception as e:
         why = ad_reason(str(e))
-        return None, "сервисная учётка не подключается: %s%s" % (
-            e, " (%s)" % why if why else "")
+        return None, "подключиться %s не удалось: %s%s" % (
+            how, e, " (%s)" % why if why else "")
     flt = cfg.get("LDAP_USER_FILTER", "(sAMAccountName={username})").format(
         username=escape_filter_chars(username))
     try:

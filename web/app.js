@@ -431,14 +431,20 @@ const App = (() => {
 
   // ═══ ВКЛАДКИ ════════════════════════════════════════════════════
 
+  // Загрузчики вкладок. Панели берём из DOM, а не из списка в коде: вкладку
+  // «Доступы» когда-то добавили в разметку, а сюда вписать забыли — секция
+  // никогда не показывалась, и на клик страница просто пустела.
+  const TAB_LOADERS = { status: () => loadStatus(),
+                        alerts: () => loadAlerts(),
+                        access: () => loadAccess() };
+
   function showTab(tab) {
     state.currentTab = tab;
     document.querySelectorAll('.tab').forEach(el =>
       el.classList.toggle('active', el.dataset.tab === tab));
-    ['chat', 'status', 'alerts'].forEach(t =>
-      $('tab-' + t).hidden = (t !== tab));
-    if (tab === 'status') loadStatus();
-    if (tab === 'alerts') loadAlerts();
+    document.querySelectorAll('.tab-pane').forEach(el =>
+      el.hidden = (el.id !== 'tab-' + tab));
+    if (TAB_LOADERS[tab]) TAB_LOADERS[tab]();
   }
 
   // ═══ СТАТУС ═════════════════════════════════════════════════════
@@ -641,7 +647,7 @@ const App = (() => {
           'Поправьте <code>config.env</code> (или запустите ' +
           '<code>sudo ./scripts/import_nslcd.py --write</code>) и переустановите ' +
           'агента: <code>sudo ./scripts/install_agent.sh</code>.<br>' +
-          'Пока можно выдать доступ по логину вручную — форма ниже.</div>'
+          'Выдать доступ по логину вручную можно и сейчас — форма ниже.</div>'
         : '';
 
       if (!d.items.length) {

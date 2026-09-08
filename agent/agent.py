@@ -317,11 +317,18 @@ def ad_reason(text: str) -> str:
 
 def ldap_conn(user: str, password: str):
     """Соединение с каталогом. Отдельная функция: bind нужен и для проверки
-    пароля пользователя, и для поиска групп сервисной учёткой."""
+    пароля пользователя, и для чтения каталога.
+
+    Пустое имя — анонимный bind. Так работает nslcd без binddn: во многих
+    каталогах чтение открыто всем, и требовать сервисную учётку значило бы
+    запрещать то, что каталог разрешает.
+    """
     from ldap3 import Server, Connection, Tls, ALL
     import ssl as _ssl
     tls = Tls(validate=_ssl.CERT_REQUIRED if LDAP_TLS_VERIFY else _ssl.CERT_NONE)
     server = Server(LDAP_URL, get_info=ALL, tls=tls, connect_timeout=LDAP_TIMEOUT)
+    if not user:
+        return Connection(server, auto_bind=True, receive_timeout=LDAP_TIMEOUT)
     return Connection(server, user=user, password=password, auto_bind=True,
                       receive_timeout=LDAP_TIMEOUT)
 
@@ -334,14 +341,14 @@ def _dir_conn(conn):
     """
     if conn is not None:
         return conn, False
-    if not LDAP_SEARCH_USER:
-        logger.error("Проверка доступа без пароля пользователя требует "
-                     "сервисной учётки LDAP_SEARCH_USER")
-        return None, False
     try:
         return ldap_conn(LDAP_SEARCH_USER, LDAP_SEARCH_PASSWORD), True
     except Exception as e:
-        logger.error(f"Не удалось подключиться к каталогу: {e}")
+        how = "сервисной учёткой" if LDAP_SEARCH_USER else "анонимно"
+        logger.error(f"Не удалось подключиться к каталогу {how}: {e}"
+                     + ("" if LDAP_SEARCH_USER else
+                        ". Каталог не разрешает анонимное чтение — заполните "
+                        "LDAP_SEARCH_USER и LDAP_SEARCH_PASSWORD"))
         return None, False
 
 
@@ -849,10 +856,6 @@ def directory_search_status() -> str:
         return "не задан LDAP_URL"
     if not LDAP_BASE_DN:
         return "не задан LDAP_BASE_DN — неизвестно, в какой ветке искать"
-    if not LDAP_SEARCH_USER:
-        return ("не задана сервисная учётка LDAP_SEARCH_USER. Она нужна "
-                "именно здесь: доступ выдаётся до первого входа человека, "
-                "и его пароля у нас ещё нет")
     return ""
 
 
@@ -880,9 +883,12 @@ def ldap_search_users(query: str, limit: int = 25) -> tuple:
         safe = escape_filter_chars(q)      # защита от инъекции в LDAP-фильтр
         tls = Tls(validate=_ssl.CERT_REQUIRED if LDAP_TLS_VERIFY else _ssl.CERT_NONE)
         server = Server(LDAP_URL, get_info=ALL, tls=tls, connect_timeout=LDAP_TIMEOUT)
-        conn = Connection(server, user=LDAP_SEARCH_USER,
-                          password=LDAP_SEARCH_PASSWORD, auto_bind=True,
-                          receive_timeout=LDAP_TIMEOUT)
+        conn = (Connection(server, auto_bind=True,
+                           receive_timeout=LDAP_TIMEOUT)
+                if not LDAP_SEARCH_USER else
+                Connection(server, user=LDAP_SEARCH_USER,
+                           password=LDAP_SEARCH_PASSWORD, auto_bind=True,
+                           receive_timeout=LDAP_TIMEOUT))
         flt = LDAP_SEARCH_FILTER.replace("{query}", safe)
         # Порядок важен: сначала атрибут, по которому идёт вход, иначе доступ
         # будет выдан на имя, под которым человек не входит
@@ -911,8 +917,11 @@ def ldap_search_users(query: str, limit: int = 25) -> tuple:
     except Exception as e:
         logger.error(f"Поиск по каталогу не удался: {e}")
         why = ad_reason(str(e))
-        return [], (f"каталог ответил: {why}" if why
-                    else f"{type(e).__name__}: {e}")
+        hint = ("" if LDAP_SEARCH_USER else
+                ". Искали анонимно — если каталог этого не разрешает, "
+                "заполните LDAP_SEARCH_USER и LDAP_SEARCH_PASSWORD")
+        return [], ((f"каталог ответил: {why}" if why
+                     else f"{type(e).__name__}: {e}") + hint)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
