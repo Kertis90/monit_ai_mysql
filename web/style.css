@@ -540,25 +540,167 @@ textarea#input:disabled { opacity: .55; }
               border-left: 3px solid var(--accent, #4c8dff);
               background: rgba(76,141,255,.07); border-radius: 0 6px 6px 0; }
 
-/* Панель выбора чата. Один человек ведёт несколько разговоров: разбор
-   аварии и вопрос про настройку не должны мешаться в одной ленте. */
-.thread-bar {
+/* ── Чаты: боковая панель ───────────────────────────────────────────
+   Список вместо выпадающего меню: при пяти разговорах в select уже не
+   видно, где какой, а действия прятались за отдельными кнопками и
+   относились непонятно к чему. */
+
+.chat-pane { flex-direction: row; }
+
+.thread-sidebar {
+  width: 244px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--border);
+  background: var(--surface);
   display: flex;
-  gap: 8px;
-  align-items: center;
-  padding: 10px 16px;
-  border-bottom: 1px solid var(--border, #2b313c);
-  flex-wrap: wrap;
+  flex-direction: column;
 }
 
-.thread-bar select {
-  flex: 1;
-  min-width: 180px;
-  max-width: 460px;
-  padding: 7px 10px;
-  border-radius: 8px;
-  border: 1px solid var(--border, #2b313c);
-  background: var(--bg, #12151b);
-  color: inherit;
+.new-chat {
+  margin: 12px;
+  padding: 9px 12px;
+  border-radius: 9px;
+  border: 1px dashed var(--border-hl);
+  background: transparent;
+  color: var(--text);
   font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  transition: border-color .15s, background .15s;
+}
+.new-chat:hover { border-color: var(--accent); background: var(--accent-dim); }
+.new-chat .plus { font-size: 16px; line-height: 1; color: var(--accent); }
+
+.thread-list { flex: 1; overflow-y: auto; padding: 0 8px 8px; }
+
+.thread-item {
+  position: relative;
+  padding: 9px 10px;
+  margin-bottom: 3px;
+  border-radius: 8px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: background .12s;
+}
+.thread-item:hover { background: var(--surface2); }
+.thread-item.active {
+  background: var(--accent-dim);
+  border-color: rgba(76,141,255,.32);
+}
+
+.thread-name {
+  font-size: 13px;
+  color: var(--text-hl);
+  /* Одна строка с многоточием: длинный вопрос не должен растягивать список */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding-right: 44px;
+}
+.thread-meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+/* Действия появляются на наведении: постоянные иконки в списке из
+   десяти чатов превращаются в рябь */
+.thread-actions {
+  position: absolute;
+  top: 7px;
+  right: 6px;
+  display: none;
+  gap: 2px;
+}
+.thread-item:hover .thread-actions,
+.thread-item.active .thread-actions { display: flex; }
+
+.thread-actions button {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 22px;
+}
+.thread-actions button:hover { background: var(--border); color: var(--text-hl); }
+.thread-actions button.danger:hover { background: rgba(239,83,80,.18); color: var(--red); }
+
+.thread-rename {
+  width: 100%;
+  padding: 5px 7px;
+  border-radius: 6px;
+  border: 1px solid var(--accent);
+  background: var(--bg);
+  color: var(--text-hl);
+  font: inherit;
+  font-size: 13px;
+}
+
+.thread-hint {
+  padding: 10px 14px;
+  font-size: 11px;
+  line-height: 1.45;
+  border-top: 1px solid var(--border);
+}
+
+.thread-empty { padding: 14px 10px; font-size: 12px; color: var(--muted); }
+
+/* ── Правая часть: заголовок и лента ─────────────────────────────── */
+
+.chat-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.chat-topbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 18px;
+  border-bottom: 1px solid var(--border);
+}
+
+.chat-title {
+  font-size: 13px;
+  color: var(--text-hl);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.icon-btn {
+  /* На широком экране список и так виден — кнопка нужна только когда
+     панель скрыта или экран узкий */
+  display: none;
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 14px;
+}
+.icon-btn:hover { border-color: var(--border-hl); }
+
+.chat-pane.threads-hidden .thread-sidebar { display: none; }
+.chat-pane.threads-hidden .icon-btn { display: block; }
+
+@media (max-width: 900px) {
+  .thread-sidebar { display: none; }
+  .icon-btn { display: block; }
+  .chat-pane.threads-shown .thread-sidebar {
+    display: flex;
+    position: absolute;
+    z-index: 20;
+    top: 0; bottom: 0; left: 0;
+    box-shadow: 0 0 24px rgba(0,0,0,.45);
+  }
+  .chat-pane { position: relative; }
 }

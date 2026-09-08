@@ -18,8 +18,8 @@
   <span class="hbadge" id="ws-badge">подключение…</span>
   <div class="spacer"></div>
   <span class="hint">Enter — отправить · Shift+Enter — новая строка</span>
-  <span class="hbadge" id="forget-btn" title="Удалить сохранённую переписку этого браузера"
-        style="cursor:pointer" onclick="App.forgetHistory()">Очистить историю</span>
+  <span class="hbadge" id="forget-btn" title="Удалить переписку текущего чата, сам чат останется"
+        style="cursor:pointer" onclick="App.forgetHistory()">Очистить чат</span>
   <span class="hbadge" id="user-badge" style="display:none"></span>
   <span class="hbadge" id="logout-btn" title="Выйти"
         style="cursor:pointer;display:none" onclick="App.logout()">Выйти</span>
@@ -52,16 +52,22 @@
 
     <!-- ── ЧАТ ── -->
     <section id="tab-chat" class="tab-pane chat-pane">
-      <div class="thread-bar">
-        <select id="thread-select" onchange="App.switchThread(this.value)"
-                title="Выбрать чат"></select>
-        <button class="ghost-btn" onclick="App.newThread()"
-                title="Начать новый чат">+ Новый</button>
-        <button class="ghost-btn" onclick="App.renameThread()"
-                title="Переименовать текущий чат">Переименовать</button>
-        <button class="ghost-btn" onclick="App.deleteThread()"
-                title="Удалить текущий чат вместе с перепиской">Удалить</button>
-      </div>
+      <aside class="thread-sidebar" id="thread-sidebar">
+        <button class="new-chat" onclick="App.newThread()">
+          <span class="plus">+</span> Новый чат
+        </button>
+        <div class="thread-list" id="thread-list"></div>
+        <div class="thread-hint muted">
+          Каждый разбор — свой чат: так контекст не мешается.
+        </div>
+      </aside>
+
+      <div class="chat-main">
+        <div class="chat-topbar">
+          <button class="icon-btn" id="sidebar-toggle" title="Список чатов"
+                  onclick="App.toggleSidebar()">☰</button>
+          <div class="chat-title" id="chat-title">Новый чат</div>
+        </div>
       <div class="messages" id="messages">
         <div class="msg assistant">
           <div class="msg-meta">AI Agent</div>
@@ -80,12 +86,13 @@
             placeholder="Спросите о состоянии БД…"></textarea>
           <button class="send-btn" id="send-btn" title="Отправить">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-              <path d="M4 12l16-8-6 8 6 8-16-8z" fill="currentColor"/>
+              <path d="M20 12L4 4l6 8-6 8 16-8z" fill="currentColor"/>
             </svg>
           </button>
           <button class="stop-btn" id="stop-btn" style="display:none"
                   title="Прервать генерацию ответа">■</button>
         </div>
+      </div>
       </div>
     </section>
 

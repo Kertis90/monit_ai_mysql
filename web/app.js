@@ -90,19 +90,105 @@ const App = (() => {
     }
   }
 
+  function threadTitle(t) {
+    return (t && t.title) || 'Без названия';
+  }
+
+  function whenText(iso) {
+    // Дата нужна только чтобы отличить сегодняшние разговоры от старых,
+    // поэтому у сегодняшних показываем время, у прочих — день
+    const d = new Date(String(iso || '').replace(' ', 'T') + 'Z');
+    if (isNaN(d)) return '';
+    const now = new Date();
+    const sameDay = d.toDateString() === now.toDateString();
+    return sameDay
+      ? d.toLocaleTimeString('ru', { hour: '2-digit', minute: '2-digit' })
+      : d.toLocaleDateString('ru', { day: '2-digit', month: '2-digit' });
+  }
+
   function renderThreads() {
-    const sel = $('thread-select');
-    if (!sel) return;
+    const box = $('thread-list');
+    if (!box) return;
     if (!state.threads.length) {
-      sel.innerHTML = '<option value="">Новый чат</option>';
+      box.innerHTML = '<div class="thread-empty">Чатов пока нет. ' +
+                      'Задайте вопрос — он создастся сам.</div>';
+      setChatTitle('Новый чат');
       return;
     }
-    sel.innerHTML = state.threads.map(t => {
-      const name = t.title || 'Без названия';
-      const when = String(t.updated_at || '').slice(5, 16).replace('T', ' ');
-      return `<option value="${esc(t.id)}"${t.id === state.threadId ? ' selected' : ''}>` +
-             `${esc(name)} · ${esc(when)} · ${t.messages}</option>`;
-    }).join('');
+    box.innerHTML = state.threads.map(t => `
+      <div class="thread-item${t.id === state.threadId ? ' active' : ''}"
+           data-id="${esc(t.id)}" title="${esc(threadTitle(t))}">
+        <div class="thread-name">${esc(threadTitle(t))}</div>
+        <div class="thread-meta">${esc(whenText(t.updated_at))} · ${t.messages} сообщ.</div>
+        <div class="thread-actions">
+          <button class="rename" title="Переименовать">✎</button>
+          <button class="danger" title="Удалить чат">✕</button>
+        </div>
+      </div>`).join('');
+    const active = state.threads.find(t => t.id === state.threadId);
+    setChatTitle(active ? threadTitle(active) : 'Новый чат');
+  }
+
+  function setChatTitle(text) {
+    const el = $('chat-title');
+    if (el) el.textContent = text;
+  }
+
+  function toggleSidebar() {
+    const pane = $('tab-chat');
+    // На узком экране панель выезжает поверх, на широком — прячется совсем
+    if (window.matchMedia('(max-width: 900px)').matches) {
+      pane.classList.toggle('threads-shown');
+    } else {
+      pane.classList.toggle('threads-hidden');
+    }
+  }
+
+  // Один обработчик на весь список: элементы перерисовываются при каждом
+  // обновлении, и слушатели на каждой строке плодились бы заново
+  function bindThreadList() {
+    const box = $('thread-list');
+    if (!box) return;
+    box.addEventListener('click', ev => {
+      const item = ev.target.closest('.thread-item');
+      if (!item) return;
+      const id = item.dataset.id;
+      if (ev.target.closest('button.rename')) { startRename(item, id); return; }
+      if (ev.target.closest('button.danger')) { deleteThread(id); return; }
+      switchThread(id);
+      if (window.matchMedia('(max-width: 900px)').matches) {
+        $('tab-chat').classList.remove('threads-shown');
+      }
+    });
+  }
+
+  function startRename(item, id) {
+    const thread = state.threads.find(t => t.id === id) || {};
+    const name = item.querySelector('.thread-name');
+    const input = document.createElement('input');
+    input.className = 'thread-rename';
+    input.value = thread.title || '';
+    input.placeholder = 'Название чата';
+    name.replaceWith(input);
+    input.focus();
+    input.select();
+
+    let done = false;
+    const finish = async (save) => {
+      if (done) return;
+      done = true;
+      if (save && input.value.trim() !== (thread.title || '')) {
+        await fetch('chat/threads/' + encodeURIComponent(id) + '?' + cid() +
+                    '&title=' + encodeURIComponent(input.value.trim()),
+                    { method: 'PATCH' });
+      }
+      await loadThreads(state.threadId);
+    };
+    input.addEventListener('keydown', e => {
+      if (e.key === 'Enter')  { e.preventDefault(); finish(true); }
+      if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+    });
+    input.addEventListener('blur', () => finish(true));
   }
 
   async function switchThread(id) {
@@ -120,35 +206,29 @@ const App = (() => {
       const d = await r.json();
       state.threadId = d.id;
       $('messages').innerHTML = '';
-      addAssistantMsg('Новый чат. Прежняя переписка сохранена — она в списке сверху.');
+      addAssistantMsg('Новый чат. Прежний никуда не делся — он в списке слева.');
       await loadThreads(d.id);
     } catch (e) {
       alert('Не удалось создать чат: ' + e);
     }
   }
 
-  async function renameThread() {
-    if (!state.threadId) return;
-    const now = (state.threads.find(t => t.id === state.threadId) || {}).title || '';
-    const title = prompt('Название чата:', now);
-    if (title === null) return;
-    await fetch('chat/threads/' + encodeURIComponent(state.threadId) +
-                '?' + cid() + '&title=' + encodeURIComponent(title),
-                { method: 'PATCH' });
-    await loadThreads(state.threadId);
-  }
-
-  async function deleteThread() {
-    if (!state.threadId) return;
-    const t = state.threads.find(x => x.id === state.threadId) || {};
-    if (!confirm('Удалить чат «' + (t.title || 'без названия') +
-                 '» вместе с перепиской?')) return;
-    await fetch('chat/threads/' + encodeURIComponent(state.threadId) + '?' + cid(),
+  async function deleteThread(id) {
+    const target = id || state.threadId;
+    if (!target) return;
+    const t = state.threads.find(x => x.id === target) || {};
+    if (!confirm('Удалить чат «' + threadTitle(t) + '» вместе с перепиской?')) return;
+    await fetch('chat/threads/' + encodeURIComponent(target) + '?' + cid(),
                 { method: 'DELETE' });
-    state.threadId = null;
-    $('messages').innerHTML = '';
-    await loadThreads();
-    await restoreHistory();
+    if (target === state.threadId) {
+      state.threadId = null;
+      $('messages').innerHTML = '';
+      await loadThreads();
+      await restoreHistory();
+      renderThreads();
+    } else {
+      await loadThreads(state.threadId);
+    }
   }
 
   async function restoreHistory() {
@@ -326,6 +406,8 @@ const App = (() => {
         break;
 
       case 'done':
+        // Время и счётчик в списке изменились — обновляем ненавязчиво
+        loadThreads(state.threadId);
         finishStreaming();
         break;
 
@@ -1336,6 +1418,7 @@ const App = (() => {
     $('send-btn').addEventListener('click', sendMessage);
     $('stop-btn').addEventListener('click', stopGeneration);
     bindDirResults();
+    bindThreadList();
   }
 
   document.addEventListener('DOMContentLoaded', init);
@@ -1344,7 +1427,7 @@ const App = (() => {
   return { showTab, pickCluster, useSuggestion, toggleAnalysis,
            loadStatus, loadAlerts, refreshClusters, forgetHistory, logout,
            loadAccess, loadAudit, searchDirectory, grantAgain,
-           newThread, renameThread, deleteThread, switchThread,
+           newThread, deleteThread, switchThread, toggleSidebar,
            grantManual, revokeAccess, deleteAlert, deleteAlertsByName,
            resolveAlert,
            stopGeneration };
