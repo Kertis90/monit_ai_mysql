@@ -135,6 +135,29 @@ def cluster_via_ssh(cluster: dict) -> bool:
     return cluster_db_mode(cluster) != "direct"
 
 
+def conn_hint(exc: Exception) -> str:
+    """Подсказка к типовым отказам подключения.
+
+    Самый частый — caching_sha2_password: MySQL 8.0 включает этот плагин по
+    умолчанию, а pymysql без пакета cryptography его не умеет. Сообщение
+    драйвера про «requires cryptography» без пояснения выглядит как поломка
+    сервера, хотя чинится на стороне агента.
+    """
+    text = str(exc).lower()
+    if "cryptography" in text or "caching_sha2" in text:
+        return ("\n  Не установлен пакет cryptography — он нужен для плагина "
+                "caching_sha2_password (в MySQL 8.0 он включён по умолчанию).\n"
+                "  Поправить: sudo ./scripts/install_agent.sh — пакет ставится "
+                "рядом с pymysql.\n"
+                "  Если его нет во внутреннем индексе pip, переведите учётку "
+                "агента на прежний плагин:\n"
+                "  ALTER USER 'db_user'@'%' IDENTIFIED WITH "
+                "mysql_native_password BY 'пароль';")
+    if "access denied" in text:
+        return "\n  Проверьте db_user и db_password в clusters.json."
+    return ""
+
+
 def sql_run(cluster: dict, sql: str, host: Optional[str] = None,
             endpoint: Optional[tuple] = None) -> dict:
     """Выполнить читающий запрос по TCP.
@@ -158,7 +181,8 @@ def sql_run(cluster: dict, sql: str, host: Optional[str] = None,
         import pymysql
     except ImportError:
         return {"error": "Не установлен pymysql — переустановите агента "
-                         "с заполненным db_user в clusters.json"}
+                         "с заполненным db_user в clusters.json: "
+                         "sudo ./scripts/install_agent.sh"}
 
     user, password = creds
     ip = host or cluster["primary_ip"]
@@ -171,7 +195,7 @@ def sql_run(cluster: dict, sql: str, host: Optional[str] = None,
             charset="utf8mb4", cursorclass=pymysql.cursors.Cursor,
             autocommit=True)
     except Exception as e:
-        return {"error": f"Не удалось подключиться к {ip}: {e}"}
+        return {"error": f"Не удалось подключиться к {ip}: {e}{conn_hint(e)}"}
 
     try:
         with conn.cursor() as cur:

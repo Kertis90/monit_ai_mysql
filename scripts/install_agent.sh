@@ -107,11 +107,37 @@ log_info "trusted-host: ${PIP_TRUSTED[*]}"
     "sqlalchemy==2.0.30" \
     "aiosqlite==0.20.0"
 
+# cryptography нужен драйверам MySQL для плагина caching_sha2_password —
+# он включён по умолчанию с MySQL 8.0. Без пакета подключение обрывается
+# на «Authentication plugin 'caching_sha2_password' requires cryptography».
+# Ставим один раз, независимо от того, кто попросил первым: драйвер хранилища
+# агента или драйвер запросов к кластерам.
+CRYPTO_DONE=""
+install_cryptography() {
+    local why="$1"
+    [[ -n "${CRYPTO_DONE}" ]] && return 0
+    # Пин — для повторяемости, но у пакета есть бинарные колёса, и на старом
+    # Python нужного просто нет. В таком случае берём то, что подходит
+    # интерпретатору, вместо того чтобы падать.
+    if "${AGENT_DIR}/venv/bin/pip" install -q "${PIP_ARGS[@]}" "cryptography==42.0.8"        || "${AGENT_DIR}/venv/bin/pip" install -q "${PIP_ARGS[@]}" "cryptography"; then
+        CRYPTO_DONE="yes"
+        log_info "cryptography установлен (${why}, MySQL 8 caching_sha2_password)"
+        return 0
+    fi
+    log_error "Не удалось поставить cryptography (${why})."
+    log_error "С MySQL 8.0 подключение упадёт на caching_sha2_password."
+    log_warn  "Положите пакет во внутренний индекс pip либо переведите учётку"
+    log_warn  "агента на mysql_native_password:"
+    log_warn  "  ALTER USER ... IDENTIFIED WITH mysql_native_password BY '...';"
+    return 1
+}
+
 # Драйвер MySQL для хранилища агента ставим, только если на него перешли.
 # По умолчанию хранилище в SQLite, и тянуть лишнее в закрытый контур незачем.
 if [[ "${DB_URL:-}" == mysql* ]]; then
     if "${AGENT_DIR}/venv/bin/pip" install -q "${PIP_ARGS[@]}" "asyncmy==0.2.9"; then
         log_info "Хранилище агента: MySQL (asyncmy)"
+        install_cryptography "хранилище агента" || true
     else
         log_error "Не удалось поставить asyncmy — хранилище MySQL не заработает."
         log_error "Положите пакет во внутренний индекс pip или уберите DB_URL."
@@ -132,6 +158,7 @@ print('yes' if any((c.get('db_user') or '').strip() for c in d['clusters']) else
 if [[ "$NEED_MYSQL" == "yes" ]]; then
     if "${AGENT_DIR}/venv/bin/pip" install -q "${PIP_ARGS[@]}" "pymysql==1.1.0"; then
         log_info "pymysql установлен (SQL-запросы к кластерам)"
+        install_cryptography "запросы к кластерам" || true
     else
         log_error "Не удалось поставить pymysql — SQL-запросы работать не будут"
     fi

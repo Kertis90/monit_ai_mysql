@@ -249,6 +249,7 @@ def application() -> None:
         knowledge(c)
         ssh_access(c)
         background_answer(c)
+        mysql_hints()
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -646,6 +647,27 @@ def background_answer(client) -> None:
     finally:
         (chat_routes.build_chat_context, chat_routes.llm_stream,
          chat_routes.llm_probe_tools) = original
+
+
+def mysql_hints() -> None:
+    """Отказ подключения объясняется, а не пересказывается.
+
+    Сообщение драйвера про caching_sha2_password выглядит как поломка сервера,
+    хотя это отсутствующий пакет на стороне агента.
+    """
+    from agent.services.mysql import conn_hint
+
+    plugin = conn_hint(Exception(
+        "Authentication plugin 'caching_sha2_password' requires the "
+        "cryptography package"))
+    check("про caching_sha2 сказано, чего не хватает",
+          "cryptography" in plugin and "install_agent.sh" in plugin, True)
+    check("предложен запасной плагин",
+          "mysql_native_password" in plugin, True)
+    check("отказ в доступе отправляет в clusters.json",
+          "clusters.json" in conn_hint(Exception("Access denied for user")), True)
+    check("обычная сетевая ошибка не обрастает подсказками",
+          conn_hint(Exception("timed out")), "")
 
 
 def websocket(client) -> None:
