@@ -20,7 +20,7 @@ import httpx
 
 from agent.core.config import settings
 from agent.services.mysql import cluster_db_creds, sql_execute
-from agent.services.prometheus import prom_query
+from agent.services.prometheus import prom_query, prom_query_map
 from agent.services.registry import cluster_hosts
 
 logger = logging.getLogger("agent.forecast")
@@ -91,11 +91,16 @@ async def disk_forecast(cluster: dict) -> list[dict]:
             # Только реальные файловые системы: tmpfs и overlay не интересны
             base = (f'node_filesystem_avail_bytes{{instance="{node}",'
                     f'fstype!~"tmpfs|overlay|squashfs|ramfs"}}')
+            # Файловых систем на сервере с десяток, поэтому нужны все ряды,
+            # а не первый попавшийся: prom_query отдаёт одно число, и раздел
+            # из-за этого всегда оказывался пустым
             avail, slope, size = await asyncio.gather(
-                prom_query(client, base),
-                prom_query(client, f'deriv({base}[{TREND_WINDOW}])'),
-                prom_query(client, base.replace("avail", "size")))
-            if not isinstance(avail, dict):
+                prom_query_map(client, base, "mountpoint"),
+                prom_query_map(client, f'deriv({base}[{TREND_WINDOW}])',
+                               "mountpoint"),
+                prom_query_map(client, base.replace("avail", "size"),
+                               "mountpoint"))
+            if not avail:
                 continue
             for key, free in avail.items():
                 # Убыль в байтах в секунду -> прирост занятого за сутки
@@ -142,55 +147,120 @@ async def connections_forecast(cluster: dict) -> dict:
                        f'mysql_global_variables_max_connections{{instance="{inst}"}}'),
             prom_query(client, conn_metric))
 
-    def one(value):
-        if isinstance(value, dict) and value:
-            try:
-                return float(next(iter(value.values())))
-            except (TypeError, ValueError):
-                return None
-        return None
-
-    peak, cap = one(peak_now), one(cap_raw)
-    now = one(now_raw)
-
-    # Предел соединений экспортёр отдаёт только со сборщиком global_variables.
-    # Если его выключили, значение всё равно доступно — запросом к самой базе.
-    if not cap and cluster_db_creds(cluster):
-        res = await sql_execute(cluster, "SELECT @@max_connections AS lim")
-        if not res.get("error") and res.get("rows"):
-            try:
-                cap = float(res["rows"][0][0])
-            except (TypeError, ValueError, IndexError):
-                cap = None
+    peak, cap, now = peak_now, cap_raw, now_raw
 
     if peak is None:
         peak = now          # окна ещё нет — только что подняли мониторинг
 
+    # Метрик может не быть, а числа — быть: они лежат в самой базе, и учётка
+    # для них у агента уже есть. Спрашиваем напрямую, вместо того чтобы
+    # оставлять раздел пустым.
+    source = "Prometheus"
+    from_db = False
     if peak is None or not cap:
-        missing = []
-        if peak is None:
-            missing.append("mysql_global_status_threads_connected")
-        if not cap:
-            missing.append("mysql_global_variables_max_connections")
-        return {
-            "level": "unknown",
-            "note": ("нет метрик %s по цели %s. Проверьте, что mysqld_exporter "
-                     "на этом сервере опрашивается Prometheus: "
-                     "curl -s %s/api/v1/query?query=%s"
-                     % (" и ".join(missing), inst, settings.prometheus.url,
-                        "mysql_up")),
-        }
+        got = await _connections_from_db(cluster)
+        if got:
+            if peak is None:
+                peak, from_db = got.get("peak") or got.get("now"), True
+            if now is None:
+                now, from_db = got.get("now"), True
+            if not cap:
+                cap, from_db = got.get("limit"), True
+    if from_db:
+        source = "запрос к базе"
 
-    before = one(peak_before)
-    # Неделя назад данных может не быть — тогда роста просто не знаем
+    if peak is None or not cap:
+        return {"level": "unknown", "note": await _why_no_metrics(inst, cap)}
+
+    # Неделя назад данных может не быть — тогда роста просто не знаем.
+    # Пик, взятый из базы, для тренда тоже не годится: Max_used_connections
+    # считается с момента запуска сервера, а не за неделю.
+    before = None if from_db else peak_before
     per_day = ((peak - before) / 7.0) if before is not None else 0.0
     days = _days_left(cap - peak, per_day)
-    return {"peak": int(peak), "limit": int(cap),
+    return {"peak": int(peak), "limit": int(cap), "source": source,
             "now": int(now) if now is not None else None,
             "used_pct": round(peak / cap * 100, 1),
             "growth_per_day": round(per_day, 2),
             "measured": before is not None,
             "days_left": days, "level": _level(days)}
+
+
+async def _connections_from_db(cluster: dict) -> dict:
+    """Числа по соединениям прямо из базы.
+
+    Max_used_connections — отметка максимума с момента запуска сервера. Для
+    тренда она грубовата, но для ответа «сколько занято из скольких» точна,
+    а это главное, что от раздела и нужно.
+    """
+    if not cluster_db_creds(cluster):
+        return {}
+    res = await sql_execute(
+        cluster,
+        "SELECT @@max_connections AS lim, "
+        "  (SELECT VARIABLE_VALUE FROM performance_schema.global_status "
+        "    WHERE VARIABLE_NAME = 'THREADS_CONNECTED') AS now_used, "
+        "  (SELECT VARIABLE_VALUE FROM performance_schema.global_status "
+        "    WHERE VARIABLE_NAME = 'MAX_USED_CONNECTIONS') AS peak_used")
+    if res.get("error") or not res.get("rows"):
+        # На 5.7 без performance_schema остаётся SHOW
+        res = await sql_execute(cluster,
+                                "SHOW GLOBAL STATUS LIKE 'Threads_connected'")
+        if res.get("error") or not res.get("rows"):
+            logger.info("Соединения из базы не прочитаны: %s",
+                        res.get("error", "пустой ответ"))
+            return {}
+        try:
+            return {"now": float(res["rows"][0][1])}
+        except (IndexError, TypeError, ValueError):
+            return {}
+
+    row = res["rows"][0]
+
+    def num(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    return {"limit": num(row[0]), "now": num(row[1]), "peak": num(row[2])}
+
+
+async def _why_no_metrics(inst: str, cap) -> str:
+    """Почему метрик нет — с ответом, куда идти.
+
+    Три разные причины выглядят одинаково («данных нет»), а чинятся
+    по-разному, поэтому различаем их явно.
+    """
+    async with httpx.AsyncClient() as client:
+        up = await prom_query(client, 'up{instance="%s"}' % inst)
+        any_status = await prom_query_map(
+            client, 'count({__name__=~"mysql_global_status_.+",'
+                    'instance="%s"})' % inst)
+
+    where = "Prometheus: %s" % settings.prometheus.url
+    if up is None:
+        return ("цели %s нет в Prometheus. Проверьте, что кластер применён "
+                "(sudo ./manage_cluster.sh apply) и цель появилась в "
+                "/etc/prometheus/prometheus.yml. %s" % (inst, where))
+    if up == 0:
+        return ("экспортёр %s не отвечает: цель есть, но up=0. "
+                "systemctl status mysqld_exporter на этом сервере. %s"
+                % (inst, where))
+    if not any_status:
+        return ("экспортёр %s отвечает, но не отдаёт ни одной метрики "
+                "mysql_global_status_*. Он запущен без --collect.global_status "
+                "— поправьте ExecStart в /etc/systemd/system/mysqld_exporter."
+                "service либо переустановите экспортёры "
+                "(sudo ./scripts/install_exporters.sh)." % inst)
+    if not cap:
+        return ("экспортёр %s не отдаёт mysql_global_variables_max_connections "
+                "(нужен --collect.global_variables), а учётки db_user для "
+                "запроса к базе у кластера нет — заполните её в clusters.json."
+                % inst)
+    return ("метрик соединений по цели %s нет, хотя экспортёр отвечает. "
+            "Проверьте вручную: curl -s '%s/api/v1/query?query="
+            "mysql_global_status_threads_connected'" % (inst, where))
 
 
 async def auto_increment_forecast(cluster: dict) -> list[dict]:
@@ -281,8 +351,12 @@ def fmt_forecast(data: dict) -> str:
         else:
             tail = "роста нет"
         now_part = ("сейчас %d, " % conn["now"]) if conn.get("now") is not None else ""
-        lines.append("  Соединения: %sпик за неделю %d из %d (%.1f%%), %s"
-                     % (now_part, conn["peak"], conn["limit"],
+        # Откуда числа, важно: пик из базы считается с запуска сервера,
+        # а не за неделю, и сравнивать его с недельным нельзя
+        peak_word = ("пик с запуска сервера"
+                     if conn.get("source") == "запрос к базе" else "пик за неделю")
+        lines.append("  Соединения: %s%s %d из %d (%.1f%%), %s"
+                     % (now_part, peak_word, conn["peak"], conn["limit"],
                         conn["used_pct"], tail))
 
     if data["auto_increment"]:

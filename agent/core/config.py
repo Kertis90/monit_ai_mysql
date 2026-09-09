@@ -35,6 +35,10 @@ class LLMSettings(BaseModel):
     # auto — проверить поддержку инструментов пробным запросом
     tools:       str   = "auto"
     tool_rounds: int   = 4
+    # Сколько ждать ОЧЕРЕДНОЙ порции ответа, а не весь ответ целиком.
+    # Локальная модель может думать над первым словом дольше облачной,
+    # а длинный разбор идёт минутами — ограничивать его сверху нельзя.
+    timeout:     float = 300.0
 
 
 class PrometheusSettings(BaseModel):
@@ -189,6 +193,7 @@ def load_settings() -> Settings:
             temperature = float(_env("LLM_TEMPERATURE", "0.3")),
             tools       = _env("LLM_TOOLS", "auto").strip().lower(),
             tool_rounds = int(_env("LLM_TOOL_ROUNDS", "4")),
+            timeout     = float(_env("LLM_TIMEOUT", "300")),
         ),
         prometheus=PrometheusSettings(
             url                  = _env("PROMETHEUS_URL", "http://localhost:9090"),

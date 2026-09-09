@@ -30,6 +30,7 @@ LLM_MAX_TOKENS  = settings.llm.max_tokens
 LLM_TEMPERATURE = settings.llm.temperature
 LLM_TOOLS       = settings.llm.tools
 LLM_TOOL_ROUNDS = settings.llm.tool_rounds
+LLM_TIMEOUT     = settings.llm.timeout
 
 # Заголовок собираем один раз: ключ задают и с "Bearer", и без него
 AUTH_HEADER = (LLM_API_KEY if LLM_API_KEY.startswith("Bearer ")
@@ -87,7 +88,7 @@ async def llm_stream(messages: list[dict]) -> AsyncGenerator[str, None]:
         async with httpx.AsyncClient() as client:
             async with client.stream(
                 "POST", f"{LLM_BASE_URL}/chat/completions",
-                headers=headers, json=payload, timeout=120.0,
+                headers=headers, json=payload, timeout=LLM_TIMEOUT,
             ) as resp:
                 if resp.status_code != 200:
                     body = await resp.aread()
@@ -122,7 +123,8 @@ async def llm_complete(messages: list[dict]) -> str:
     try:
         async with httpx.AsyncClient() as client:
             r = await client.post(f"{LLM_BASE_URL}/chat/completions",
-                                  headers=headers, json=payload, timeout=90.0)
+                                  headers=headers, json=payload,
+                                  timeout=LLM_TIMEOUT)
             r.raise_for_status()
             return r.json()["choices"][0]["message"]["content"].strip()
     except httpx.HTTPStatusError as e:

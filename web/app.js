@@ -22,6 +22,7 @@ const App = (() => {
     clusters:      [],
     clusterName:   null,   // открытый на вкладке «Кластер»
     templates:     [],     // готовые диагностические запросы
+    auditOffset:   0,      // сколько записей журнала уже показано
     currentTab:    'chat',
     streamingEl:   null,   // элемент .msg-body куда стримятся токены
     streamBuf:     '',     // сырой текст ответа до разметки
@@ -482,7 +483,26 @@ const App = (() => {
     ws.onerror = () => ws.close();
   }
 
+  // Пять минут ТИШИНЫ, а не пять минут с начала запроса: длинный разбор
+  // легко идёт дольше, и обрывать его на середине — ровно то, чего сторож
+  // должен избегать. Отсчёт сбрасывает любой признак работы; ping не в
+  // счёт — он приходит и от молчащего сервера.
+  const REPLY_SILENCE_MS = 300000;
+  const ALIVE = ['token', 'step', 'context', 'tools', 'charts', 'resume',
+                 'error', 'done'];
+
+  function armWatchdog() {
+    clearTimeout(state.replyTimer);
+    state.replyTimer = setTimeout(() => {
+      if (state.awaitingReply) {
+        finishStreaming('\n\n[ответ не приходит уже 5 минут — ' +
+                        'попробуйте ещё раз]');
+      }
+    }, REPLY_SILENCE_MS);
+  }
+
   function handleWsMessage(msg) {
+    if (state.awaitingReply && ALIVE.indexOf(msg.type) >= 0) armWatchdog();
     switch (msg.type) {
       case 'pong':
         break;
@@ -664,14 +684,7 @@ const App = (() => {
     el.innerHTML = '<span class="thinking"><i></i><i></i><i></i></span>';
     state.streamingEl   = el;
     state.awaitingReply = true;
-    // Сторож: если сервер замолчал, не закрыв соединение, поле ввода должно
-    // разблокироваться само — иначе чат выглядит зависшим без причины
-    clearTimeout(state.replyTimer);
-    state.replyTimer = setTimeout(() => {
-      if (state.awaitingReply) {
-        finishStreaming('\n\n[ответ не пришёл за 5 минут — попробуйте ещё раз]');
-      }
-    }, 300000);
+    armWatchdog();
 
     input.value    = '';
     autoResize(input);
@@ -828,8 +841,7 @@ const App = (() => {
                         logs:   () => { fillClusterSelects(); },
                         sql:    () => { fillClusterSelects(); loadTemplates();
                                         renderSqlHistory(); },
-                        search: () => $('search-q').focus(),
-                        health: () => loadHealth() };
+                        search: () => $('search-q').focus() };
 
   function showTab(tab) {
     state.currentTab = tab;
@@ -1084,23 +1096,31 @@ const App = (() => {
     }
   }
 
-  async function loadAudit() {
+  // Журнал листается страницами: за месяц записей набираются тысячи, и
+  // вываливать их разом значит подвесить страницу ради того, что человек
+  // всё равно не прочитает.
+  const AUDIT_PAGE = 100;
+
+  async function loadAudit(btn, more) {
+    if (btn) return withBusy(btn, () => loadAudit(null, more));
     const box = $('audit-list');
-    setBusy(box, 'Читаю журнал действий…');
+    if (!more) state.auditOffset = 0;
+    if (!state.auditOffset) setBusy(box, 'Читаю журнал действий…');
     try {
       const r = await fetch('api/audit?days=' + encodeURIComponent($('audit-days').value)
                             + '&action=' + encodeURIComponent($('audit-action').value)
-                            + '&limit=300');
+                            + '&limit=' + AUDIT_PAGE
+                            + '&offset=' + state.auditOffset);
       if (r.status === 403) {
         box.innerHTML = '<div class="muted">Нужны права администратора.</div>';
         return;
       }
       const d = await r.json();
-      if (!d.items.length) {
+      if (!d.items.length && !state.auditOffset) {
         box.innerHTML = '<div class="muted">За этот период записей нет.</div>';
         return;
       }
-      box.innerHTML = d.items.map(a => `
+      const rows = d.items.map(a => `
         <div class="alert-item" style="display:flex;gap:12px;align-items:baseline">
           <div class="muted" style="font-size:12px;white-space:nowrap">
             ${esc(String(a.ts).slice(0, 19).replace('T', ' '))}</div>
@@ -1113,8 +1133,32 @@ const App = (() => {
               ${a.detail ? ' · ' + esc(String(a.detail).slice(0, 200)) : ''}</div>
           </div>
         </div>`).join('');
+
+      const shown = state.auditOffset + d.items.length;
+      const foot =
+        '<div class="pager">' +
+        '<span class="muted small">Показано ' + shown + ' из ' + d.total + '</span>' +
+        (d.has_more
+          ? '<button class="ghost-btn" id="audit-more">Показать ещё ' +
+            Math.min(AUDIT_PAGE, d.total - shown) + '</button>'
+          : '') + '</div>';
+
+      // Догрузка дописывает записи, а не перерисовывает список: иначе
+      // просмотренное уезжает и приходится искать место заново
+      const old = box.querySelector('.audit-rows');
+      if (more && old) {
+        old.insertAdjacentHTML('beforeend', rows);
+        box.querySelector('.pager')?.remove();
+        box.insertAdjacentHTML('beforeend', foot);
+      } else {
+        box.innerHTML = '<div class="audit-rows">' + rows + '</div>' + foot;
+      }
+      state.auditOffset = shown;
+      $('audit-more')?.addEventListener('click', ev =>
+        loadAudit(ev.currentTarget, true));
     } catch (e) {
-      box.innerHTML = '<div class="muted">Не удалось загрузить журнал: ' + esc(e) + '</div>';
+      box.innerHTML = '<div class="muted">Не удалось загрузить журнал: ' +
+                      esc(e.message || e) + '</div>';
     }
   }
 

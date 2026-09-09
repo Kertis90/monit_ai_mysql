@@ -292,7 +292,8 @@ async def llm_with_tools(messages: list) -> tuple:
                    "temperature": LLM_TEMPERATURE, "messages": convo,
                    "tools": tool_specs(), "tool_choice": "auto"}
         try:
-            async with httpx.AsyncClient(timeout=90) as client:
+            async with httpx.AsyncClient(
+                    timeout=settings.llm.timeout) as client:
                 r = await client.post(f"{LLM_BASE_URL}/chat/completions",
                                       headers=headers, json=payload)
                 r.raise_for_status()

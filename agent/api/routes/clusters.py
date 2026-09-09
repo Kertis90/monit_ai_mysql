@@ -7,6 +7,7 @@ import logging
 
 from fastapi import APIRouter, HTTPException, Request
 
+from agent.core.config import settings
 from agent.api.deps import (AdminUser, Audit, CurrentUser, DbSession,
                             MaybeUser)
 from agent.db.repositories.notes import NoteRepository
@@ -31,6 +32,11 @@ from agent.services.registry import (app_host, cluster_hosts,
 
 logger = logging.getLogger("agent.api.clusters")
 router = APIRouter(tags=["Кластеры"])
+
+# Запас поверх таймаута модели: сбор контекста для разбора (состояние,
+# события, заметки) тоже занимает время, и обрывать запрос ровно по
+# таймауту самой модели было бы рано.
+INSIGHT_GRACE_S = 30
 
 # Поля реестра, которые наружу не отдаются ни при каких обстоятельствах
 SECRET_FIELDS = {"mysql_exporter_password", "db_password"}
@@ -331,7 +337,7 @@ async def config_snapshot_now(name: str, admin: AdminUser):
 @router.post("/api/analyze", tags=["Диагностика"], response_model=InsightOut,
              summary="Разбор собранного моделью")
 async def analyze_blocks(req: InsightRequest, user: CurrentUser,
-                         audit_log: Audit):
+                         journal: Audit, request: Request):
     """Объяснить один блок диагностики или всё собранное вместе.
 
     Разбирается то, что человек видит на экране, поэтому блоки приходят от
@@ -340,11 +346,30 @@ async def analyze_blocks(req: InsightRequest, user: CurrentUser,
     """
     cluster = _need(req.cluster)
     blocks = [{"title": b.title, "text": b.text} for b in req.blocks]
-    text = await insight.analyze(cluster, blocks, req.scope, req.question)
-    await audit_log("insight", req.cluster,
-                    "разбор ИИ: %s, блоков %d"
-                    % ("всё вместе" if req.scope == "all" else "один блок",
-                       len(blocks)))
+    ok, text = True, ""
+    try:
+        # Ограничение сверху обязательно: без него молчащая модель оставляет
+        # в интерфейсе вечно крутящееся кольцо, и человек не знает, ждать ему
+        # или уже нет
+        text = await asyncio.wait_for(
+            insight.analyze(cluster, blocks, req.scope, req.question),
+            timeout=settings.llm.timeout + INSIGHT_GRACE_S)
+    except asyncio.TimeoutError:
+        ok = False
+        text = ("Модель не ответила за %d с. Проверьте её доступность на "
+                "вкладке «Здоровье»."
+                % int(settings.llm.timeout + INSIGHT_GRACE_S))
+    except Exception as exc:
+        ok = False
+        logger.error("Разбор не выполнен: %s", exc)
+        text = "Разбор не выполнен: %s" % exc
+
+    await journal.add(action="Разбор ИИ", username=user.get("username", ""),
+                      target=req.cluster,
+                      detail="%s, блоков %d"
+                             % ("всё вместе" if req.scope == "all"
+                                else "один блок", len(blocks)),
+                      ip=audit.client_ip(request), ok=ok)
     return {"cluster": req.cluster, "text": text}
 
 

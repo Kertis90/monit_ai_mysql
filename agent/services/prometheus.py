@@ -70,6 +70,43 @@ async def prom_query(client: httpx.AsyncClient, query: str) -> Optional[float]:
     return None
 
 
+def parse_series(data: dict, key_label: str = "") -> dict:
+    """Ответ Prometheus -> {метка: значение} по всем рядам.
+
+    prom_query отдаёт одно число — первое попавшееся. Этого хватает, когда
+    ряд заведомо один (соединения сервера), но не когда их несколько:
+    файловых систем на сервере с десяток, и «первая попавшаяся» — не ответ.
+
+    key_label — по какой метке различать ряды. Пусто — берём первую
+    подходящую: точку монтирования, устройство, цель.
+    """
+    out: dict = {}
+    if not isinstance(data, dict) or data.get("status") != "success":
+        return out
+    for item in (data.get("data", {}).get("result") or []):
+        metric = item.get("metric") or {}
+        key = metric.get(key_label) if key_label else ""
+        if not key:
+            key = (metric.get("mountpoint") or metric.get("device")
+                   or metric.get("instance") or str(len(out)))
+        try:
+            out[key] = float(item["value"][1])
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+    return out
+
+
+async def prom_query_map(client: httpx.AsyncClient, query: str,
+                         key_label: str = "") -> dict:
+    """Все ряды ответа, а не только первый."""
+    try:
+        r = await client.get(f"{PROMETHEUS_URL}/api/v1/query",
+                             params={"query": query}, timeout=10.0)
+        return parse_series(r.json(), key_label)
+    except Exception:
+        return {}
+
+
 async def prom_range_summary(client: httpx.AsyncClient, query: str,
                              hours: float) -> dict:
     """Мин/макс/среднее за период + время пиков."""

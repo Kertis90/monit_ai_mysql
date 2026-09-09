@@ -84,13 +84,26 @@ async def search_directory(admin: AdminUser, users: Users,
 
 @router.get("/api/audit", summary="Журнал действий")
 async def audit_log(admin: AdminUser, session: DbSession,
-                    days: int = 30, limit: int = 200, action: str = ""):
+                    days: int = 30, limit: int = 100, offset: int = 0,
+                    action: str = "", username: str = ""):
     """Кто что делал: входы, выдача и отзыв доступов, удаление событий,
-    запись решений, выполненные SQL-запросы."""
-    rows = await AuditRepository(session).recent(
-        days=max(1, min(days, 365)), limit=max(1, min(limit, 1000)),
-        action=action or None)
-    return {"total": len(rows),
+    запись решений, выполненные SQL-запросы.
+
+    Отдаётся страницами: за месяц записей набираются тысячи, и вываливать их
+    в браузер одним куском значит подвесить страницу ради того, что человек
+    всё равно не прочитает. total — сколько всего подходит под фильтр, а не
+    сколько отдано: без этого непонятно, есть ли что-то дальше.
+    """
+    repo = AuditRepository(session)
+    days = max(1, min(days, 365))
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    rows = await repo.recent(days=days, limit=limit, offset=offset,
+                             action=action or None, username=username or None)
+    total = await repo.count(days=days, action=action or None,
+                             username=username or None)
+    return {"total": total, "limit": limit, "offset": offset,
+            "returned": len(rows), "has_more": offset + len(rows) < total,
             "items": [{"ts": r.ts, "username": r.username, "action": r.action,
                        "target": r.target, "detail": r.detail, "ip": r.ip,
                        "ok": bool(r.ok)} for r in rows]}

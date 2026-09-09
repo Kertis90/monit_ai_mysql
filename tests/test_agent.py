@@ -257,6 +257,11 @@ def application() -> None:
         row_cap()
         forecast_wording()
         insight_blocks()
+        prometheus_series()
+        forecast_sources()
+        web_behaviour()
+        audit_paging(c)
+        insight_endpoint(c)
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -824,7 +829,7 @@ def forecast_wording() -> None:
     check("пик считается по threads_connected",
           "max_over_time" in src and "threads_connected" in src, True)
     check("предел спрашивается у базы, если его нет в метриках",
-          "@@max_connections" in src, True)
+          "@@max_connections" in inspect.getsource(forecast), True)
 
     text = forecast.fmt_forecast({
         "label": "Кемерово", "disks": [], "auto_increment": [],
@@ -849,6 +854,168 @@ def insight_blocks() -> None:
                                  {"title": "Пусто", "text": "  "}])
     check("заголовок блока сохранён", "## Репликация" in body, True)
     check("пустые блоки отброшены", "Пусто" not in body, True)
+
+
+def prometheus_series() -> None:
+    """Рядов у запроса бывает много, и нужен не первый попавшийся.
+
+    Раздел «Запас по ресурсам» разбирал ответ Prometheus как словарь, а
+    prom_query отдаёт одно число: диски всегда получались пустыми, а
+    соединения — «метрик нет».
+    """
+    from agent.services.prometheus import parse_series
+
+    answer = {"status": "success", "data": {"result": [
+        {"metric": {"mountpoint": "/", "instance": "10.0.0.5:9100"},
+         "value": [1757000000, "12884901888"]},
+        {"metric": {"mountpoint": "/var/lib/mysql"},
+         "value": [1757000000, "53687091200"]},
+    ]}}
+    got = parse_series(answer, "mountpoint")
+    check("все файловые системы разобраны", len(got), 2)
+    check("значение по точке монтирования",
+          got["/var/lib/mysql"], 53687091200.0)
+    check("пустой ответ не роняет разбор",
+          parse_series({"status": "success", "data": {"result": []}}), {})
+    check("ошибка Prometheus даёт пусто",
+          parse_series({"status": "error"}), {})
+
+    # Без метки различаем по тому, что есть
+    by_instance = parse_series({"status": "success", "data": {"result": [
+        {"metric": {"instance": "10.0.0.5:9104"}, "value": [1, "42"]}]}})
+    check("метка подбирается сама", by_instance["10.0.0.5:9104"], 42.0)
+
+
+def forecast_sources() -> None:
+    """Числа по соединениям берутся и из базы, когда метрик нет."""
+    import inspect
+
+    from agent.services import forecast
+
+    src = inspect.getsource(forecast)
+    check("есть запрос к базе про соединения",
+          "_connections_from_db" in src and "@@max_connections" in src, True)
+    check("причина отсутствия метрик разбирается",
+          "_why_no_metrics" in src and "--collect.global_status" in src, True)
+    check("диски читаются всеми рядами",
+          "prom_query_map(client, base" in src, True)
+
+    text = forecast.fmt_forecast({
+        "label": "Кемерово", "disks": [], "auto_increment": [],
+        "connections": {"peak": 300, "limit": 500, "used_pct": 60.0,
+                        "now": 120, "days_left": None, "measured": False,
+                        "source": "запрос к базе", "level": "ok"}})
+    check("видно, что пик с запуска сервера",
+          "пик с запуска сервера" in text, True)
+
+
+def web_behaviour() -> None:
+    """Поведение интерфейса, которое ломалось незаметно."""
+    app = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
+    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+
+    check("вкладка «Здоровье» не проверяет всё при открытии",
+          "health: () => loadHealth()" not in app, True)
+    check("проверка запускается кнопкой",
+          "App.loadHealth(this)" in html, True)
+
+    check("сторож ответа сбрасывается на каждом признаке работы",
+          "if (state.awaitingReply && ALIVE.indexOf(msg.type) >= 0)" in app, True)
+    check("ping сторож не продлевает", "'pong'" not in
+          app[app.index("const ALIVE"):app.index("function armWatchdog")], True)
+
+    check("вкладка «Кластер» больше не спрятана",
+          'id="tab-btn-cluster"' in html and "display:none" not in
+          html[html.index('id="tab-btn-cluster"'):
+               html.index('id="tab-btn-cluster"') + 160], True)
+    check("графики страницы кластера получают период",
+          "attachCharts($('cluster-charts')," in app and
+          "hours: hours" in app, True)
+    check("значок «Здоровья» из общедоступного набора",
+          "🩺" not in html, True)
+
+
+def audit_paging(client) -> None:
+    """Журнал отдаётся страницами, а не тысячами записей разом."""
+    # Записи заведём действиями, которые журналируются сами
+    for i in range(7):
+        client.post("/api/query", json={"cluster": "kemerovo",
+                                        "sql": "SELECT %d" % i})
+
+    first = client.get("/api/audit?days=1&limit=3&offset=0").json()
+    check("страница отдана целиком", len(first["items"]), 3)
+    check("total считает все подходящие", first["total"] >= 7, True)
+    check("сказано, что есть продолжение", first["has_more"], True)
+    check("смещение возвращается", first["offset"], 0)
+
+    second = client.get("/api/audit?days=1&limit=3&offset=3").json()
+    check("вторая страница другая",
+          second["items"][0] != first["items"][0], True)
+    check("границы страницы не пересекаются",
+          all(a not in first["items"] for a in second["items"]), True)
+
+    tail = client.get("/api/audit?days=1&limit=500&offset=0").json()
+    check("последняя страница без продолжения", tail["has_more"], False)
+    check("отдано столько, сколько есть",
+          tail["returned"], len(tail["items"]))
+
+    # Фильтр по действию считается вместе с общим числом
+    only = client.get("/api/audit?days=1&limit=2&action=SQL-запрос").json()
+    check("фильтр применён к обеим величинам",
+          only["total"] >= 7 and len(only["items"]) == 2, True)
+
+
+def insight_endpoint(client) -> None:
+    """Разбор отвечает даже тогда, когда модель молчит.
+
+    Журнал раньше вызывался как функция, хотя это репозиторий: запрос падал
+    сразу после того, как модель отработала, и в интерфейсе кольцо крутилось
+    без конца.
+    """
+    from agent.api.routes import clusters as cluster_routes
+
+    async def fake_analyze(cluster, blocks, scope="all", question=""):
+        return "Вывод: %d блоков, режим %s" % (len(blocks), scope)
+
+    original = cluster_routes.insight.analyze
+    cluster_routes.insight.analyze = fake_analyze
+    try:
+        r = client.post("/api/analyze", json={
+            "cluster": "kemerovo", "scope": "one",
+            "blocks": [{"title": "Репликация", "text": "лаг 0 с"}]})
+        check("разбор отдан", r.status_code, 200)
+        check("текст от модели дошёл", "1 блоков" in r.json()["text"], True)
+
+        journal = client.get("/api/audit?days=1&limit=50&action=Разбор ИИ").json()
+        check("действие попало в журнал", journal["total"] >= 1, True)
+
+        r = client.post("/api/analyze", json={"cluster": "нет-такого",
+                                              "blocks": []})
+        check("несуществующий кластер отвергнут", r.status_code, 404)
+    finally:
+        cluster_routes.insight.analyze = original
+
+    # Молчащая модель не должна оставлять запрос висеть
+    async def never(cluster, blocks, scope="all", question=""):
+        await asyncio.sleep(30)
+        return "поздно"
+
+    from agent.core.config import settings
+    was, grace = settings.llm.timeout, cluster_routes.INSIGHT_GRACE_S
+    settings.llm.timeout = 0.1
+    cluster_routes.INSIGHT_GRACE_S = 0
+    cluster_routes.insight.analyze = never
+    try:
+        r = client.post("/api/analyze", json={
+            "cluster": "kemerovo",
+            "blocks": [{"title": "Блок", "text": "данные" * 20}]})
+        check("молчание модели не подвешивает запрос", r.status_code, 200)
+        check("сказано, что модель не ответила",
+              "не ответила" in r.json()["text"], True)
+    finally:
+        settings.llm.timeout = was
+        cluster_routes.INSIGHT_GRACE_S = grace
+        cluster_routes.insight.analyze = original
 
 
 def websocket(client) -> None:

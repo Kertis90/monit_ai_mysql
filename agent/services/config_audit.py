@@ -247,8 +247,8 @@ async def audit(cluster: dict, host: Optional[str] = None) -> dict:
         async with httpx.AsyncClient() as client:
             total = await prom_query(
                 client, 'node_memory_MemTotal_bytes{instance="%s"}' % node)
-        if isinstance(total, dict) and total:
-            ram = int(float(next(iter(total.values()))))
+        if total is not None:
+            ram = int(float(total))
     except Exception as exc:
         logger.info("Объём памяти не получен: %s", exc)
 

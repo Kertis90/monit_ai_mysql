@@ -1067,3 +1067,16 @@ button[disabled] { opacity: .65; cursor: progress; }
 .ai-box pre { overflow-x: auto; }
 
 .ai-btn { margin-left: 8px; }
+
+/* ── Постраничный просмотр ──────────────────────────────────────────
+   Журнал за месяц — тысячи записей. Отдаём сотнями и дописываем к уже
+   показанному: перерисовка списка увозит просмотренное место. */
+
+.pager {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 2px 4px;
+  border-top: 1px solid var(--border);
+  margin-top: 8px;
+}
