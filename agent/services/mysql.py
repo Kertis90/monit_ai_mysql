@@ -89,14 +89,14 @@ def sql_validate(sql: str) -> tuple[bool, str]:
     return True, ""
 
 
-def sql_add_limit(sql: str) -> str:
+def sql_add_limit(sql: str, max_rows: int = 0) -> str:
     """Дописать LIMIT, если его нет — чтобы не вытащить миллион строк."""
     body = sql_strip_comments(sql).rstrip(";").strip()
     if re.search(r"(?<![a-z_])limit\s+\d", body, re.I):
         return body
     if body.lower().startswith(("show", "explain", "describe", "desc")):
         return body           # у них LIMIT либо не нужен, либо не поддержан
-    return f"{body} LIMIT {SQL_MAX_ROWS}"
+    return f"{body} LIMIT {max_rows or SQL_MAX_ROWS}"
 
 
 def cluster_db_creds(cluster: dict) -> Optional[tuple]:
@@ -159,6 +159,7 @@ def conn_hint(exc: Exception) -> str:
 
 
 def sql_run(cluster: dict, sql: str, host: Optional[str] = None,
+            max_rows: int = 0,
             endpoint: Optional[tuple] = None) -> dict:
     """Выполнить читающий запрос по TCP.
 
@@ -186,7 +187,8 @@ def sql_run(cluster: dict, sql: str, host: Optional[str] = None,
 
     user, password = creds
     ip = host or cluster["primary_ip"]
-    query = sql_add_limit(sql)
+    cap = max_rows or SQL_MAX_ROWS
+    query = sql_add_limit(sql, cap)
     conn_host, conn_port = endpoint or (ip, 3306)
     try:
         conn = pymysql.connect(
@@ -208,9 +210,9 @@ def sql_run(cluster: dict, sql: str, host: Optional[str] = None,
             cur.execute(f"SET SESSION MAX_EXECUTION_TIME={SQL_TIMEOUT_S * 1000}")
             cur.execute(query)
             cols = [d[0] for d in (cur.description or [])]
-            rows = cur.fetchmany(SQL_MAX_ROWS)
+            rows = cur.fetchmany(cap)
         return {"host": ip, "query": query, "columns": cols,
-                "rows": [list(r) for r in rows], "truncated": len(rows) >= SQL_MAX_ROWS}
+                "rows": [list(r) for r in rows], "truncated": len(rows) >= cap}
     except Exception as e:
         return {"error": f"Ошибка выполнения на {ip}: {e}"}
     finally:
@@ -244,7 +246,8 @@ def parse_mysql_batch(text: str) -> tuple:
 
 
 async def sql_run_ssh(cluster: dict, sql: str,
-                      host: Optional[str] = None) -> dict:
+                      host: Optional[str] = None,
+                      max_rows: int = 0) -> dict:
     """Читающий запрос через клиент mysql на самом сервере."""
     ok, why = sql_validate(sql)
     if not ok:
@@ -278,9 +281,10 @@ async def sql_run_ssh(cluster: dict, sql: str,
         return {"error": "Ошибка выполнения на {}: {}".format(ip, out[:300])}
 
     cols, rows = parse_mysql_batch(out)
+    cap = max_rows or SQL_MAX_ROWS
     return {"host": ip, "query": query, "columns": cols,
-            "rows": rows[:SQL_MAX_ROWS],
-            "truncated": len(rows) > SQL_MAX_ROWS, "via": "ssh"}
+            "rows": rows[:cap],
+            "truncated": len(rows) > cap, "via": "ssh"}
 
 
 def free_local_port() -> int:
@@ -313,7 +317,8 @@ async def wait_port(port: int, deadline: float) -> bool:
 
 
 async def sql_run_tunnel(cluster: dict, sql: str,
-                         host: Optional[str] = None) -> dict:
+                         host: Optional[str] = None,
+                         max_rows: int = 0) -> dict:
     """Запрос через SSH-туннель: локальный порт → 3306 на сервере БД.
 
     Туннель поднимается на время запроса и закрывается сразу после: держать
@@ -360,7 +365,7 @@ async def sql_run_tunnel(cluster: dict, sql: str,
             return {"error": f"Туннель к {ip} не поднялся"
                              + (f": {err.strip()[:200]}" if err.strip() else
                                 f" за {LOG_SSH_TIMEOUT} с")}
-        res = await asyncio.to_thread(sql_run, cluster, sql, ip,
+        res = await asyncio.to_thread(sql_run, cluster, sql, ip, max_rows,
                                       ("127.0.0.1", port))
         if not res.get("error"):
             res["via"] = "tunnel"
@@ -379,15 +384,24 @@ async def sql_run_tunnel(cluster: dict, sql: str,
 
 
 async def sql_execute(cluster: dict, sql: str,
-                      host: Optional[str] = None) -> dict:
-    """Единая точка входа: сама выбирает режим доступа к БД."""
+                      host: Optional[str] = None,
+                      max_rows: int = 0) -> dict:
+    """Единая точка входа: сама выбирает режим доступа к БД.
+
+    max_rows — предел строк для этого запроса. По умолчанию действует общий
+    SQL_MAX_ROWS: он защищает вкладку SQL от «SELECT * FROM большая_таблица».
+    Служебным запросам агента этот предел вредит: SHOW GLOBAL VARIABLES в
+    MySQL 8 отдаёт больше шестисот строк, и на двухстах ответ обрывался
+    посреди алфавита — version, sql_mode и sync_binlog просто не доезжали,
+    а разбор настроек молча считал их отсутствующими.
+    """
     mode = cluster_db_mode(cluster)
     if mode == "exec":
-        return await sql_run_ssh(cluster, sql, host)
+        return await sql_run_ssh(cluster, sql, host, max_rows)
     if mode == "tunnel":
-        return await sql_run_tunnel(cluster, sql, host)
+        return await sql_run_tunnel(cluster, sql, host, max_rows)
     # pymysql блокирующий, поэтому уводим его из цикла событий
-    return await asyncio.to_thread(sql_run, cluster, sql, host)
+    return await asyncio.to_thread(sql_run, cluster, sql, host, max_rows)
 
 
 def fmt_sql_result(res: dict) -> str:

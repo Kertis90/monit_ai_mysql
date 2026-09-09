@@ -21,6 +21,12 @@ logger = logging.getLogger("agent.config_audit")
 VARIABLES_SQL = "SHOW GLOBAL VARIABLES"
 STATUS_SQL    = "SHOW GLOBAL STATUS"
 
+# Переменных в MySQL 8 больше шестисот, счётчиков состояния — около пятисот.
+# Общий предел вкладки SQL (200 строк) обрывал ответ посреди алфавита: version,
+# sql_mode, sync_binlog и slow_query_log просто не доезжали, и разбор считал
+# их незаданными. Здесь нужен полный список.
+ALL_ROWS = 5000
+
 # Ключи, которые читаем из вывода. Разбирать всё подряд незачем: в 8.0
 # переменных больше шестисот, и отчёт стал бы нечитаемым.
 WATCHED = (
@@ -219,13 +225,19 @@ async def audit(cluster: dict, host: Optional[str] = None) -> dict:
         return {"error": "Для кластера не задана учётка db_user — настройки "
                          "прочитать нельзя"}
 
-    variables = await sql_execute(cluster, VARIABLES_SQL, host)
+    variables = await sql_execute(cluster, VARIABLES_SQL, host, ALL_ROWS)
     if variables.get("error"):
         return {"error": "Настройки не прочитаны: %s" % variables["error"]}
-    status = await sql_execute(cluster, STATUS_SQL, host)
+    status = await sql_execute(cluster, STATUS_SQL, host, ALL_ROWS)
 
     values = _rows_to_dict(variables)
     counts = _rows_to_dict(status)
+    if "version" not in values:
+        # Версия — опора для половины проверок: у 5.7 и 8.0 разные значения по
+        # умолчанию. Если её нет, спрашиваем отдельно, а не подставляем «?».
+        res = await sql_execute(cluster, "SELECT VERSION() AS v", host)
+        if not res.get("error") and res.get("rows"):
+            values["version"] = str(res["rows"][0][0])
 
     ram = None
     try:

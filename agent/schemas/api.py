@@ -145,3 +145,26 @@ class UsersOut(BaseModel):
 
 class OkOut(BaseModel):
     ok: bool = True
+
+class InsightBlock(BaseModel):
+    """Один блок диагностики в том виде, в каком он показан человеку."""
+    title: str = Field("", max_length=200)
+    text:  str = Field("", max_length=200000)
+
+
+class InsightRequest(BaseModel):
+    """Запрос на разбор собранного.
+
+    Данные приходят от браузера, а не собираются заново: разбирать надо
+    ровно то, что человек видит на экране. Через пять минут профиль
+    нагрузки будет уже другим, и разбор перестанет объяснять картинку.
+    """
+    cluster: str
+    scope:   str = Field("all", pattern="^(one|all)$")
+    question: str = Field("", max_length=500)
+    blocks:  list[InsightBlock] = Field(default_factory=list, max_length=30)
+
+
+class InsightOut(BaseModel):
+    cluster: str
+    text:    str

@@ -22,7 +22,9 @@ from agent.db.repositories.users import normalize
 from agent.schemas.api import ChatRequest, FeedbackRequest
 from agent.services import access, jobs
 from agent.services.analysis import system_prompt
-from agent.services.assistant import build_chat_context, llm_with_tools
+from agent.services.assistant import (build_chat_context, llm_with_tools,
+                                      run_tool)
+from agent.services.toolcalls import StreamFilter
 from agent.services.intents import detect_chart_intent, detect_export_intent
 from agent.services.llm import llm_complete, llm_probe_tools, llm_stream
 from agent.services.prometheus import build_charts
@@ -134,6 +136,30 @@ async def chat_compact(client_id: str, session_id: str,
     return [{"role": "summary", "content": digest}] + tail
 
 
+# Сколько раз подряд разбираем вызовы, написанные текстом. Больше двух —
+# признак того, что модель зациклилась на запросах вместо ответа.
+INLINE_TOOL_ROUNDS = 2
+
+
+async def stream_answer(messages: list, job) -> tuple:
+    """Стримить ответ, вырезая из потока разметку вызовов инструментов.
+
+    Возвращает (чистый текст, вызовы). Разметка до пользователя не доходит
+    ни при каком исходе: даже нераспознанный вызов показывать незачем.
+    """
+    flt = StreamFilter()
+    async for token in llm_stream(messages):
+        if job.stop_event.is_set():
+            break
+        visible = flt.feed(token)
+        if visible:
+            await job.emit({"type": "token", "text": visible})
+    tail = flt.finish()
+    if tail:
+        await job.emit({"type": "token", "text": tail})
+    return flt.clean, flt.calls
+
+
 async def generate(owner: str, thread_id: str, thread_title: str, text: str,
                    fp: str, sid: str, history: list, job) -> None:
     """Собрать контекст и получить ответ.
@@ -150,8 +176,13 @@ async def generate(owner: str, thread_id: str, thread_title: str, text: str,
     async with session_scope() as db:
         await ChatRepository(db).touch_thread(thread_id, text)
 
+    async def say(what: str) -> None:
+        """Рассказать, чем агент занят прямо сейчас."""
+        await job.emit({"type": "step", "text": what})
+
+    await say("Разбираю вопрос")
     try:
-        context_text, cluster, hours = await build_chat_context(text)
+        context_text, cluster, hours = await build_chat_context(text, say)
     except Exception as exc:
         logger.error("Context error: %s", exc)
         await job.emit({"type": "error", "text": "Ошибка сбора метрик: %s" % exc})
@@ -196,6 +227,7 @@ async def generate(owner: str, thread_id: str, thread_title: str, text: str,
     # самой, вместо угадывания по ключевым словам. Собранный контекст
     # остаётся: он покрывает типовые вопросы без лишних раундов к модели.
     if await llm_probe_tools():
+        await say("Спрашиваю модель, каких данных не хватает")
         try:
             messages, used = await llm_with_tools(messages)
             if used:
@@ -203,14 +235,39 @@ async def generate(owner: str, thread_id: str, thread_title: str, text: str,
         except Exception as exc:
             logger.error("Режим инструментов не сработал: %s", exc)
 
-    parts = []
-    async for token in llm_stream(messages):
-        if job.stop_event.is_set():
-            break
-        parts.append(token)
-        await job.emit({"type": "token", "text": token})
+    await say("Формулирую ответ")
+    answer, calls = await stream_answer(messages, job)
 
-    answer = "".join(parts)
+    # Модель могла попросить инструменты текстом, а не штатным полем: часть
+    # моделей обучена писать <tool_call> прямо в ответ. Разметку пользователь
+    # уже не увидел — осталось выполнить и дать модели дописать по данным.
+    rounds = 0
+    while calls and rounds < INLINE_TOOL_ROUNDS and not job.stop_event.is_set():
+        rounds += 1
+        names = [c["name"] for c in calls]
+        logger.info("Инструменты из текста ответа: %s", ", ".join(names))
+        await say("Выполняю: " + ", ".join(names))
+        results = []
+        for call in calls:
+            try:
+                out = await run_tool(call["name"], call["args"])
+            except Exception as exc:
+                out = "Инструмент не выполнен: %s" % exc
+            results.append("## %s\n\n%s" % (call["name"], str(out)[:20000]))
+        await job.emit({"type": "tools", "used": names})
+
+        messages = messages + [
+            {"role": "assistant", "content": answer or "(запрос данных)"},
+            {"role": "user",
+             "content": "Данные, которые ты запросил:\n\n"
+                        + "\n\n".join(results)
+                        + "\n\nТеперь ответь на вопрос по этим данным. "
+                          "Инструменты больше не вызывай."}]
+        if answer.strip():
+            await job.emit({"type": "token", "text": "\n\n"})
+            answer += "\n\n"
+        more, calls = await stream_answer(messages, job)
+        answer += more
     if job.stop_event.is_set():
         # Прерванный ответ всё равно сохраняем: пользователь его видел и в
         # следующем вопросе может на него сослаться

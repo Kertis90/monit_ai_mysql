@@ -21,6 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
+from agent.api.responses import SafeJSONResponse
 from agent.core.config import settings
 
 logging.basicConfig(
@@ -36,7 +37,7 @@ from agent.db.repositories.alerts import AlertRepository           # noqa: E402
 from agent.db.repositories.audit import AuditRepository            # noqa: E402
 from agent.db.repositories.chats import ChatRepository             # noqa: E402
 from agent.services import (access, anomaly, config_history,       # noqa: E402
-                            digest, followup, growth, jobs, selfcheck)
+                            digest, followup, growth, jobs, selfcheck, tasks)
 from agent.services.mysql import refresh_db_versions               # noqa: E402
 
 # Пути, доступные без входа. Всё остальное закрыто: забыть добавить проверку
@@ -101,6 +102,7 @@ async def lifespan(app: FastAPI):
     # Незавершённые ответы: пережить остановку агента они всё равно
     # не могут, а висящие задачи задержали бы её
     await jobs.shutdown()
+    await tasks.shutdown()
 
     # Задачу надо снять явно: недоступный сервер БД держит её в таймауте
     # подключения, и без отмены остановка ждёт её завершения
@@ -131,6 +133,8 @@ def create_app() -> FastAPI:
             "с токеном в заголовке `X-Ingest-Token`."),
         root_path=settings.prefix,
         lifespan=lifespan,
+        # NaN и Infinity в любом поле иначе роняют весь ответ пятисоткой
+        default_response_class=SafeJSONResponse,
         openapi_tags=[
             {"name": "Чат", "description": "Вопросы агенту и история переписки"},
             {"name": "События", "description": "Алерты, приём событий, память инцидентов"},
@@ -142,6 +146,19 @@ def create_app() -> FastAPI:
 
     app.add_middleware(CORSMiddleware, allow_origins=["*"],
                        allow_methods=["*"], allow_headers=["*"])
+
+    @app.exception_handler(Exception)
+    async def any_error(request: Request, exc: Exception):
+        """Необработанный сбой — тоже JSON, и с причиной.
+
+        Пустая пятисотка в интерфейсе выглядит как «ошибка разбора JSON»:
+        фронтенд ждёт объект, а получает страницу. Ответ с текстом причины
+        показывается человеку и попадает в журнал.
+        """
+        logger.exception("Необработанная ошибка на %s", request.url.path)
+        return SafeJSONResponse(
+            {"error": "%s: %s" % (type(exc).__name__, exc),
+             "path": request.url.path}, status_code=500)
 
     @app.middleware("http")
     async def guard(request: Request, call_next):

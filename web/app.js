@@ -132,6 +132,91 @@ const App = (() => {
     setChatTitle(active ? threadTitle(active) : 'Новый чат');
   }
 
+  // ═══ ОЖИДАНИЕ ═══════════════════════════════════════════════════
+  // Пустой раздел неотличим от сломанного. Везде, где команда уходит на
+  // сервер, показываем одно и то же кольцо с подписью, чего ждём.
+
+  // Ответ сервера с внятной ошибкой. Раньше любой сбой выглядел как
+  // «ошибка разбора JSON»: пятисотка отдавала страницу, а код ждал объект и
+  // падал на разборе, пряча настоящую причину.
+  async function getJson(url, opts) {
+    const r = await fetch(url, opts);
+    const body = await r.text();
+    let data = null;
+    try { data = JSON.parse(body); } catch (e) { /* ниже */ }
+    if (data === null) {
+      throw new Error('сервер ответил не JSON (код ' + r.status + '): ' +
+                      body.slice(0, 300));
+    }
+    if (!r.ok && data.error) throw new Error(data.error);
+    if (!r.ok) throw new Error(data.detail || ('код ' + r.status));
+    return data;
+  }
+
+  function busyHtml(what, slow) {
+    return '<div class="busy"><span class="spinner"></span>' +
+           '<span class="what">' + esc(what) + '</span>' +
+           (slow ? '<span class="slow">' + esc(slow) + '</span>' : '') + '</div>';
+  }
+
+  function setBusy(el, what, slow) {
+    const box = typeof el === 'string' ? $(el) : el;
+    if (box) box.innerHTML = busyHtml(what, slow);
+    return box;
+  }
+
+  // Кнопка, запустившая команду: кольцо въезжает внутрь неё, остальные
+  // кнопки раздела блокируются — два одновременных «Снять профиль» дают
+  // два SSH-захода и путаницу в выводе.
+  async function withBusy(btn, fn) {
+    if (!btn || btn.disabled) return fn ? fn() : undefined;
+    const was = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>' + was;
+    try {
+      return await fn();
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = was;
+    }
+  }
+
+  // Кольцо на самой вкладке: раздел может грузиться, пока смотрят другой
+  function tabBusy(tab, on) {
+    const el = document.querySelector('.tab[data-tab="' + tab + '"]');
+    if (!el) return;
+    const mark = el.querySelector('.spinner');
+    if (on && !mark) el.insertAdjacentHTML('beforeend', '<span class="spinner"></span>');
+    if (!on && mark) mark.remove();
+  }
+
+  // Что агент делает прямо сейчас. Строка живёт под пузырём ответа и
+  // исчезает, как только пошёл текст: дальше о работе говорит сам ответ.
+  function showStep(text) {
+    if (!state.streamingEl || !text) return;
+    const parent = state.streamingEl.parentElement;
+    let box = parent.querySelector('.steps');
+    if (!box) {
+      box = document.createElement('div');
+      box.className = 'steps';
+      parent.appendChild(box);
+    }
+    const prev = box.lastElementChild;
+    if (prev) prev.className = 'step done';
+    const row = document.createElement('div');
+    row.className = 'step now';
+    row.innerHTML = '<span class="spinner"></span><span></span>';
+    row.lastElementChild.textContent = text;
+    box.appendChild(row);
+    // Список не должен вытеснять переписку: держим последние пять
+    while (box.children.length > 5) box.removeChild(box.firstElementChild);
+    scrollToBottom();
+  }
+
+  function clearSteps() {
+    document.querySelectorAll('.steps').forEach(el => el.remove());
+  }
+
   function inlineNote(text) {
     const div = document.createElement('div');
     div.className = 'muted';
@@ -156,6 +241,20 @@ const App = (() => {
     // Запоминаем выбор: разворачивать панель при каждой перезагрузке
     // раздражает того, кто её свернул осознанно
     try { localStorage.setItem(CLUSTERS_KEY, on ? '1' : '0'); } catch (e) {}
+  }
+
+  // Кластер, открытый на вкладке: восстанавливаем после перезагрузки
+  const CLUSTER_KEY = 'mysql-ai-agent.cluster';
+
+  function restoreCluster() {
+    if (state.clusterName) return;
+    let saved = null;
+    try { saved = localStorage.getItem(CLUSTER_KEY); } catch (e) {}
+    if (saved && state.clusters.some(c => c.name === saved)) {
+      state.clusterName = saved;
+      $('cc-' + saved)?.classList.add('active');
+      if (state.currentTab === 'cluster') loadClusterPage();
+    }
   }
 
   function restoreClustersState() {
@@ -405,6 +504,13 @@ const App = (() => {
         break;
       }
 
+      case 'step':
+        // Сбор данных для тяжёлого вопроса идёт минуту и дольше. Пока он
+        // идёт, показываем, чем агент занят: три точки не отличают работу
+        // от зависшего запроса.
+        showStep(msg.text || '');
+        break;
+
       case 'tools':
         // Показываем, чем агент пользовался: видно, на чём основан ответ
         if (state.streamingEl && msg.used && msg.used.length) {
@@ -445,6 +551,7 @@ const App = (() => {
         // Убрать индикатор "думает" при первом токене
         const think = state.streamingEl.querySelector('.thinking');
         if (think) { think.remove(); state.streamingEl.classList.add('streaming'); }
+        clearSteps();
         // Пока идёт стрим — простой текст: перерисовывать разметку
         // на каждом токене дорого. Разметку накладываем в finishStreaming.
         state.streamBuf += msg.text;
@@ -514,6 +621,7 @@ const App = (() => {
   }
 
   function unlockInput() {
+    clearSteps();
     clearTimeout(state.replyTimer);
     state.awaitingReply = false;
     $('input').disabled = false;
@@ -626,6 +734,7 @@ const App = (() => {
       $('clusters-badge').textContent = state.clusters.length + ' кластеров';
       renderClusterList();
       buildSuggestions();
+      restoreCluster();
       // Живые бейджи — параллельно
       state.clusters.forEach(c => refreshClusterBadges(c.name));
     } catch (e) { console.error('clusters:', e); }
@@ -728,14 +837,17 @@ const App = (() => {
       el.classList.toggle('active', el.dataset.tab === tab));
     document.querySelectorAll('.tab-pane').forEach(el =>
       el.hidden = (el.id !== 'tab-' + tab));
-    if (TAB_LOADERS[tab]) TAB_LOADERS[tab]();
+    if (!TAB_LOADERS[tab]) return;
+    tabBusy(tab, true);
+    Promise.resolve(TAB_LOADERS[tab]()).finally(() => tabBusy(tab, false));
   }
 
   // ═══ СТАТУС ═════════════════════════════════════════════════════
 
-  async function loadStatus() {
+  async function loadStatus(btn) {
+    if (btn) return withBusy(btn, () => loadStatus());
     const el = $('status-content');
-    el.innerHTML = '<div class="muted">Загрузка…</div>';
+    setBusy(el, 'Опрашиваю Prometheus по всем кластерам…');
     try {
       const r = await fetch('status');
       const d = await r.json();
@@ -810,9 +922,10 @@ const App = (() => {
 
   // ═══ АЛЕРТЫ ═════════════════════════════════════════════════════
 
-  async function loadAlerts() {
+  async function loadAlerts(btn) {
+    if (btn) return withBusy(btn, () => loadAlerts());
     const el = $('alerts-content');
-    el.innerHTML = '<div class="muted">Загрузка…</div>';
+    setBusy(el, 'Читаю историю событий…');
     try {
       const r = await fetch('alerts/history?limit=30');
       const d = await r.json();
@@ -919,7 +1032,7 @@ const App = (() => {
 
   async function loadAccess() {
     const box = $('access-list');
-    box.innerHTML = '<div class="muted">Загрузка…</div>';
+    setBusy(box, 'Читаю список доступов…');
     try {
       const r = await fetch('api/users');
       if (r.status === 403) {
@@ -973,7 +1086,7 @@ const App = (() => {
 
   async function loadAudit() {
     const box = $('audit-list');
-    box.innerHTML = '<div class="muted">Загрузка…</div>';
+    setBusy(box, 'Читаю журнал действий…');
     try {
       const r = await fetch('api/audit?days=' + encodeURIComponent($('audit-days').value)
                             + '&action=' + encodeURIComponent($('audit-action').value)
@@ -1011,7 +1124,7 @@ const App = (() => {
     const q   = $('dir-query').value.trim();
     const box = $('dir-results');
     if (q.length < 2) { box.innerHTML = '<div class="muted">Введите хотя бы 2 символа.</div>'; return; }
-    box.innerHTML = '<div class="muted">Ищу в каталоге…</div>';
+    setBusy(box, 'Ищу в каталоге…', 'запрос к LDAP');
     state.dirItems = []; state.dirPage = 0; state.dirQuery = q;
     try {
       const r = await fetch('api/directory/search?q=' + encodeURIComponent(q) +
@@ -1499,9 +1612,32 @@ const App = (() => {
 
   async function openCluster(name) {
     state.clusterName = name;
-    $('tab-btn-cluster').style.display = '';
+    // Выбор переживает перезагрузку: вкладка открывается на том кластере,
+    // с которым работали, а не на пустой странице
+    try { localStorage.setItem(CLUSTER_KEY, name); } catch (e) { /* приватный режим */ }
+    document.querySelectorAll('.cluster-card').forEach(el =>
+      el.classList.toggle('active', el.id === 'cc-' + name));
     showTab('cluster');
-    await loadClusterPage();
+  }
+
+  // Вкладка доступна всегда, а не только после щелчка по кластеру слева:
+  // раньше человек, не знавший об этом, просто не находил раздел.
+  function renderClusterPicker(box) {
+    if (!state.clusters.length) {
+      box.innerHTML = '<div class="muted">Кластеры не настроены. ' +
+                      'Добавьте через manage_cluster.sh</div>';
+      return;
+    }
+    box.innerHTML = '<div class="muted">Выберите кластер — или щёлкните по нему ' +
+      'в списке слева.</div><div class="pick-grid">' +
+      state.clusters.map(c =>
+        '<div class="pick-card" data-cluster="' + esc(c.name) + '">' +
+        '<b>' + esc(c.label) + '</b><div class="cmeta">' + esc(c.primary_ip) +
+        (c.replica_ip ? ' · ' + esc(c.replica_ip) : '') + '</div>' +
+        (c.description ? '<div class="cmeta">' + esc(c.description) + '</div>' : '') +
+        '</div>').join('') + '</div>';
+    box.querySelectorAll('.pick-card').forEach(el =>
+      el.addEventListener('click', () => openCluster(el.dataset.cluster)));
   }
 
   function tile(k, v, cls) {
@@ -1511,14 +1647,20 @@ const App = (() => {
 
   function pct(v) { return isNaN(num(v)) ? '—' : num(v).toFixed(0) + '%'; }
 
-  async function loadClusterPage() {
+  async function loadClusterPage(btn) {
+    if (btn) return withBusy(btn, () => loadClusterPage());
     const name = state.clusterName;
     const box  = $('cluster-body');
-    if (!name) { box.innerHTML = '<div class="muted">Выберите кластер слева.</div>'; return; }
+    if (!name) {
+      $('cluster-head').textContent = 'Кластер';
+      $('notes-card').hidden = true;
+      renderClusterPicker(box);
+      return;
+    }
 
     const meta = state.clusters.find(c => c.name === name) || {};
     $('cluster-head').textContent = meta.label || name;
-    box.innerHTML = '<div class="muted">Собираю…</div>';
+    setBusy(box, 'Собираю состояние, графики и события…');
 
     const hours = clusterHours();
     try {
@@ -1553,6 +1695,18 @@ const App = (() => {
 
       let html = '<div class="tiles">' + tiles.join('') + '</div>';
 
+      // Общий разбор идёт первым: главное обычно видно на пересечении
+      // блоков, а не внутри одного из них
+      html += '<div class="card" id="insight-card"><h4>Разбор ИИ по кластеру' +
+              '<button class="ghost-btn lazy" onclick="App.explainAll(this)">' +
+              'Разобрать всё собранное</button></h4>' +
+              '<div id="cluster-insight" class="muted small">' +
+              'Модель посмотрит на всё, что собрано на этой странице, разом: ' +
+              'состояние, профиль нагрузки, репликацию, настройки, запас ' +
+              'ресурсов — и скажет, что из этого складывается в одну причину. ' +
+              'Чем больше блоков вы раскрыли кнопками ниже, тем полнее разбор.' +
+              '</div></div>';
+
       if (ch.charts && ch.charts.length) {
         html += '<div class="card"><h4>Метрики за ' + hours + ' ч</h4>' +
                 '<div id="cluster-charts"></div></div>';
@@ -1561,7 +1715,7 @@ const App = (() => {
       html += `
         <div class="card">
           <h4>Что нагружает базу сейчас
-            <button class="ghost-btn lazy" onclick="App.loadWorkload()">Снять профиль</button></h4>
+            <button class="ghost-btn lazy" onclick="App.loadWorkload(this)">Снять профиль</button></h4>
           <div id="cluster-workload" class="muted small">
             Два среза performance_schema с интервалом в несколько секунд —
             показывает то, что исполняется именно сейчас, а не средние за всё
@@ -1569,35 +1723,35 @@ const App = (() => {
         </div>
         <div class="card">
           <h4>Репликация
-            <button class="ghost-btn lazy" onclick="App.loadReplication()">Проверить</button></h4>
+            <button class="ghost-btn lazy" onclick="App.loadReplication(this)">Проверить</button></h4>
           <div id="cluster-repl" class="muted small">
             Состояние потоков, ошибки применения, отставание сверх
             запланированного.</div>
         </div>
         <div class="card">
           <h4>Диагностика Performance Schema
-            <button class="ghost-btn lazy" onclick="App.loadDiag()">Выполнить</button></h4>
+            <button class="ghost-btn lazy" onclick="App.loadDiag(this)">Выполнить</button></h4>
           <div id="cluster-diag" class="muted small">
             Тяжёлые запросы, полные сканирования, ожидания блокировок,
             планы выполнения.</div>
         </div>
         <div class="card">
           <h4>Запас по ресурсам
-            <button class="ghost-btn lazy" onclick="App.loadForecast()">Посчитать</button></h4>
+            <button class="ghost-btn lazy" onclick="App.loadForecast(this)">Посчитать</button></h4>
           <div id="cluster-forecast" class="muted small">
             Через сколько кончится место на дисках, когда упрёмся в предел
             соединений и сколько осталось до переполнения автоинкрементов.</div>
         </div>
         <div class="card">
           <h4>Настройки MySQL
-            <button class="ghost-btn lazy" onclick="App.loadConfigAudit()">Разобрать</button></h4>
+            <button class="ghost-btn lazy" onclick="App.loadConfigAudit(this)">Разобрать</button></h4>
           <div id="cluster-config" class="muted small">
             Что выставлено неудачно и чем это грозит, с пометкой, что можно
             менять на ходу.</div>
         </div>
         <div class="card">
           <h4>Рост данных
-            <button class="ghost-btn lazy" onclick="App.loadGrowth()">Показать</button>
+            <button class="ghost-btn lazy" onclick="App.loadGrowth(this)">Показать</button>
           </h4>
           <div id="cluster-growth" class="muted small">
             Что растёт быстрее всех, где место не вернулось диску, где нет
@@ -1605,37 +1759,37 @@ const App = (() => {
         </div>
         <div class="card">
           <h4>Отклонения от обычного
-            <button class="ghost-btn lazy" onclick="App.loadAnomalies()">Сверить</button></h4>
+            <button class="ghost-btn lazy" onclick="App.loadAnomalies(this)">Сверить</button></h4>
           <div id="cluster-anomaly" class="muted small">
             Сравнение с медианой за несколько недель на этот же час: ловит то,
             на что нет порога.</div>
         </div>
         <div class="card">
           <h4>Лишние индексы
-            <button class="ghost-btn lazy" onclick="App.loadIndexes()">Найти</button></h4>
+            <button class="ghost-btn lazy" onclick="App.loadIndexes(this)">Найти</button></h4>
           <div id="cluster-indexes" class="muted small">
             Дублирующие и избыточные: индекс по (a) не нужен, когда есть
             (a, b), — он занимает место и обновляется при каждой вставке.</div>
         </div>
         <div class="card">
           <h4>Изменения настроек
-            <button class="ghost-btn lazy" onclick="App.loadConfigChanges()">Показать</button></h4>
+            <button class="ghost-btn lazy" onclick="App.loadConfigChanges(this)">Показать</button></h4>
           <div id="cluster-changes" class="muted small">
             Что менялось за месяц и когда — первое, что нужно при внезапной
             деградации.</div>
         </div>
         <div class="card">
           <h4>Резервные копии
-            <button class="ghost-btn lazy" onclick="App.loadBackups()">Проверить</button></h4>
+            <button class="ghost-btn lazy" onclick="App.loadBackups(this)">Проверить</button></h4>
           <div id="cluster-backups" class="muted small">
             Возраст и размер последней копии на серверах кластера.</div>
         </div>
         <div class="card">
           <h4>Можно ли трогать
             <span>
-              <button class="ghost-btn lazy" onclick="App.loadReadiness('restart')">Перезапуск</button>
-              <button class="ghost-btn lazy" onclick="App.loadReadiness('alter')">ALTER</button>
-              <button class="ghost-btn lazy" onclick="App.loadReadiness('backup')">Бэкап</button>
+              <button class="ghost-btn lazy" onclick="App.loadReadiness('restart', this)">Перезапуск</button>
+              <button class="ghost-btn lazy" onclick="App.loadReadiness('alter', this)">ALTER</button>
+              <button class="ghost-btn lazy" onclick="App.loadReadiness('backup', this)">Бэкап</button>
             </span>
           </h4>
           <div id="cluster-ready" class="muted small">
@@ -1656,8 +1810,11 @@ const App = (() => {
               '</div>';
 
       box.innerHTML = html;
+      decorateCards(box);
       if (ch.charts && ch.charts.length) {
-        attachCharts($('cluster-charts'), ch.charts);
+        attachCharts($('cluster-charts'),
+                     { cluster: name, hours: hours, charts: ch.charts,
+                       mode: 'inline' });
       }
       loadNotes();
     } catch (e) {
@@ -1665,35 +1822,201 @@ const App = (() => {
     }
   }
 
-  async function lazyBlock(id, url, label) {
-    const box = $(id);
-    if (!box) return;
-    box.innerHTML = '<span class="muted small">' + esc(label) + '</span>';
-    try {
-      const d = await fetch(url).then(r => r.json());
-      box.innerHTML = '<pre class="output">' +
-                      esc(d.text || d.report || d.error || 'Нет данных.') + '</pre>';
-    } catch (e) {
-      box.innerHTML = '<span class="muted small">Не получилось: ' + esc(e) + '</span>';
+  // ═══ РАЗБОР СТРАНИЦЫ КЛАСТЕРА ═══════════════════════════════════
+  // Каждый блок можно свернуть и попросить разобрать. Само по себе
+  // «Handler_read_rnd_next 4 млрд» ничего не говорит человеку, который
+  // пришёл разбираться в аварии, а не изучать performance_schema.
+
+  const FOLD_KEY = 'mysql-ai-agent.folded';
+
+  function foldedSet() {
+    try { return new Set(JSON.parse(localStorage.getItem(FOLD_KEY) || '[]')); }
+    catch (e) { return new Set(); }
+  }
+
+  function rememberFold(key, folded) {
+    const set = foldedSet();
+    folded ? set.add(key) : set.delete(key);
+    try { localStorage.setItem(FOLD_KEY, JSON.stringify([...set])); }
+    catch (e) { /* приватный режим */ }
+  }
+
+  function cardTitle(card) {
+    const h = card.querySelector('h4');
+    if (!h) return 'Блок';
+    // В заголовке живут кнопки — берём только собственный текст
+    return [...h.childNodes]
+      .filter(n => n.nodeType === 3).map(n => n.textContent).join(' ')
+      .replace(/\s+/g, ' ').trim() || 'Блок';
+  }
+
+  // Текст блока — то же, что видит человек. Разбирать надо именно это,
+  // а не пересобранный на сервере срез пятью минутами позже.
+  function cardText(card) {
+    const parts = [];
+    card.querySelectorAll('pre.output, .res-wrap table').forEach(el =>
+      parts.push(el.innerText || el.textContent || ''));
+    if (!parts.length) {
+      const body = card.querySelector('.tiles, .lazy-body');
+      if (body) parts.push(body.innerText || '');
+    }
+    return parts.join('\n\n').trim();
+  }
+
+  function setFold(card, folded) {
+    card.classList.toggle('folded', folded);
+    const btn = card.querySelector('.fold-btn');
+    if (btn) {
+      btn.textContent = folded ? '▸' : '▾';
+      btn.title = folded ? 'Развернуть' : 'Свернуть';
     }
   }
 
-  const loadWorkload = () => lazyBlock('cluster-workload',
+  function decorateCards(box) {
+    if (!box) return;
+    const folded = foldedSet();
+    box.querySelectorAll('.card').forEach(card => {
+      const head = card.querySelector('h4');
+      if (!head) return;
+      const key = cardTitle(card);
+
+      if (!card.dataset.folding) {
+        card.dataset.folding = '1';
+        const fold = document.createElement('button');
+        fold.type = 'button';
+        fold.className = 'fold-btn';
+        fold.textContent = '▾';
+        fold.title = 'Свернуть';
+        fold.addEventListener('click', ev => {
+          ev.stopPropagation();
+          const now = !card.classList.contains('folded');
+          setFold(card, now);
+          rememberFold(key, now);
+        });
+        head.insertBefore(fold, head.firstChild);
+        if (folded.has(key)) setFold(card, true);
+      }
+
+      // Кнопка разбора появляется, только когда в блоке есть что разбирать
+      const has = cardText(card).length > 40;
+      let ai = card.querySelector('.ai-btn');
+      if (has && !ai) {
+        ai = document.createElement('button');
+        ai.type = 'button';
+        ai.className = 'ghost-btn ai-btn';
+        ai.textContent = 'Разобрать';
+        ai.title = 'Объяснить, что здесь важно и что делать';
+        ai.addEventListener('click', () => explainCard(card, ai));
+        head.appendChild(ai);
+      }
+    });
+  }
+
+  async function askInsight(blocks, scope, question) {
+    return getJson('api/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cluster: state.clusterName, scope: scope,
+                             question: question || '', blocks: blocks }),
+    });
+  }
+
+  function insightBox(card) {
+    let box = card.querySelector('.ai-box');
+    if (!box) {
+      box = document.createElement('div');
+      box.className = 'ai-box';
+      card.appendChild(box);
+    }
+    return box;
+  }
+
+  async function explainCard(card, btn) {
+    const text = cardText(card);
+    if (!text) return;
+    const box = insightBox(card);
+    setFold(card, false);
+    setBusy(box, 'Модель разбирает этот блок…');
+    await withBusy(btn, async () => {
+      try {
+        const d = await askInsight([{ title: cardTitle(card), text: text }], 'one');
+        box.innerHTML = '<div class="ai-head">Разбор модели</div>' +
+                        renderMarkdown(d.text || '');
+      } catch (e) {
+        box.innerHTML = '<div class="muted small">Не удалось разобрать: ' +
+                        esc(e.message || e) + '</div>';
+      }
+    });
+  }
+
+  // Общий разбор: главное обычно видно на пересечении блоков, а не внутри
+  // одного. Отдаём модели всё, что уже собрано на странице.
+  async function explainAll(btn) {
+    const box = $('cluster-insight');
+    if (!box) return;
+    const blocks = [];
+    document.querySelectorAll('#cluster-body .card').forEach(card => {
+      if (card.id === 'insight-card') return;
+      const text = cardText(card);
+      if (text.length > 40) blocks.push({ title: cardTitle(card), text: text });
+    });
+    const tiles = document.querySelector('#cluster-body .tiles');
+    if (tiles) blocks.unshift({ title: 'Состояние сейчас', text: tiles.innerText });
+
+    if (!blocks.length) {
+      box.innerHTML = '<div class="muted small">Пока нечего разбирать: ' +
+        'соберите блоки кнопками выше — профиль нагрузки, репликацию, ' +
+        'настройки — и нажмите ещё раз.</div>';
+      return;
+    }
+    setBusy(box, 'Модель сводит ' + blocks.length + ' блоков в один разбор…',
+            'это занимает до минуты');
+    await withBusy(btn, async () => {
+      try {
+        const d = await askInsight(blocks, 'all');
+        box.innerHTML = '<div class="ai-head">Разбор по ' + blocks.length +
+                        ' блокам</div>' + renderMarkdown(d.text || '');
+      } catch (e) {
+        box.innerHTML = '<div class="muted small">Не удалось разобрать: ' +
+                        esc(e.message || e) + '</div>';
+      }
+    });
+  }
+
+  async function lazyBlock(id, url, label, btn) {
+    const box = $(id);
+    if (!box) return;
+    if (btn) return withBusy(btn, () => lazyBlock(id, url, label));
+    box.innerHTML = busyHtml(label);
+    try {
+      const d = await getJson(url);
+      box.innerHTML = '<pre class="output">' +
+                      esc(d.text || d.report || d.error || 'Нет данных.') + '</pre>';
+      decorateCards($('cluster-body'));
+    } catch (e) {
+      box.innerHTML = '<span class="muted small">Не получилось: ' +
+                      esc(e.message || e) + '</span>';
+    }
+  }
+
+  const loadWorkload = (btn) => lazyBlock('cluster-workload',
     'api/workload/' + encodeURIComponent(state.clusterName),
-    'Снимаю два среза, это займёт несколько секунд…');
+    'Снимаю два среза, это займёт несколько секунд…', btn);
 
-  const loadReplication = () => lazyBlock('cluster-repl',
-    'api/replication/' + encodeURIComponent(state.clusterName), 'Читаю состояние…');
+  const loadReplication = (btn) => lazyBlock('cluster-repl',
+    'api/replication/' + encodeURIComponent(state.clusterName),
+    'Читаю состояние…', btn);
 
-  const loadIndexes = () => lazyBlock('cluster-indexes',
-    'api/indexes/' + encodeURIComponent(state.clusterName), 'Читаю схему…');
+  const loadIndexes = (btn) => lazyBlock('cluster-indexes',
+    'api/indexes/' + encodeURIComponent(state.clusterName), 'Читаю схему…', btn);
 
-  const loadConfigChanges = () => lazyBlock('cluster-changes',
+  const loadConfigChanges = (btn) => lazyBlock('cluster-changes',
     'api/config-changes/' + encodeURIComponent(state.clusterName) + '?days=30',
-    'Сравниваю снимки…');
+    'Сравниваю снимки…', btn);
 
-  const loadBackups = () => lazyBlock('cluster-backups',
-    'api/backups/' + encodeURIComponent(state.clusterName), 'Смотрю каталог копий…');
+  const loadBackups = (btn) => lazyBlock('cluster-backups',
+    'api/backups/' + encodeURIComponent(state.clusterName),
+    'Смотрю каталог копий…', btn);
 
   async function loadNotes() {
     const card = $('notes-card');
@@ -1742,40 +2065,42 @@ const App = (() => {
     await loadNotes();
   }
 
-  const loadForecast = () => lazyBlock('cluster-forecast',
-    'api/forecast/' + encodeURIComponent(state.clusterName), 'Считаю запас…');
+  const loadForecast = (btn) => lazyBlock('cluster-forecast',
+    'api/forecast/' + encodeURIComponent(state.clusterName), 'Считаю запас…', btn);
 
-  const loadConfigAudit = () => lazyBlock('cluster-config',
+  const loadConfigAudit = (btn) => lazyBlock('cluster-config',
     'api/config-audit/' + encodeURIComponent(state.clusterName),
-    'Читаю настройки…');
+    'Читаю настройки…', btn);
 
-  const loadGrowth = () => lazyBlock('cluster-growth',
+  const loadGrowth = (btn) => lazyBlock('cluster-growth',
     'api/growth/' + encodeURIComponent(state.clusterName) + '?days=30',
-    'Сравниваю снимки…');
+    'Сравниваю снимки…', btn);
 
-  const loadAnomalies = () => lazyBlock('cluster-anomaly',
+  const loadAnomalies = (btn) => lazyBlock('cluster-anomaly',
     'api/anomalies/' + encodeURIComponent(state.clusterName),
-    'Сверяю с обычным состоянием…');
+    'Сверяю с обычным состоянием…', btn);
 
-  const loadReadiness = (action) => lazyBlock('cluster-ready',
+  const loadReadiness = (action, btn) => lazyBlock('cluster-ready',
     'api/readiness/' + encodeURIComponent(state.clusterName) +
     '?action=' + encodeURIComponent(action || 'restart'),
-    'Проверяю…');
+    'Проверяю…', btn);
 
-  async function loadHealth() {
+  async function loadHealth(btn) {
+    if (btn) return withBusy(btn, () => loadHealth());
     const out = $('health-out');
-    out.textContent = 'Проверяю Prometheus, модель, SSH, учётки баз…';
+    setBusy(out, 'Проверяю Prometheus, модель, SSH до серверов, учётки баз…',
+            'обход всех серверов занимает до минуты');
     try {
-      const d = await fetch('health/deep').then(r => r.json());
+      const d = await getJson('health/deep');
       out.textContent = d.text || 'Нет данных.';
     } catch (e) {
-      out.textContent = 'Проверка не выполнена: ' + e;
+      out.textContent = 'Проверка не выполнена: ' + (e.message || e);
     }
   }
 
-  const loadDiag = () => lazyBlock('cluster-diag',
+  const loadDiag = (btn) => lazyBlock('cluster-diag',
     'api/diagnose/' + encodeURIComponent(state.clusterName) + '?deep=true',
-    'Выполняю набор запросов…');
+    'Выполняю набор запросов и строю планы…', btn);
 
   function askAboutCluster() {
     const meta = state.clusters.find(c => c.name === state.clusterName) || {};
@@ -1806,7 +2131,7 @@ const App = (() => {
   async function similarIncidents(name, cluster) {
     showTab('alerts');
     const box = $('alerts-content');
-    box.innerHTML = '<div class="muted">Ищу прошлые случаи…</div>';
+    setBusy(box, 'Ищу прошлые случаи…');
     try {
       const d = await fetch('api/incidents/' + encodeURIComponent(name) +
                             (cluster ? '?cluster=' + encodeURIComponent(cluster) : ''))
@@ -1822,7 +2147,7 @@ const App = (() => {
               </div>`).join('')
           : '<div class="muted">Записанных решений пока нет. ' +
             'Запишите своё — в следующий раз агент предложит его первым.</div>') +
-        '<button class="ghost-btn" onclick="App.loadAlerts()">← К списку событий</button>';
+        '<button class="ghost-btn" onclick="App.loadAlerts(this)">← К списку событий</button>';
     } catch (e) {
       box.innerHTML = '<div class="muted">Не удалось: ' + esc(e) + '</div>';
     }
@@ -1840,20 +2165,21 @@ const App = (() => {
     });
   }
 
-  async function loadLogs() {
+  async function loadLogs(btn) {
+    if (btn) return withBusy(btn, () => loadLogs());
     const out = $('logs-out');
     const name = $('logs-cluster').value;
     if (!name) { out.textContent = 'Кластеры ещё не загружены.'; return; }
-    out.textContent = 'Читаю логи по SSH…';
+    setBusy(out, 'Читаю логи по SSH…',
+            'на больших файлах это занимает до минуты');
     try {
-      const d = await fetch('api/logs/' + encodeURIComponent(name) +
-                            '?hours=' + encodeURIComponent($('logs-hours').value) +
-                            '&kind=' + encodeURIComponent($('logs-kind').value) +
-                            '&filter=' + encodeURIComponent($('logs-filter').value))
-                      .then(r => r.json());
+      const d = await getJson('api/logs/' + encodeURIComponent(name) +
+                              '?hours=' + encodeURIComponent($('logs-hours').value) +
+                              '&kind=' + encodeURIComponent($('logs-kind').value) +
+                              '&filter=' + encodeURIComponent($('logs-filter').value));
       out.textContent = d.text || 'Ничего не найдено.';
     } catch (e) {
-      out.textContent = 'Не удалось прочитать логи: ' + e;
+      out.textContent = 'Не удалось прочитать логи: ' + (e.message || e);
     }
   }
 
@@ -1900,12 +2226,13 @@ const App = (() => {
     if (t) { $('sql-text').value = t.sql; $('sql-template').value = ''; }
   }
 
-  async function runSql() {
+  async function runSql(btn) {
+    if (btn) return withBusy(btn, () => runSql());
     const out  = $('sql-out');
     const sql  = $('sql-text').value.trim();
     const name = $('sql-cluster').value;
     if (!sql) return;
-    out.innerHTML = '<div class="muted">Выполняю…</div>';
+    setBusy(out, 'Выполняю запрос на сервере…');
     try {
       const r = await fetch('api/query', {
         method: 'POST',
@@ -1940,11 +2267,12 @@ const App = (() => {
 
   // ═══ ПОИСК ═════════════════════════════════════════════════════
 
-  async function runSearch() {
+  async function runSearch(btn) {
+    if (btn) return withBusy(btn, () => runSearch());
     const q   = $('search-q').value.trim();
     const box = $('search-out');
     if (q.length < 2) { box.innerHTML = '<div class="muted">Введите хотя бы 2 символа.</div>'; return; }
-    box.innerHTML = '<div class="muted">Ищу…</div>';
+    setBusy(box, 'Ищу по событиям, переписке и заметкам…');
     try {
       const d = await fetch('api/search?q=' + encodeURIComponent(q)).then(r => r.json());
       const parts = [];
@@ -2086,7 +2414,7 @@ const App = (() => {
   document.addEventListener('DOMContentLoaded', init);
 
   // Публичный API для onclick в HTML
-  return { showTab, pickCluster, useSuggestion, toggleAnalysis,
+  return { showTab, pickCluster, useSuggestion, toggleAnalysis, explainAll,
            loadStatus, loadAlerts, refreshClusters, logout,
            loadAccess, loadAudit, searchDirectory, grantAgain,
            newThread, deleteThread, switchThread, toggleSidebar,

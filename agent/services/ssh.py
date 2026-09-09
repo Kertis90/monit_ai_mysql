@@ -48,7 +48,7 @@ LOG_SSH_TIMEOUT = settings.ssh.timeout
 
 
 async def log_ssh(host: str, remote_cmd: str, ok_codes: tuple = (0, 1),
-                  env: Optional[dict] = None) -> tuple:
+                  env: Optional[dict] = None, timeout: int = 0) -> tuple:
     """Выполнить готовую команду на сервере. Возвращает (успех, вывод).
 
     ok_codes — какие коды возврата считать успехом. У grep код 1 означает
@@ -57,6 +57,10 @@ async def log_ssh(host: str, remote_cmd: str, ok_codes: tuple = (0, 1),
 
     env — переменные для удалённой команды. Через них передаётся пароль
     (MYSQL_PWD): в аргументах командной строки он был бы виден всем в ps.
+
+    timeout — сколько ждать саму команду. Отдельно от времени подключения:
+    соединение либо устанавливается за секунды, либо не устанавливается
+    вовсе, а чтение лога на многогигабайтном файле идёт заметно дольше.
     """
     problem = access_problem()
     if problem:
@@ -76,10 +80,17 @@ async def log_ssh(host: str, remote_cmd: str, ok_codes: tuple = (0, 1),
         proc = await asyncio.create_subprocess_exec(
             *argv, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE)
-        out, err = await asyncio.wait_for(proc.communicate(),
-                                          timeout=LOG_SSH_TIMEOUT + 10)
+        out, err = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout or (LOG_SSH_TIMEOUT + 10))
     except asyncio.TimeoutError:
-        return False, "Таймаут при выполнении команды на " + host
+        # Оборванный ssh закрывает канал, и удалённая команда получает SIGPIPE
+        # на первой же записи — процесс на сервере не остаётся висеть
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return False, ("Команда на %s не уложилась в %d с"
+                       % (host, timeout or (LOG_SSH_TIMEOUT + 10)))
     except Exception as e:
         return False, "Не удалось подключиться к {}: {}".format(host, e)
 

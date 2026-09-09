@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import datetime
 import logging
 import os
@@ -17,13 +18,16 @@ import shlex
 from typing import Optional
 
 from agent.core.config import settings
+from agent.services.logscan import (BISECT_MIN_BYTES, bisect_script, date_key,
+                                    human_size, take_slice_note)
 from agent.services.registry import slow_log_archive, slow_log_path
 from agent.services.ssh import log_ssh, remote_now, remote_time
 
 logger = logging.getLogger("agent.logs")
 
-LOG_MAX_LINES   = settings.log_max_lines
-LOG_SSH_TIMEOUT = settings.ssh.timeout
+LOG_MAX_LINES    = settings.log_max_lines
+LOG_SSH_TIMEOUT  = settings.ssh.timeout
+LOG_READ_TIMEOUT = settings.log_read_timeout
 
 LOG_KEYWORDS = (
     "лог", "логи", "логе", "логах", "slow log", "slow-лог", "слоу", "журнал",
@@ -108,16 +112,32 @@ def log_reader_cmd(path: str, args: str) -> str:
 
 
 async def log_grep(host: str, path: str, patterns: list,
-                   extra: str = "", max_lines: int = 0) -> tuple:
-    """grep по файлу с ограничением вывода — файл целиком не читаем."""
+                   extra: str = "", max_lines: int = 0, size: int = 0,
+                   since=None, until=None) -> tuple:
+    """grep по файлу с ограничением вывода — файл целиком не читаем.
+
+    На большом файле даже grep слишком долог: 17 ГБ он читает минутами и не
+    укладывается ни в какой разумный таймаут. Логи отсортированы по времени,
+    поэтому нужный кусок ищется делением файла пополам, и grep'у достаётся
+    несколько десятков мегабайт вместо всего файла.
+
+    Сжатые файлы так читать нельзя — в них нет соответствия «смещение ↔
+    время», поэтому для .gz остаётся zgrep целиком.
+    """
     max_lines = max_lines or LOG_MAX_LINES
     args = " ".join("-e " + shlex.quote(p) for p in patterns)
-    cmd = log_reader_cmd(path, args)
-    if extra:
-        # дополнительный фильтр тоже фиксированной строкой, не регуляркой
-        cmd += " | grep -a -F -i " + shlex.quote(extra)
-    cmd += " | tail -n " + str(int(max_lines))
-    return await log_ssh(host, cmd)
+    # дополнительный фильтр тоже фиксированной строкой, не регуляркой
+    extra_cmd = (" | grep -a -F -i " + shlex.quote(extra)) if extra else ""
+    tail_cmd = " | tail -n " + str(int(max_lines))
+
+    huge = (size >= BISECT_MIN_BYTES and not path.lower().endswith(".gz")
+            and since is not None and until is not None)
+    if huge:
+        pipeline = "LC_ALL=C grep -a -F " + args + extra_cmd + tail_cmd
+        cmd = bisect_script(path, date_key(since), date_key(until), pipeline)
+    else:
+        cmd = log_reader_cmd(path, args) + extra_cmd + tail_cmd
+    return await log_ssh(host, cmd, timeout=LOG_READ_TIMEOUT)
 
 
 async def log_list_files(host: str, dirs: list, pattern: str) -> list:
@@ -178,17 +198,25 @@ async def read_log_group(host: str, dirs: list, pattern: str, since, until,
            "  Просмотрено файлов: {} из {} (выбраны по времени изменения)"
            .format(len(picked), len(files))]
     per_file = max(LOG_MAX_LINES // len(picked), 40)
+    patterns = log_date_patterns(since, until, utc_dates)
+
+    # Файлы читаем разом, а не по очереди: это независимые команды на одном
+    # сервере, и ждать их последовательно значит складывать таймауты
+    results = await asyncio.gather(*[
+        log_grep(host, f["path"], patterns, extra, per_file,
+                 size=f.get("size", 0), since=since, until=until)
+        for f in picked])
+
     found_any = False
-    for f in picked:
+    for f, (ok, text) in zip(picked, results):
         mt = datetime.datetime.fromtimestamp(f["mtime"])
-        out.append("  {} — {:.1f} МБ, изменён {:%Y-%m-%d %H:%M}"
-                   .format(f["path"], f["size"] / 1048576, mt))
-        ok, text = await log_grep(host, f["path"],
-                                  log_date_patterns(since, until, utc_dates),
-                                  extra, per_file)
+        note, text = take_slice_note(text) if ok else ("", text)
+        out.append("  {} — {}, изменён {:%Y-%m-%d %H:%M}{}"
+                   .format(f["path"], human_size(f["size"]), mt,
+                           (" · " + note) if note else ""))
         lines = [l for l in text.splitlines() if l.strip()] if ok else []
         if not ok:
-            out.append("      не прочитан: " + text[:120])
+            out.append("      не прочитан: " + text[:200])
         elif not lines:
             out.append("      совпадений за период нет")
         else:

@@ -937,3 +937,133 @@ textarea#input:disabled { opacity: .55; }
 }
 .cluster-card:hover .ask-btn { opacity: 1; }
 .ask-btn:hover { color: var(--accent); }
+
+/* ── Бублик ожидания ────────────────────────────────────────────────
+   Раздел, который «просто ничего не показывает», выглядит как поломка:
+   человек не знает, идёт запрос или всё повисло. Крутящееся кольцо
+   отвечает на этот вопрос без слов, а подпись рядом объясняет, чего ждём.
+   Один класс на все разделы, чтобы ожидание везде выглядело одинаково. */
+
+.spinner {
+  display: inline-block;
+  flex: none;
+  width: 14px; height: 14px;
+  border: 2px solid var(--border-hl);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  vertical-align: -2px;
+  animation: spin .7s linear infinite;
+}
+.spinner.lg { width: 20px; height: 20px; border-width: 3px; }
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Кольцо крутится вечно — при отключённой анимации оно превратилось бы
+   в неподвижную дугу, поэтому там показываем пульсацию */
+@media (prefers-reduced-motion: reduce) {
+  .spinner { animation: pulse 1.4s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: .35 } 50% { opacity: 1 } }
+}
+
+.busy {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 12px 2px;
+  color: var(--muted);
+}
+.busy .what { color: var(--text); }
+.busy .slow { color: var(--muted); font-size: 12px; }
+
+/* Кнопка, запустившая команду: кольцо внутри неё, чтобы было видно,
+   какая именно из нескольких кнопок сейчас работает */
+button .spinner { margin-right: 6px; }
+button[disabled] { opacity: .65; cursor: progress; }
+
+/* Вкладка, чей раздел сейчас грузится */
+.tab .spinner { width: 11px; height: 11px; border-width: 2px; margin-left: 6px; }
+
+/* Выбор кластера, когда вкладку открыли без выбранного */
+.pick-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+.pick-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 12px 14px;
+  cursor: pointer;
+  transition: border-color .15s, background .15s;
+}
+.pick-card:hover { border-color: var(--border-hl); background: var(--surface2); }
+.pick-card b { color: var(--text-hl); }
+.pick-card .cmeta { color: var(--muted); font-size: 12px; margin-top: 4px; }
+
+/* ── Что агент делает прямо сейчас ──────────────────────────────────
+   Тяжёлый вопрос собирается минуту и дольше: два среза performance_schema,
+   EXPLAIN, чтение логов по SSH. Три точки всё это время неотличимы от
+   зависшего запроса, поэтому показываем сами шаги. */
+
+.steps {
+  margin: 6px 0 2px 0;
+  padding-left: 2px;
+  border-left: 2px solid var(--border);
+}
+.steps .step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0 3px 10px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+.steps .step.done { opacity: .55; }
+.steps .step.done .spinner {
+  animation: none;
+  border-color: var(--border-hl);
+  border-top-color: var(--green);
+}
+
+/* ── Блоки на странице кластера ─────────────────────────────────────
+   Собранного на странице много, и читать всё сразу незачем: то, что
+   сейчас не нужно, сворачивается и не мешает искать глазами нужное.
+   Выбор запоминается — свернувший блок осознанно не хочет видеть его
+   развёрнутым при каждом открытии. */
+
+.fold-btn {
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 0 6px 0 0;
+  line-height: 1;
+}
+.fold-btn:hover { color: var(--text-hl); }
+
+.card.folded > *:not(h4) { display: none; }
+.card.folded h4 { margin-bottom: 0; }
+
+/* Разбор модели: отделён от данных, чтобы не путать наблюдение с выводом */
+.ai-box {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border-left: 3px solid var(--accent);
+  background: var(--accent-dim);
+  border-radius: 0 6px 6px 0;
+}
+.ai-box .ai-head {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--accent);
+  margin-bottom: 8px;
+}
+.ai-box p  { margin: 0 0 8px; }
+.ai-box ul, .ai-box ol { margin: 0 0 8px 18px; }
+.ai-box pre { overflow-x: auto; }
+
+.ai-btn { margin-left: 8px; }

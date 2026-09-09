@@ -12,8 +12,9 @@ from agent.api.deps import (AdminUser, Audit, CurrentUser, DbSession,
 from agent.db.repositories.notes import NoteRepository
 from agent.services import (anomaly, audit, backups, config_audit,
                             config_history, forecast, growth, indexes,
-                            readiness)
-from agent.schemas.api import SqlRequest, SqlResult
+                            insight, readiness, tasks)
+from agent.schemas.api import (InsightOut, InsightRequest, SqlRequest,
+                               SqlResult)
 from agent.services.analysis import (DIAG_QUERIES, collect_series_table,
                                      explain_top_queries, fmt_diagnostics,
                                      run_diagnostics)
@@ -105,11 +106,15 @@ async def diagnose(name: str, user: CurrentUser, deep: bool = False):
     """Готовые читающие запросы по методике из документации MySQL:
     performance_schema и представления sys."""
     cluster = _need(name)
-    result  = await run_diagnostics(cluster)
-    text    = fmt_diagnostics(result)
-    if deep:
-        text += "\n\n" + await explain_top_queries(cluster)
-    return {"cluster": name, "report": text}
+
+    async def build():
+        result = await run_diagnostics(cluster)
+        text = fmt_diagnostics(result)
+        if deep:
+            text += "\n\n" + await explain_top_queries(cluster)
+        return {"cluster": name, "report": text}
+    return await tasks.shared("diagnose:%s:%d" % (name, int(deep)),
+                              build, ttl=60)
 
 
 @router.get("/api/workload/{name}", tags=["Диагностика"],
@@ -121,20 +126,28 @@ async def workload(name: str, user: CurrentUser, seconds: float = 0,
     Именно разница: накопленные суммы показывают средние за всё время работы
     сервера и текущую проблему прячут.
     """
-    data = await workload_delta(_need(name), seconds or DEFAULT_WINDOW_S,
-                                host or None)
-    if not data.get("error"):
-        data["text"] = fmt_workload(data, name)
-    return data
+    async def build():
+        data = await workload_delta(_need(name), seconds or DEFAULT_WINDOW_S,
+                                    host or None)
+        if not data.get("error"):
+            data["text"] = fmt_workload(data, name)
+        return data
+    # Профиль снимается двумя срезами с паузой: два одновременных запроса
+    # означали бы четыре обхода performance_schema ради одного ответа
+    return await tasks.shared("workload:%s:%s:%g" % (name, host, seconds),
+                              build, ttl=30)
 
 
 @router.get("/api/replication/{name}", tags=["Диагностика"],
             summary="Состояние репликации кластера")
 async def replication(name: str, user: CurrentUser):
     cluster = _need(name)
-    states = await collect_replication(cluster)
-    return {"cluster": name, "items": states,
-            "text": fmt_replication(states, cluster["label"])}
+
+    async def build():
+        states = await collect_replication(cluster)
+        return {"cluster": name, "items": states,
+                "text": fmt_replication(states, cluster["label"])}
+    return await tasks.shared("replication:%s" % name, build, ttl=20)
 
 
 @router.get("/api/logs/{name}", tags=["Диагностика"],
@@ -148,6 +161,16 @@ async def logs(name: str, user: CurrentUser, hours: float = 2,
     """
     cluster = _need(name)
     hours = max(0.25, min(float(hours), 48.0))
+
+    key = "logs:%s:%s:%g:%s" % (name, kind, hours, filter)
+    return await tasks.shared(key, lambda: _read_logs(cluster, name, hours,
+                                                      filter, kind), ttl=60)
+
+
+async def _read_logs(cluster: dict, name: str, hours: float,
+                     filter: str, kind: str) -> dict:
+    """Собственно чтение. Вынесено, чтобы одинаковые запросы делили работу:
+    на большом логе это десятки секунд, и повторять их незачем."""
     parts = []
 
     if kind in ("all", "slow"):
@@ -196,26 +219,33 @@ async def templates(user: CurrentUser):
 async def forecast_one(name: str, user: CurrentUser):
     """«Занято 85%» говорит о состоянии, «хватит на трое суток» — о запасе
     времени. Второе полезнее."""
-    data = await forecast.collect(_need(name))
-    data["text"] = forecast.fmt_forecast(data)
-    return data
+    async def build():
+        data = await forecast.collect(_need(name))
+        data["text"] = forecast.fmt_forecast(data)
+        return data
+    return await tasks.shared("forecast:%s" % name, build, ttl=120)
 
 
 @router.get("/api/config-audit/{name}", tags=["Диагностика"],
             summary="Разбор настроек MySQL")
 async def config_audit_one(name: str, user: CurrentUser, host: str = ""):
-    data = await config_audit.audit(_need(name), host or None)
-    data["text"] = config_audit.fmt_audit(data)
-    return data
+    async def build():
+        data = await config_audit.audit(_need(name), host or None)
+        data["text"] = config_audit.fmt_audit(data)
+        return data
+    return await tasks.shared("config-audit:%s:%s" % (name, host), build, ttl=120)
 
 
 @router.get("/api/growth/{name}", tags=["Диагностика"],
             summary="Что растёт: размеры таблиц и динамика")
 async def growth_one(name: str, user: CurrentUser, days: int = 30):
     _need(name)
-    data = await growth.report(name, max(1, min(days, 90)))
-    data["text"] = growth.fmt_growth(data)
-    return data
+
+    async def build():
+        data = await growth.report(name, max(1, min(days, 90)))
+        data["text"] = growth.fmt_growth(data)
+        return data
+    return await tasks.shared("growth:%s:%d" % (name, days), build, ttl=300)
 
 
 @router.post("/api/growth/{name}/snapshot", tags=["Диагностика"],
@@ -231,9 +261,12 @@ async def anomalies_one(name: str, user: CurrentUser):
     """Половина поломок не пересекает ни одного порога: запросов вдвое
     меньше обычного — приложение отвалилось, а база здорова."""
     cluster = _need(name)
-    items = await anomaly.check(cluster)
-    return {"cluster": name, "items": items,
-            "text": anomaly.fmt_anomalies(items, cluster["label"])}
+
+    async def build():
+        items = await anomaly.check(cluster)
+        return {"cluster": name, "items": items,
+                "text": anomaly.fmt_anomalies(items, cluster["label"])}
+    return await tasks.shared("anomalies:%s" % name, build, ttl=60)
 
 
 @router.get("/api/readiness/{name}", tags=["Диагностика"],
@@ -243,9 +276,12 @@ async def readiness_one(name: str, user: CurrentUser, action: str = "restart",
     if action not in ("restart", "alter", "backup"):
         raise HTTPException(status_code=400,
                             detail="action: restart, alter или backup")
-    data = await readiness.check(_need(name), action, host or None)
-    data["text"] = readiness.fmt_readiness(data)
-    return data
+    async def build():
+        data = await readiness.check(_need(name), action, host or None)
+        data["text"] = readiness.fmt_readiness(data)
+        return data
+    return await tasks.shared("readiness:%s:%s:%s" % (name, action, host),
+                              build, ttl=30)
 
 
 @router.get("/api/indexes/{name}", tags=["Диагностика"],
@@ -253,27 +289,36 @@ async def readiness_one(name: str, user: CurrentUser, action: str = "restart",
 async def indexes_one(name: str, user: CurrentUser, host: str = ""):
     """Индекс по (a) не нужен, когда есть (a, b): он занимает место и
     обновляется при каждой вставке. Глазами в схеме такое не найти."""
-    data = await indexes.analyse(_need(name), host or None)
-    data["text"] = indexes.fmt_indexes(data)
-    return data
+    async def build():
+        data = await indexes.analyse(_need(name), host or None)
+        data["text"] = indexes.fmt_indexes(data)
+        return data
+    return await tasks.shared("indexes:%s:%s" % (name, host), build, ttl=600)
 
 
 @router.get("/api/backups/{name}", tags=["Диагностика"],
             summary="Снимаются ли копии баз")
 async def backups_one(name: str, user: CurrentUser):
     cluster = _need(name)
-    data = await backups.check(cluster)
-    data["text"] = backups.fmt_backups(data, cluster["label"])
-    return data
+
+    async def build():
+        data = await backups.check(cluster)
+        data["text"] = backups.fmt_backups(data, cluster["label"])
+        return data
+    return await tasks.shared("backups:%s" % name, build, ttl=300)
 
 
 @router.get("/api/config-changes/{name}", tags=["Диагностика"],
             summary="Что менялось в настройках и когда")
 async def config_changes_one(name: str, user: CurrentUser, days: int = 30):
     cluster = _need(name)
-    items = await config_history.changes(name, max(1, min(days, 180)))
-    return {"cluster": name, "days": days, "items": items,
-            "text": config_history.fmt_changes(items, cluster["label"], days)}
+
+    async def build():
+        items = await config_history.changes(name, max(1, min(days, 180)))
+        return {"cluster": name, "days": days, "items": items,
+                "text": config_history.fmt_changes(items, cluster["label"], days)}
+    return await tasks.shared("config-changes:%s:%d" % (name, days),
+                              build, ttl=300)
 
 
 @router.post("/api/config-changes/{name}/snapshot", tags=["Диагностика"],
@@ -281,6 +326,26 @@ async def config_changes_one(name: str, user: CurrentUser, days: int = 30):
 async def config_snapshot_now(name: str, admin: AdminUser):
     """Первый снимок нужен сразу: иначе сравнивать будет не с чем сутки."""
     return {"cluster": name, "values": await config_history.snapshot(_need(name))}
+
+
+@router.post("/api/analyze", tags=["Диагностика"], response_model=InsightOut,
+             summary="Разбор собранного моделью")
+async def analyze_blocks(req: InsightRequest, user: CurrentUser,
+                         audit_log: Audit):
+    """Объяснить один блок диагностики или всё собранное вместе.
+
+    Разбирается то, что человек видит на экране, поэтому блоки приходят от
+    браузера. Пересобирать их на сервере значило бы объяснять другой срез:
+    профиль нагрузки через пять минут уже другой.
+    """
+    cluster = _need(req.cluster)
+    blocks = [{"title": b.title, "text": b.text} for b in req.blocks]
+    text = await insight.analyze(cluster, blocks, req.scope, req.question)
+    await audit_log("insight", req.cluster,
+                    "разбор ИИ: %s, блоков %d"
+                    % ("всё вместе" if req.scope == "all" else "один блок",
+                       len(blocks)))
+    return {"cluster": req.cluster, "text": text}
 
 
 @router.get("/api/notes/{name}", tags=["Кластеры"],

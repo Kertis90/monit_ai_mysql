@@ -250,6 +250,13 @@ def application() -> None:
         ssh_access(c)
         background_answer(c)
         mysql_hints()
+        tool_calls_in_text()
+        log_bisect()
+        shared_tasks()
+        json_safety()
+        row_cap()
+        forecast_wording()
+        insight_blocks()
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -580,7 +587,7 @@ def background_answer(client) -> None:
 
     slow = {"go": False}
 
-    async def fake_ctx(text):
+    async def fake_ctx(text, progress=None):
         return "", None, 0
 
     async def fake_stream(messages):
@@ -670,6 +677,180 @@ def mysql_hints() -> None:
           conn_hint(Exception("timed out")), "")
 
 
+def tool_calls_in_text() -> None:
+    """Вызов инструмента, написанный текстом, не должен попадать в чат.
+
+    Часть моделей не умеет штатный tool calling и пишет вызов прямо в
+    ответ. Пользователь видел разметку вместо ответа.
+    """
+    from agent.services.toolcalls import StreamFilter, find_calls, strip_calls
+
+    sample = ("Сейчас посмотрю.\n<tool_call><function><parameter=cluster>"
+              "vladivostok</parameter><parameter=sql>SELECT 1</parameter>"
+              "</function></tool_call>")
+    calls = find_calls(sample)
+    check("вызов без имени функции разобран", len(calls), 1)
+    check("инструмент определён по параметрам", calls[0]["name"], "run_sql")
+    check("аргументы разобраны", calls[0]["args"].get("cluster"), "vladivostok")
+    check("разметка не показана", "tool_call" not in strip_calls(sample), True)
+
+    # По одному символу: тег приходит кусками и не должен мелькать
+    flt = StreamFilter()
+    shown = "".join(flt.feed(ch) for ch in sample) + flt.finish()
+    check("в потоке разметки нет", "<tool" not in shown, True)
+    check("текст до вызова сохранён", shown.strip(), "Сейчас посмотрю.")
+    check("вызовы видны вызывающему", len(flt.calls), 1)
+
+    js = ('<tool_call>{"name": "get_history", "arguments": '
+          '{"cluster": "kemerovo", "hours": 6}}</tool_call>')
+    check("формат JSON тоже понят", find_calls(js)[0]["name"], "get_history")
+
+    cut = "Проверяю<tool_call><function=run_sql><parameter=cluster>kem"
+    check("оборванный вызов отрезан", strip_calls(cut), "Проверяю")
+
+    plain = "Обычный текст, где встречается < и слово tool"
+    f2 = StreamFilter()
+    out = "".join(f2.feed(t + " ") for t in plain.split(" ")) + f2.finish()
+    check("обычный текст не пострадал", out.strip(), plain)
+
+
+def log_bisect() -> None:
+    """Кусок большого лога ищется делением, а не полным чтением."""
+    from agent.services import logscan
+
+    script = logscan.bisect_script("/var/log/big.log", "20260907", "20260908",
+                                   "grep -a -F -e X")
+    check("файл экранирован", "F=/var/log/big.log" in script, True)
+    check("границы периода переданы",
+          "S=20260907" in script and "U=20260908" in script, True)
+    check("две границы ищутся делением", script.count("while [ $(("), 2)
+    check("читается только найденный кусок",
+          "tail -c +$((st + 1))" in script, True)
+
+    note, rest = logscan.take_slice_note(
+        "##SLICE 0 52428800 18253611008\nстрока лога")
+    check("отчёт о просмотренном", "50 МБ" in note and "17.0 ГБ" in note, True)
+    check("служебная строка не в выводе", rest, "строка лога")
+    check("обычный вывод не тронут",
+          logscan.take_slice_note("просто строка")[1], "просто строка")
+
+    # На маленьком файле деление не нужно: обычный grep быстрее
+    check("порог включения разумен",
+          logscan.BISECT_MIN_BYTES >= 128 * 1024 * 1024, True)
+
+
+def shared_tasks() -> None:
+    """Одинаковую работу делаем один раз на всех, кто её попросил."""
+    from agent.services import tasks
+
+    calls = {"n": 0}
+
+    async def slow():
+        calls["n"] += 1
+        await asyncio.sleep(0.15)
+        return {"value": calls["n"]}
+
+    async def scenario():
+        # Три одновременных запроса — одна работа
+        got = await asyncio.gather(*[tasks.shared("проба", slow, ttl=5)
+                                     for _ in range(3)])
+        check("работа выполнена один раз", calls["n"], 1)
+        check("все получили один результат",
+              all(g["value"] == 1 for g in got), True)
+
+        # Свежий результат отдаётся сразу, без повторной работы
+        again = await tasks.shared("проба", slow, ttl=5)
+        check("свежий результат переиспользован", again["value"], 1)
+        check("повторной работы не было", calls["n"], 1)
+
+        # Отменённый запрос не убивает работу: следующий получит готовое
+        task = asyncio.create_task(tasks.shared("проба2", slow, ttl=5))
+        await asyncio.sleep(0.02)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        await asyncio.sleep(0.3)
+        check("работа пережила отменённый запрос",
+              tasks.cached("проба2", ttl=5) is not None, True)
+        await tasks.shutdown()
+
+    asyncio.run(scenario())
+
+
+def json_safety() -> None:
+    """Одно нечисловое значение не должно ронять весь ответ."""
+    import json as jsonlib
+
+    from agent.api.responses import SafeJSONResponse, sanitize
+
+    data = {"ok": 1.5, "bad": float("inf"), "nan": float("nan"),
+            "deep": {"list": [1.0, float("nan")]}}
+    clean = sanitize(data)
+    check("бесконечность обезврежена", clean["bad"] is None, True)
+    check("NaN обезврежен", clean["nan"] is None, True)
+    check("вложенные тоже", clean["deep"]["list"][1] is None, True)
+    check("нормальные числа целы", clean["ok"], 1.5)
+
+    raw = SafeJSONResponse(content=data).render(data)
+    back = jsonlib.loads(raw.decode("utf-8"))
+    check("ответ разбирается как JSON", back["ok"], 1.5)
+
+
+def row_cap() -> None:
+    """SHOW GLOBAL VARIABLES не должен обрываться на двухстах строках."""
+    from agent.services.mysql import SQL_MAX_ROWS, sql_add_limit
+
+    check("предел по умолчанию на месте",
+          sql_add_limit("SELECT 1").endswith("LIMIT %d" % SQL_MAX_ROWS), True)
+    check("свой предел применяется",
+          sql_add_limit("SELECT 1", 5000).endswith("LIMIT 5000"), True)
+    check("к SHOW предел не дописывается",
+          sql_add_limit("SHOW GLOBAL VARIABLES"), "SHOW GLOBAL VARIABLES")
+
+    from agent.services import config_audit
+    check("разбор настроек просит все строки",
+          config_audit.ALL_ROWS >= 1000, True)
+
+
+def forecast_wording() -> None:
+    """Про соединения говорим по метрике, которая есть у любого экспортёра."""
+    import inspect
+
+    from agent.services import forecast
+
+    src = inspect.getsource(forecast.connections_forecast)
+    check("пик считается по threads_connected",
+          "max_over_time" in src and "threads_connected" in src, True)
+    check("предел спрашивается у базы, если его нет в метриках",
+          "@@max_connections" in src, True)
+
+    text = forecast.fmt_forecast({
+        "label": "Кемерово", "disks": [], "auto_increment": [],
+        "connections": {"peak": 120, "limit": 500, "used_pct": 24.0,
+                        "now": 87, "days_left": None, "measured": False,
+                        "level": "ok"}})
+    check("видно и текущее, и пик", "сейчас 87" in text and "пик" in text, True)
+    check("честно про отсутствие истории", "не известен" in text, True)
+
+
+def insight_blocks() -> None:
+    """Разбор собирает то, что видит человек, и не раздувается."""
+    from agent.services import insight
+
+    long_text = "строка данных " * 5000
+    trimmed = insight._trim(long_text, 1000)
+    check("длинный блок обрезан", len(trimmed) < 1200, True)
+    check("вырезана середина, а не хвост",
+          trimmed.startswith("строка") and trimmed.endswith("данных "), True)
+
+    body = insight._blocks_text([{"title": "Репликация", "text": "лаг 0"},
+                                 {"title": "Пусто", "text": "  "}])
+    check("заголовок блока сохранён", "## Репликация" in body, True)
+    check("пустые блоки отброшены", "Пусто" not in body, True)
+
+
 def websocket(client) -> None:
     """Разговор по WebSocket от начала до конца.
 
@@ -679,7 +860,7 @@ def websocket(client) -> None:
     """
     from agent.api.routes import chat as chat_routes
 
-    async def fake_context(text):
+    async def fake_context(text, progress=None):
         return "## Метрики\n  всё в порядке", None, 0
 
     async def fake_stream(messages):

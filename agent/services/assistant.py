@@ -321,8 +321,22 @@ async def llm_with_tools(messages: list) -> tuple:
     return convo, used
 
 
-async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], float]:
-    """Определить кластер и временное окно, собрать контекст метрик."""
+async def build_chat_context(user_message: str, progress=None
+                             ) -> tuple[str, Optional[dict], float]:
+    """Определить кластер и временное окно, собрать контекст метрик.
+
+    progress — куда сообщать, чем агент занят. Сбор данных для тяжёлого
+    вопроса идёт минуту и дольше: два среза performance_schema, EXPLAIN по
+    десятку запросов, чтение логов по SSH. Всё это время человек смотрел на
+    три точки и не знал, работает агент или завис.
+    """
+    async def step(text: str) -> None:
+        if progress is not None:
+            try:
+                await progress(text)
+            except Exception:          # рассказ о работе не должен её ломать
+                pass
+
     cluster = detect_cluster_in_text(user_message)
     hours   = detect_time_hours(user_message)
     blocks  = []
@@ -348,9 +362,11 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
             blocks.append(notes)
 
         if hours > 0:
+            await step("Читаю метрики Prometheus за %g ч" % hours)
             hist = await collect_history(cluster, hours)
             blocks.append(fmt_history(hist, cluster["label"]))
             # С чем сравнивать: те же метрики неделю назад
+            await step("Сравниваю с тем же периодом неделю назад")
             try:
                 base = await collect_baseline(cluster, hours)
                 cmp_block = fmt_baseline(hist, base, cluster["label"])
@@ -368,6 +384,7 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
                 # и ресурсы у них разные
                 for tb in await collect_series_tables(cluster, hours, step):
                     blocks.append(fmt_series_table(tb, cluster["label"]))
+        await step("Снимаю текущее состояние " + cluster["label"])
         current = await collect_current(cluster)
         blocks.append(fmt_current(current))
 
@@ -388,6 +405,7 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
         if detect_diagnose_intent(user_message) and cluster_db_creds(cluster):
             # Что грузит базу ПРЯМО СЕЙЧАС. Накопленная статистика показывает
             # средние за всё время работы сервера и текущую проблему прячет.
+            await step("Снимаю профиль нагрузки: два среза performance_schema")
             live = await workload_delta(cluster)
             if live.get("error"):
                 gaps.append("не снят профиль нагрузки: %s" % live["error"])
@@ -395,6 +413,7 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
                 blocks.append(fmt_workload(live, cluster["label"]))
 
             # Лаг говорит «на сколько», состояние репликации — «почему»
+            await step("Проверяю состояние репликации")
             repl = await collect_replication(cluster)
             block = fmt_replication(repl, cluster["label"])
             if block:
@@ -405,6 +424,7 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
                                 % state["error"])
 
             for ip, role in cluster_hosts(cluster):
+                await step("Диагностические запросы на %s (%s)" % (ip, role))
                 diag = await run_diagnostics(cluster, ip)
                 if diag:
                     blocks.append(fmt_diagnostics(
@@ -421,6 +441,7 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
 
             # Планы выполнения — превращают «запрос медленный»
             # в конкретную рекомендацию по индексам
+            await step("Строю планы выполнения тяжёлых запросов")
             try:
                 plans = await explain_top_queries(cluster, cluster["primary_ip"])
                 if plans:
@@ -446,6 +467,7 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
         if detect_log_intent(user_message):
             win = hours if hours > 0 else 2.0
             for ip, role in cluster_hosts(cluster):
+                await step("Читаю логи на %s по SSH" % ip)
                 t = await remote_time(ip)
                 if t is None:
                     gaps.append("логи с %s (%s) не прочитаны: сервер не "

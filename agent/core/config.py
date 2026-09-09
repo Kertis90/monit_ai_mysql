@@ -135,6 +135,9 @@ class Settings(BaseModel):
     alert_dedup_minutes: int = 30
     chat_context_messages: int = 10
     log_max_lines: int = 400
+    # Чтение логов идёт дольше обычной команды: на многогигабайтном
+    # файле даже суженный поиск занимает десятки секунд
+    log_read_timeout: int = 180
 
     llm:        LLMSettings        = Field(default_factory=LLMSettings)
     prometheus: PrometheusSettings = Field(default_factory=PrometheusSettings)
@@ -176,6 +179,7 @@ def load_settings() -> Settings:
         alert_dedup_minutes   = int(_env("ALERT_DEDUP_MINUTES", "30")),
         chat_context_messages = int(_env("CHAT_CONTEXT_MESSAGES", "10")),
         log_max_lines         = int(_env("LOG_MAX_LINES", "400")),
+        log_read_timeout      = int(_env("LOG_READ_TIMEOUT", "180")),
 
         llm=LLMSettings(
             base_url    = _env("LLM_BASE_URL", "https://your-llm-server.com/v1"),

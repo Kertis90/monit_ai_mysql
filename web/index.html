@@ -47,11 +47,11 @@
       <div class="tab"        data-tab="status" onclick="App.showTab('status')">📊 Статус</div>
       <div class="tab"        data-tab="alerts" onclick="App.showTab('alerts')">🔔 Алерты <span class="alert-count" id="alert-count"></span></div>
       <div class="tab"        data-tab="cluster" id="tab-btn-cluster"
-           style="display:none" onclick="App.showTab('cluster')">🖥 Кластер</div>
+           onclick="App.showTab('cluster')">🖥 Кластер</div>
       <div class="tab"        data-tab="logs"   onclick="App.showTab('logs')">📄 Логи</div>
       <div class="tab"        data-tab="sql"    onclick="App.showTab('sql')">🗄 SQL</div>
       <div class="tab"        data-tab="search" onclick="App.showTab('search')">🔍 Поиск</div>
-      <div class="tab"        data-tab="health" onclick="App.showTab('health')">🩺 Здоровье</div>
+      <div class="tab"        data-tab="health" onclick="App.showTab('health')">🔧 Здоровье</div>
       <div class="tab" data-tab="access" id="tab-btn-access" style="display:none"
            onclick="App.showTab('access')">🔑 Доступы</div>
       <div class="tab" data-tab="audit" id="tab-btn-audit" style="display:none"
@@ -107,13 +107,13 @@
     <!-- ── СТАТУС ── -->
     <section id="tab-status" class="tab-pane status-pane" hidden>
       <div id="status-content"><div class="muted">Загрузка…</div></div>
-      <button class="ghost-btn" onclick="App.loadStatus()">↻ Обновить</button>
+      <button class="ghost-btn" onclick="App.loadStatus(this)">↻ Обновить</button>
     </section>
 
     <!-- ── АЛЕРТЫ ── -->
     <section id="tab-alerts" class="tab-pane alerts-pane" hidden>
       <div id="alerts-content"><div class="muted">Загрузка…</div></div>
-      <button class="ghost-btn" onclick="App.loadAlerts()">↻ Обновить</button>
+      <button class="ghost-btn" onclick="App.loadAlerts(this)">↻ Обновить</button>
     </section>
 
     <!-- ── КЛАСТЕР: всё, что агент собирает для разбора, одним экраном ── -->
@@ -127,11 +127,11 @@
             <option value="12">за 12 часов</option>
             <option value="24">за сутки</option>
           </select>
-          <button class="ghost-btn" onclick="App.loadClusterPage()">↻ Обновить</button>
+          <button class="ghost-btn" onclick="App.loadClusterPage(this)">↻ Обновить</button>
           <button class="ghost-btn" onclick="App.askAboutCluster()">Спросить агента</button>
         </div>
       </div>
-      <div id="cluster-body"><div class="muted">Выберите кластер слева.</div></div>
+      <div id="cluster-body"><div class="muted">Выберите кластер.</div></div>
       <div class="card" id="notes-card" hidden>
         <h4>Известные особенности
           <button class="ghost-btn lazy" onclick="App.addNote()">+ Заметка</button></h4>
@@ -162,7 +162,7 @@
             <option value="24">за сутки</option>
           </select>
           <input id="logs-filter" type="text" placeholder="строка поиска (необязательно)">
-          <button class="ghost-btn" onclick="App.loadLogs()">Показать</button>
+          <button class="ghost-btn" onclick="App.loadLogs(this)">Показать</button>
         </div>
       </div>
       <p class="muted small">Файлы выбираются по времени изменения, архивы читаются
@@ -179,7 +179,7 @@
           <select id="sql-template" onchange="App.useTemplate(this.value)">
             <option value="">готовые запросы…</option>
           </select>
-          <button class="ghost-btn" onclick="App.runSql()">Выполнить</button>
+          <button class="ghost-btn" onclick="App.runSql(this)">Выполнить</button>
         </div>
       </div>
       <p class="muted small">Только чтение: SELECT, SHOW, EXPLAIN, DESCRIBE.
@@ -195,7 +195,7 @@
         <h3>Поиск</h3>
         <div class="pane-actions">
           <input id="search-q" type="text" placeholder="слово из переписки или события">
-          <button class="ghost-btn" onclick="App.runSearch()">Найти</button>
+          <button class="ghost-btn" onclick="App.runSearch(this)">Найти</button>
         </div>
       </div>
       <p class="muted small">Ищется и по вашим чатам, и по истории событий вместе
@@ -208,7 +208,7 @@
       <div class="pane-head">
         <h3>Самопроверка агента</h3>
         <div class="pane-actions">
-          <button class="ghost-btn" onclick="App.loadHealth()">Проверить сейчас</button>
+          <button class="ghost-btn" onclick="App.loadHealth(this)">Проверить сейчас</button>
         </div>
       </div>
       <p class="muted small">Prometheus, модель, SSH до каждого сервера, учётки

@@ -117,29 +117,79 @@ async def disk_forecast(cluster: dict) -> list[dict]:
 
 
 async def connections_forecast(cluster: dict) -> dict:
-    """Когда упрёмся в max_connections при нынешнем росте."""
+    """Когда упрёмся в max_connections при нынешнем росте.
+
+    Считаем по threads_connected, а не по max_used_connections. Причин две.
+    Первая: max_used_connections отдают не все сборки экспортёра, и раздел
+    молча оставался пустым. Вторая: это отметка «самого высокого уровня» с
+    момента запуска сервера, она почти никогда не убывает — темп роста по
+    ней получался ложный.
+
+    Пик берём как max_over_time за окно: это настоящий максимум за неделю,
+    а не средняя занятость, — упираемся мы именно в пики. Рост — разница
+    пика с таким же окном неделю назад: сравнение сопоставимых величин
+    устойчивее производной по шумному ряду.
+    """
     inst = f'{cluster["primary_ip"]}:9104'
+    conn_metric = f'mysql_global_status_threads_connected{{instance="{inst}"}}'
     async with httpx.AsyncClient() as client:
-        used, limit, slope = await asyncio.gather(
-            prom_query(client, f'mysql_global_status_max_used_connections{{instance="{inst}"}}'),
-            prom_query(client, f'mysql_global_variables_max_connections{{instance="{inst}"}}'),
-            prom_query(client, f'deriv(mysql_global_status_max_used_connections'
-                               f'{{instance="{inst}"}}[{TREND_WINDOW}])'))
+        peak_now, peak_before, cap_raw, now_raw = await asyncio.gather(
+            prom_query(client, f'max_over_time({conn_metric}[{TREND_WINDOW}])'),
+            prom_query(client,
+                       f'max_over_time({conn_metric}[{TREND_WINDOW}] '
+                       f'offset {TREND_WINDOW})'),
+            prom_query(client,
+                       f'mysql_global_variables_max_connections{{instance="{inst}"}}'),
+            prom_query(client, conn_metric))
 
     def one(value):
         if isinstance(value, dict) and value:
-            return float(next(iter(value.values())))
+            try:
+                return float(next(iter(value.values())))
+            except (TypeError, ValueError):
+                return None
         return None
 
-    peak, cap = one(used), one(limit)
-    per_day = (one(slope) or 0) * 86400
+    peak, cap = one(peak_now), one(cap_raw)
+    now = one(now_raw)
+
+    # Предел соединений экспортёр отдаёт только со сборщиком global_variables.
+    # Если его выключили, значение всё равно доступно — запросом к самой базе.
+    if not cap and cluster_db_creds(cluster):
+        res = await sql_execute(cluster, "SELECT @@max_connections AS lim")
+        if not res.get("error") and res.get("rows"):
+            try:
+                cap = float(res["rows"][0][0])
+            except (TypeError, ValueError, IndexError):
+                cap = None
+
+    if peak is None:
+        peak = now          # окна ещё нет — только что подняли мониторинг
+
     if peak is None or not cap:
-        return {"level": "unknown",
-                "note": "Метрик соединений нет — экспортёр не отдаёт их"}
+        missing = []
+        if peak is None:
+            missing.append("mysql_global_status_threads_connected")
+        if not cap:
+            missing.append("mysql_global_variables_max_connections")
+        return {
+            "level": "unknown",
+            "note": ("нет метрик %s по цели %s. Проверьте, что mysqld_exporter "
+                     "на этом сервере опрашивается Prometheus: "
+                     "curl -s %s/api/v1/query?query=%s"
+                     % (" и ".join(missing), inst, settings.prometheus.url,
+                        "mysql_up")),
+        }
+
+    before = one(peak_before)
+    # Неделя назад данных может не быть — тогда роста просто не знаем
+    per_day = ((peak - before) / 7.0) if before is not None else 0.0
     days = _days_left(cap - peak, per_day)
     return {"peak": int(peak), "limit": int(cap),
+            "now": int(now) if now is not None else None,
             "used_pct": round(peak / cap * 100, 1),
             "growth_per_day": round(per_day, 2),
+            "measured": before is not None,
             "days_left": days, "level": _level(days)}
 
 
@@ -224,10 +274,16 @@ def fmt_forecast(data: dict) -> str:
     if conn.get("level") == "unknown":
         lines.append("  Соединения: %s" % conn.get("note", "нет данных"))
     else:
-        tail = ("хватит на %.1f дн." % conn["days_left"]
-                if conn.get("days_left") is not None else "роста нет")
-        lines.append("  Соединения: пик %d из %d (%.1f%%), %s"
-                     % (conn["peak"], conn["limit"], conn["used_pct"], tail))
+        if conn.get("days_left") is not None:
+            tail = "хватит на %.1f дн." % conn["days_left"]
+        elif not conn.get("measured"):
+            tail = "истории за прошлую неделю нет, темп роста пока не известен"
+        else:
+            tail = "роста нет"
+        now_part = ("сейчас %d, " % conn["now"]) if conn.get("now") is not None else ""
+        lines.append("  Соединения: %sпик за неделю %d из %d (%.1f%%), %s"
+                     % (now_part, conn["peak"], conn["limit"],
+                        conn["used_pct"], tail))
 
     if data["auto_increment"]:
         lines.append("")
