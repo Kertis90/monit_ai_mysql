@@ -86,6 +86,21 @@ echo -e "  ${YELLOW}  echo '<user> ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/mys
 ask "SSH-пользователь" SSH_USER "${USER:-$(id -un)}"
 ask "SSH-порт" SSH_PORT "22"
 ask "Путь к SSH-ключу (Enter — ключ по умолчанию/агент)" SSH_KEY ""
+if [[ -n "${SSH_KEY:-}" ]]; then
+    if [[ ! -f "$SSH_KEY" ]]; then
+        echo -e "  ${YELLOW}! Файл ${SSH_KEY} не найден. Путь сохранён, но"
+        echo -e "    установка агента на нём остановится${NC}"
+    else
+        # Агент работает под служебной учёткой aiagent и ключ администратора
+        # с правами 600 прочитать не сможет. install_agent.sh сделает копию,
+        # но предупредить лучше сразу — здесь это ещё можно исправить.
+        echo -e "  ${GREEN}✓ Ключ найден${NC}"
+        if id aiagent &>/dev/null && ! sudo -u aiagent test -r "$SSH_KEY" 2>/dev/null; then
+            echo -e "  ${YELLOW}Учётке aiagent он недоступен — при установке"
+            echo -e "    будет сделана её собственная копия${NC}"
+        fi
+    fi
+fi
 
 echo ""
 echo -e "${CYAN}── 6. Python-репозиторий (pip) ───────────────────────${NC}"

@@ -266,6 +266,47 @@ id aiagent &>/dev/null || useradd -r -s /sbin/nologin aiagent
 chown -R aiagent:aiagent "${AGENT_DIR}"
 
 # =============================================================================
+log_section "Доступ по SSH"
+# =============================================================================
+# Агент работает под учёткой aiagent, а ключ обычно лежит в домашнем каталоге
+# администратора с правами 600. Прочитать его агент не сможет, и всё, что
+# ходит по SSH — логи, туннель к базе, проверка копий — молча перестанет
+# работать: в интерфейсе будет «сервер не отвечает», а причина невидима.
+if [[ -n "${SSH_USER:-}" ]]; then
+    log_info "Учётная запись для серверов БД: ${SSH_USER}, порт ${SSH_PORT:-22}"
+
+    if [[ -n "${SSH_KEY:-}" ]]; then
+        if [[ ! -f "$SSH_KEY" ]]; then
+            log_error "SSH-ключ не найден: ${SSH_KEY}"
+            log_error "Поправьте SSH_KEY в config.env либо оставьте его пустым"
+            exit 1
+        fi
+
+        AGENT_KEY="${AGENT_DIR}/.ssh/id_agent"
+        if sudo -u aiagent test -r "$SSH_KEY" 2>/dev/null; then
+            log_info "Ключ ${SSH_KEY} читается учёткой aiagent — оставляю как есть"
+        else
+            # Копия, а не chmod на оригинал: раздавать права на ключ
+            # администратора всем — плохая идея, а своя копия у агента
+            # закрыта и живёт вместе с ним
+            log_warn "Ключ ${SSH_KEY} недоступен учётке aiagent — делаю копию"
+            install -d -m 700 -o aiagent -g aiagent "${AGENT_DIR}/.ssh"
+            install -m 600 -o aiagent -g aiagent "$SSH_KEY" "$AGENT_KEY"
+            log_info "Копия ключа: ${AGENT_KEY} (только для aiagent)"
+            # В окружении агента подменяем путь на копию
+            sed -i "s|^SSH_KEY=.*|SSH_KEY=${AGENT_KEY}|" "${AGENT_DIR}/.env"
+        fi
+    else
+        log_info "Путь к ключу не задан — используется ключ по умолчанию"
+        log_warn "Учётка aiagent служебная и своего ~/.ssh не имеет."
+        log_warn "Если по SSH ничего не работает, укажите SSH_KEY в config.env"
+    fi
+else
+    log_warn "SSH_USER не задан: чтение логов, туннель к базе и проверка"
+    log_warn "резервных копий работать не будут. Заполните ./configure.sh"
+fi
+
+# =============================================================================
 log_section "Systemd-сервис"
 # =============================================================================
 cat > /etc/systemd/system/ai-alert-agent.service << EOF
@@ -278,6 +319,9 @@ User=aiagent
 Group=aiagent
 WorkingDirectory=${AGENT_DIR}
 EnvironmentFile=${AGENT_DIR}/.env
+# ssh ищет настройки в домашнем каталоге, а у служебной учётки его нет:
+# без HOME он ругается на "No such file or directory" ещё до подключения
+Environment=HOME=${AGENT_DIR}
 ExecStart=${AGENT_DIR}/venv/bin/python -m agent.main
 Restart=always
 RestartSec=3s

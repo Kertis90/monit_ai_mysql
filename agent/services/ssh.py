@@ -10,12 +10,36 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
+import os
 import shlex
 from typing import Optional
 
 from agent.core.config import settings
 
 logger = logging.getLogger("agent.ssh")
+
+
+def access_problem() -> str:
+    """Что мешает ходить по SSH. Пусто — всё в порядке.
+
+    Проверяется до подключения: иначе недоступный агенту ключ выглядит как
+    «сервер не отвечает», и чинить идут не туда. Учётка агента служебная,
+    ключ администратора с правами 600 она не прочитает — install_agent.sh
+    делает копию, но конфиг могли поправить руками уже после установки.
+    """
+    if not settings.ssh.user:
+        return ("Не задана учётка для SSH: заполните SSH_USER в config.env "
+                "и переустановите агента.")
+    key = settings.ssh.key
+    if not key:
+        return ""
+    if not os.path.exists(key):
+        return "SSH-ключ не найден: %s. Проверьте SSH_KEY в config.env." % key
+    if not os.access(key, os.R_OK):
+        return ("SSH-ключ %s недоступен учётке, под которой работает агент. "
+                "Переустановите агента — он сделает читаемую копию, либо "
+                "положите ключ туда, куда у него есть доступ." % key)
+    return ""
 
 LOG_SSH_USER    = settings.ssh.user
 LOG_SSH_PORT    = settings.ssh.port
@@ -34,9 +58,9 @@ async def log_ssh(host: str, remote_cmd: str, ok_codes: tuple = (0, 1),
     env — переменные для удалённой команды. Через них передаётся пароль
     (MYSQL_PWD): в аргументах командной строки он был бы виден всем в ps.
     """
-    if not LOG_SSH_USER:
-        return False, ("Не задан SSH_USER — чтение логов недоступно. "
-                       "Заполните его в config.env и переустановите агента.")
+    problem = access_problem()
+    if problem:
+        return False, problem
     argv = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=" + str(LOG_SSH_TIMEOUT),
             "-p", str(LOG_SSH_PORT)]

@@ -247,6 +247,7 @@ def application() -> None:
         gui_endpoints(c)
         foresight(c)
         knowledge(c)
+        ssh_access(c)
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -534,6 +535,34 @@ def knowledge(client) -> None:
     except ImportError:
         check("YAML не проверен (нет PyYAML)", True, True)
     os.remove(out)
+
+
+def ssh_access(client) -> None:
+    """Учётка и ключ для серверов: причина должна называться до подключения."""
+    from agent.core.config import settings
+    from agent.services.ssh import access_problem
+
+    user, key = settings.ssh.user, settings.ssh.key
+    try:
+        settings.ssh.user, settings.ssh.key = "monitor", ""
+        check("учётка задана, ключ по умолчанию", access_problem(), "")
+
+        settings.ssh.key = os.path.join(tempfile.gettempdir(), "нет-такого-ключа")
+        check("отсутствующий ключ назван прямо",
+              "не найден" in access_problem(), True)
+
+        real = os.path.join(tempfile.gettempdir(), "agent_test_key")
+        with open(real, "w", encoding="utf-8") as f:
+            f.write("не настоящий ключ")
+        settings.ssh.key = real
+        check("читаемый ключ претензий не вызывает", access_problem(), "")
+        os.remove(real)
+
+        settings.ssh.user = ""
+        check("без учётки сказано, что заполнить",
+              "SSH_USER" in access_problem(), True)
+    finally:
+        settings.ssh.user, settings.ssh.key = user, key
 
 
 def websocket(client) -> None:

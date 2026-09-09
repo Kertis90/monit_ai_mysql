@@ -72,9 +72,18 @@ async def check_llm() -> dict:
 async def check_ssh() -> list[dict]:
     """SSH до каждого сервера: логи и туннель к базе держатся на нём."""
     out = []
-    if not settings.ssh.user:
-        return [_item("SSH", False, "SSH_USER не задан",
-                      "Заполните SSH_USER в config.env и переустановите агента")]
+    from agent.services.ssh import access_problem
+    problem = access_problem()
+    if problem:
+        # Ключ и учётка проверяются до подключения: недоступный агенту ключ
+        # иначе выглядит как недоступный сервер
+        return [_item("SSH", False, problem,
+                      "Поправьте SSH_USER и SSH_KEY в config.env, затем "
+                      "sudo ./scripts/install_agent.sh")]
+    if settings.ssh.key:
+        out_note = "ключ %s" % settings.ssh.key
+    else:
+        out_note = "ключ по умолчанию"
     seen = set()
     for cluster in enabled_clusters():
         hosts = [(ip, role) for ip, role in cluster_hosts(cluster)]
@@ -86,7 +95,8 @@ async def check_ssh() -> list[dict]:
             moment = await remote_time(ip)
             out.append(_item(
                 "SSH %s (%s)" % (ip, role), moment is not None,
-                "Отвечает" if moment else "Не отвечает под учёткой " + settings.ssh.user,
+                ("Отвечает (%s, %s)" % (settings.ssh.user, out_note)) if moment
+                else "Не отвечает под учёткой " + settings.ssh.user,
                 "" if moment else
                 "ssh %s@%s — проверьте ключ и доступ" % (settings.ssh.user, ip)))
     return out
