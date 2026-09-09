@@ -1571,6 +1571,26 @@ const App = (() => {
             на что нет порога.</div>
         </div>
         <div class="card">
+          <h4>Лишние индексы
+            <button class="ghost-btn lazy" onclick="App.loadIndexes()">Найти</button></h4>
+          <div id="cluster-indexes" class="muted small">
+            Дублирующие и избыточные: индекс по (a) не нужен, когда есть
+            (a, b), — он занимает место и обновляется при каждой вставке.</div>
+        </div>
+        <div class="card">
+          <h4>Изменения настроек
+            <button class="ghost-btn lazy" onclick="App.loadConfigChanges()">Показать</button></h4>
+          <div id="cluster-changes" class="muted small">
+            Что менялось за месяц и когда — первое, что нужно при внезапной
+            деградации.</div>
+        </div>
+        <div class="card">
+          <h4>Резервные копии
+            <button class="ghost-btn lazy" onclick="App.loadBackups()">Проверить</button></h4>
+          <div id="cluster-backups" class="muted small">
+            Возраст и размер последней копии на серверах кластера.</div>
+        </div>
+        <div class="card">
           <h4>Можно ли трогать
             <span>
               <button class="ghost-btn lazy" onclick="App.loadReadiness('restart')">Перезапуск</button>
@@ -1599,6 +1619,7 @@ const App = (() => {
       if (ch.charts && ch.charts.length) {
         attachCharts($('cluster-charts'), ch.charts);
       }
+      loadNotes();
     } catch (e) {
       box.innerHTML = '<div class="muted">Не удалось собрать данные: ' + esc(e) + '</div>';
     }
@@ -1623,6 +1644,63 @@ const App = (() => {
 
   const loadReplication = () => lazyBlock('cluster-repl',
     'api/replication/' + encodeURIComponent(state.clusterName), 'Читаю состояние…');
+
+  const loadIndexes = () => lazyBlock('cluster-indexes',
+    'api/indexes/' + encodeURIComponent(state.clusterName), 'Читаю схему…');
+
+  const loadConfigChanges = () => lazyBlock('cluster-changes',
+    'api/config-changes/' + encodeURIComponent(state.clusterName) + '?days=30',
+    'Сравниваю снимки…');
+
+  const loadBackups = () => lazyBlock('cluster-backups',
+    'api/backups/' + encodeURIComponent(state.clusterName), 'Смотрю каталог копий…');
+
+  async function loadNotes() {
+    const card = $('notes-card');
+    const box  = $('notes-list');
+    if (!card || !state.clusterName) return;
+    card.hidden = false;
+    try {
+      const d = await fetch('api/notes/' + encodeURIComponent(state.clusterName))
+                      .then(r => r.json());
+      box.innerHTML = d.items.length
+        ? d.items.map(n => `
+            <div class="alert-item" style="display:flex;gap:10px;align-items:baseline">
+              <div style="flex:1${n.enabled ? '' : ';opacity:.5'}">
+                <div>${esc(n.text)}</div>
+                <div class="muted" style="font-size:11px">
+                  ${esc(n.author || '—')} · ${esc(String(n.ts).slice(0, 10))}
+                  ${n.enabled ? '' : ' · выключена'}</div>
+              </div>
+              <button class="ghost-btn" onclick="App.toggleNote(${n.id}, ${!n.enabled})">
+                ${n.enabled ? 'Выключить' : 'Включить'}</button>
+              <button class="ghost-btn" onclick="App.deleteNote(${n.id})">✕</button>
+            </div>`).join('')
+        : '<div class="muted small">Заметок нет.</div>';
+    } catch (e) {
+      box.innerHTML = '<div class="muted small">Не удалось загрузить: ' + esc(e) + '</div>';
+    }
+  }
+
+  async function addNote() {
+    const text = prompt('Что агенту стоит знать про этот кластер?');
+    if (!text || !text.trim()) return;
+    await fetch('api/notes/' + encodeURIComponent(state.clusterName) +
+                '?text=' + encodeURIComponent(text.trim()), { method: 'POST' });
+    await loadNotes();
+  }
+
+  async function toggleNote(id, enabled) {
+    await fetch('api/notes/' + id + '?enabled=' + (enabled ? 'true' : 'false'),
+                { method: 'PATCH' });
+    await loadNotes();
+  }
+
+  async function deleteNote(id) {
+    if (!confirm('Удалить заметку?')) return;
+    await fetch('api/notes/' + id, { method: 'DELETE' });
+    await loadNotes();
+  }
 
   const loadForecast = () => lazyBlock('cluster-forecast',
     'api/forecast/' + encodeURIComponent(state.clusterName), 'Считаю запас…');
@@ -1976,7 +2054,8 @@ const App = (() => {
            loadReplication, loadDiag, askAboutCluster, analyzeAlert,
            similarIncidents, loadLogs, runSql, useTemplate, runSearch,
            loadForecast, loadConfigAudit, loadGrowth, loadAnomalies,
-           loadReadiness, loadHealth,
+           loadReadiness, loadHealth, loadIndexes, loadConfigChanges,
+           loadBackups, addNote, toggleNote, deleteNote,
            grantManual, revokeAccess, deleteAlert, deleteAlertsByName,
            resolveAlert,
            stopGeneration };

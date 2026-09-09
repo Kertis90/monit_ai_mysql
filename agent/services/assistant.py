@@ -38,6 +38,8 @@ from agent.services.logs import detect_log_intent, read_app_log, read_slow_log
 from agent.services.mysql import (cluster_db_creds, fmt_sql_result, sql_execute)
 from agent.services.prometheus import (build_charts, collect_current,
                                        collect_history)
+from agent.db.repositories.notes import NoteRepository
+from agent.services import config_history
 from agent.services.replication import collect_replication, fmt_replication
 from agent.services.workload import fmt_workload, workload_delta
 from agent.services.registry import (app_host, cluster_hosts,
@@ -50,6 +52,26 @@ logger = logging.getLogger("agent.assistant")
 LOG_SSH_USER = settings.ssh.user
 SERIES_MAX_ROWS = settings.prometheus.series_max_rows
 ALERTS_RETENTION_DAYS = settings.db.alerts_retention_days
+
+
+async def cluster_notes(cluster_name: str) -> str:
+    """Известные особенности кластера — их дежурный знает, а агент нет.
+
+    Без них он в каждом разборе заново «открывает» плановые вещи: всплеск в
+    три часа ночи, растущую по расписанию таблицу, привычный для этого железа
+    iowait — и предлагает с ними разобраться.
+    """
+    async with session_scope() as session:
+        rows = await NoteRepository(session).list(cluster_name, only_enabled=True)
+    if not rows:
+        return ""
+    lines = ["## Известные особенности кластера", "",
+             "  Это записали люди, которые его обслуживают. Учитывай при "
+             "разборе и не предлагай разбираться с тем, что здесь названо "
+             "нормой.", ""]
+    for note in rows:
+        lines.append("  - " + " ".join(note.text.split()))
+    return "\n".join(lines)
 
 
 async def recent_alerts(cluster: Optional[str] = None, hours: float = 24,
@@ -321,6 +343,10 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
             f"  Обязательно предупреди об этом в ответе.")
 
     if cluster:
+        notes = await cluster_notes(cluster["name"])
+        if notes:
+            blocks.append(notes)
+
         if hours > 0:
             hist = await collect_history(cluster, hours)
             blocks.append(fmt_history(hist, cluster["label"]))
@@ -403,10 +429,14 @@ async def build_chat_context(user_message: str) -> tuple[str, Optional[dict], fl
                 logger.error(f"EXPLAIN не выполнен: {e}")
                 gaps.append("не получены планы выполнения (EXPLAIN): %s" % e)
 
-            # Лента событий: причинно-следственную связь видно сразу
-            tl = build_timeline(await recent_alerts(
-                cluster=cluster["name"], hours=hours if hours > 0 else 24,
-                limit=40))
+            # Лента событий: причинно-следственную связь видно сразу.
+            # Изменения настроек идут туда же — «что вчера поменяли» самый
+            # частый вопрос при внезапной деградации.
+            changed = await config_history.changes(cluster["name"], days=14)
+            tl = build_timeline(
+                await recent_alerts(cluster=cluster["name"],
+                                    hours=hours if hours > 0 else 24, limit=40),
+                config_history.as_events(changed[:15]))
             if tl:
                 blocks.append(tl)
 

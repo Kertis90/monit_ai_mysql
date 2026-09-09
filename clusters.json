@@ -19,7 +19,10 @@
     "enabled": "true/false — включить/отключить мониторинг",
     "tags": "произвольные метки для группировки",
     "replica_slow_log_path": "путь к slow-логу на replica, если отличается. Пусто = как на primary",
-    "replica_slow_log_archive_dir": "каталог архивов slow-лога на replica, если отличается"
+    "replica_slow_log_archive_dir": "каталог архивов slow-лога на replica, если отличается",
+    "backup_dir": "каталог с резервными копиями БД на серверах (проверяется возраст и размер последней). Пусто = не проверять",
+    "backup_pattern": "маска файлов копий, по умолчанию *.gz",
+    "backup_max_age_hours": "тревожить, если копия старше стольких часов (по умолчанию 26)"
   },
   "clusters": [
     {
@@ -38,6 +41,8 @@
       "replica_slow_log_path": "",
       "app_log_dirs": "/var/log/billing,/var/log/billing/archive_logs",
       "app_log_pattern": "*.log*",
+      "backup_dir": "",
+      "backup_pattern": "*.gz",
       "enabled": true,
       "tags": [
         "siberia",
@@ -60,6 +65,8 @@
       "replica_slow_log_path": "",
       "app_log_dirs": "/var/log/billing,/var/log/billing/archive_logs",
       "app_log_pattern": "*.log*",
+      "backup_dir": "",
+      "backup_pattern": "*.gz",
       "enabled": true,
       "tags": [
         "siberia",

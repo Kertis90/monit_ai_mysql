@@ -412,6 +412,16 @@ EOF
         log_warn "gen_replication_rules.py не найден — правила лага реплик не обновлены"
     fi
 
+    # ── Правила прогноза: место и соединения кончатся через N дней ───────────
+    # Прогноз, который видит только открывший вкладку, до дежурного не доходит.
+    # Правило идёт обычным путём — Alertmanager, почта, смена.
+    FGEN="${SCRIPT_DIR}/scripts/gen_forecast_rules.py"
+    if [[ -f "$FGEN" ]]; then
+        python3 "$FGEN" "$REGISTRY" "${RULES_DIR}/forecast.yml"
+    else
+        log_warn "gen_forecast_rules.py не найден — правила прогноза не обновлены"
+    fi
+
     # Перезагрузить Prometheus без рестарта
     if systemctl is-active prometheus &>/dev/null; then
         PROM_RELOAD="http://localhost:9090"

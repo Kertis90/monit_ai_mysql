@@ -246,6 +246,7 @@ def application() -> None:
         threads(c)
         gui_endpoints(c)
         foresight(c)
+        knowledge(c)
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -454,6 +455,85 @@ def foresight(client) -> None:
     deep = client.get("/health/deep").json()
     check("самопроверка отвечает", isinstance(deep.get("checks"), list), True)
     check("самопроверка видит проблемы", deep["ok"], False)
+
+
+def knowledge(client) -> None:
+    """Заметки, история настроек, лишние индексы, копии, правила прогноза."""
+    import json as _json
+    import subprocess
+    import sys as _sys
+
+    from agent.services import indexes
+
+    # ── Заметки: подмешиваются в разбор, поэтому важно, что они хранятся ────
+    made = client.post("/api/notes/kemerovo?text=Всплеск в 3:00 — это бэкап")
+    check("заметка добавлена", made.status_code, 200)
+    listed = client.get("/api/notes/kemerovo").json()["items"]
+    check("заметка в списке", any("бэкап" in n["text"] for n in listed), True)
+    note_id = listed[0]["id"]
+    client.patch("/api/notes/%d?enabled=false" % note_id)
+    check("заметка выключается",
+          client.get("/api/notes/kemerovo").json()["items"][0]["enabled"], False)
+    check("пустая заметка отклоняется",
+          client.post("/api/notes/kemerovo?text=   ").status_code, 400)
+    check("заметка удаляется",
+          client.delete("/api/notes/%d" % note_id).status_code, 200)
+    check("несуществующая заметка",
+          client.delete("/api/notes/%d" % note_id).status_code, 404)
+
+    # ── Лишние индексы: разбор схемы без обращения к данным ────────────────
+    rows = []
+    def idx(tbl, name, cols, unique=False):
+        for i, col in enumerate(cols, 1):
+            rows.append({"db": "billing", "tbl": tbl, "idx": name, "pos": i,
+                         "col": col, "non_unique": "0" if unique else "1",
+                         "cardinality": 10})
+    idx("vgroups", "PRIMARY", ["id"], unique=True)
+    idx("vgroups", "ix_agrm", ["agrm_id"])
+    idx("vgroups", "ix_agrm_date", ["agrm_id", "created"])
+    idx("vgroups", "ix_copy", ["agrm_id", "created"])
+    idx("payments", "ix_uniq", ["ext_id"], unique=True)
+    idx("payments", "ix_ext_date", ["ext_id", "paid_at"])
+    idx("logs", "ix_ts", ["ts"])
+
+    tables = indexes.build(rows)
+    found = indexes.find_duplicates(tables) + indexes.find_redundant(tables)
+    names = {i["index"] for i in found}
+    check("дубликат индекса найден", "ix_copy" in names, True)
+    check("префиксный индекс найден", "ix_agrm" in names, True)
+    check("уникальный не трогаем", "ix_uniq" not in names, True)
+    check("первичный ключ не трогаем", "PRIMARY" not in names, True)
+    check("одиночный индекс не лишний", "ix_ts" not in names, True)
+    check("готовая команда удаления",
+          all("DROP INDEX" in indexes.fmt_indexes(
+              {"host": "h", "tables": 3, "indexes": 7, "items": found})
+              for _ in [0]), True)
+
+    # ── Методы отвечают даже без доступной базы ────────────────────────────
+    for path in ("api/indexes/kemerovo", "api/backups/kemerovo",
+                 "api/config-changes/kemerovo?days=30"):
+        check("отвечает /" + path.split("?")[0],
+              client.get("/" + path).status_code, 200)
+    check("копии не настроены — сказано прямо",
+          client.get("/api/backups/kemerovo").json().get("configured"), False)
+
+    # ── Правила прогноза для Prometheus ────────────────────────────────────
+    out = os.path.join(tempfile.gettempdir(), "forecast_test.yml")
+    code = subprocess.run([_sys.executable, str(ROOT / "scripts" / "gen_forecast_rules.py"),
+                           os.environ["REGISTRY_PATH"], out],
+                          capture_output=True, text=True).returncode
+    check("генератор правил отработал", code, 0)
+    body = open(out, encoding="utf-8").read()
+    check("правило по дискам есть", "DiskWillFillIn3Days" in body, True)
+    check("правило по соединениям есть", "ConnectionsWillHitLimit" in body, True)
+    check("экстраполяция, а не порог", "predict_linear" in body, True)
+    try:
+        import yaml
+        parsed = yaml.safe_load(body)
+        check("YAML разбирается", len(parsed["groups"][0]["rules"]), 3)
+    except ImportError:
+        check("YAML не проверен (нет PyYAML)", True, True)
+    os.remove(out)
 
 
 def websocket(client) -> None:

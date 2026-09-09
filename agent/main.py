@@ -35,8 +35,8 @@ from agent.db.base import dispose, init_models, session_scope      # noqa: E402
 from agent.db.repositories.alerts import AlertRepository           # noqa: E402
 from agent.db.repositories.audit import AuditRepository            # noqa: E402
 from agent.db.repositories.chats import ChatRepository             # noqa: E402
-from agent.services import (access, anomaly, digest,               # noqa: E402
-                            followup, growth, selfcheck)
+from agent.services import (access, anomaly, config_history,       # noqa: E402
+                            digest, followup, growth, selfcheck)
 from agent.services.mysql import refresh_db_versions               # noqa: E402
 
 # Пути, доступные без входа. Всё остальное закрыто: забыть добавить проверку
@@ -69,6 +69,7 @@ async def lifespan(app: FastAPI):
         await ChatRepository(session).purge_old()
         await AuditRepository(session).purge_old()
     await growth.purge_old()
+    await config_history.purge_old()
 
     # Версии СУБД спрашиваем на старте: без них модель советует синтаксис
     # наугад — у 5.7 и 8.0 разные имена таблиц performance_schema.
@@ -85,6 +86,7 @@ async def lifespan(app: FastAPI):
     if selfcheck.ENABLED:
         background.append(asyncio.create_task(selfcheck.scheduler()))
     background.append(asyncio.create_task(growth.scheduler()))
+    background.append(asyncio.create_task(config_history.scheduler()))
 
     yield
 

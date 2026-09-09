@@ -7,8 +7,11 @@ import logging
 
 from fastapi import APIRouter, HTTPException, Request
 
-from agent.api.deps import AdminUser, Audit, CurrentUser, MaybeUser
-from agent.services import (anomaly, audit, config_audit, forecast, growth,
+from agent.api.deps import (AdminUser, Audit, CurrentUser, DbSession,
+                            MaybeUser)
+from agent.db.repositories.notes import NoteRepository
+from agent.services import (anomaly, audit, backups, config_audit,
+                            config_history, forecast, growth, indexes,
                             readiness)
 from agent.schemas.api import SqlRequest, SqlResult
 from agent.services.analysis import (DIAG_QUERIES, collect_series_table,
@@ -243,3 +246,84 @@ async def readiness_one(name: str, user: CurrentUser, action: str = "restart",
     data = await readiness.check(_need(name), action, host or None)
     data["text"] = readiness.fmt_readiness(data)
     return data
+
+
+@router.get("/api/indexes/{name}", tags=["Диагностика"],
+            summary="Дублирующие и избыточные индексы")
+async def indexes_one(name: str, user: CurrentUser, host: str = ""):
+    """Индекс по (a) не нужен, когда есть (a, b): он занимает место и
+    обновляется при каждой вставке. Глазами в схеме такое не найти."""
+    data = await indexes.analyse(_need(name), host or None)
+    data["text"] = indexes.fmt_indexes(data)
+    return data
+
+
+@router.get("/api/backups/{name}", tags=["Диагностика"],
+            summary="Снимаются ли копии баз")
+async def backups_one(name: str, user: CurrentUser):
+    cluster = _need(name)
+    data = await backups.check(cluster)
+    data["text"] = backups.fmt_backups(data, cluster["label"])
+    return data
+
+
+@router.get("/api/config-changes/{name}", tags=["Диагностика"],
+            summary="Что менялось в настройках и когда")
+async def config_changes_one(name: str, user: CurrentUser, days: int = 30):
+    cluster = _need(name)
+    items = await config_history.changes(name, max(1, min(days, 180)))
+    return {"cluster": name, "days": days, "items": items,
+            "text": config_history.fmt_changes(items, cluster["label"], days)}
+
+
+@router.post("/api/config-changes/{name}/snapshot", tags=["Диагностика"],
+             summary="Снять снимок настроек немедленно")
+async def config_snapshot_now(name: str, admin: AdminUser):
+    """Первый снимок нужен сразу: иначе сравнивать будет не с чем сутки."""
+    return {"cluster": name, "values": await config_history.snapshot(_need(name))}
+
+
+@router.get("/api/notes/{name}", tags=["Кластеры"],
+            summary="Известные особенности кластера")
+async def notes_list(name: str, user: CurrentUser, session: DbSession):
+    _need(name)
+    rows = await NoteRepository(session).list(name)
+    return {"cluster": name,
+            "items": [{"id": n.id, "text": n.text, "author": n.author,
+                       "ts": n.ts, "enabled": bool(n.enabled)} for n in rows]}
+
+
+@router.post("/api/notes/{name}", tags=["Кластеры"], summary="Добавить заметку")
+async def notes_add(name: str, admin: AdminUser, session: DbSession,
+                    journal: Audit, request: Request, text: str = ""):
+    """Заметки подмешиваются в разбор: записанное один раз избавляет от
+    повторных «открытий» планового бэкапа в каждом ответе."""
+    _need(name)
+    note = await NoteRepository(session).add(name, text,
+                                             admin.get("username", ""))
+    if note is None:
+        raise HTTPException(status_code=400, detail="Пустая заметка")
+    await journal.add(action="заметка добавлена", username=admin.get("username", ""),
+                      target=name, detail=note.text[:500],
+                      ip=audit.client_ip(request))
+    return {"id": note.id, "text": note.text}
+
+
+@router.patch("/api/notes/{note_id}", tags=["Кластеры"],
+              summary="Включить или выключить заметку")
+async def notes_toggle(note_id: int, admin: AdminUser, session: DbSession,
+                       enabled: bool = True):
+    if not await NoteRepository(session).toggle(note_id, enabled):
+        raise HTTPException(status_code=404, detail="Заметка не найдена")
+    return {"id": note_id, "enabled": enabled}
+
+
+@router.delete("/api/notes/{note_id}", tags=["Кластеры"],
+               summary="Удалить заметку")
+async def notes_delete(note_id: int, admin: AdminUser, session: DbSession,
+                       journal: Audit, request: Request):
+    if not await NoteRepository(session).delete(note_id):
+        raise HTTPException(status_code=404, detail="Заметка не найдена")
+    await journal.add(action="заметка удалена", username=admin.get("username", ""),
+                      target=str(note_id), ip=audit.client_ip(request))
+    return {"id": note_id}

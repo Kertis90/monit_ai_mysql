@@ -235,3 +235,52 @@ class TableSize(Base):
     has_pk:      Mapped[int] = mapped_column(Integer, nullable=False, default=1)
 
     __table_args__ = (Index("idx_sizes_cluster_ts", "cluster", "ts"),)
+
+
+class ClusterNote(Base):
+    """Известная особенность кластера.
+
+    То, что знает дежурный, но не знает агент: всплеск в три часа ночи — это
+    бэкап, таблица растёт из-за выгрузки и чистится по субботам, на этом
+    железе iowait 20% — норма. Без таких заметок агент в каждом разборе заново
+    «открывает» плановые вещи и предлагает с ними разобраться.
+
+    Заметки подмешиваются в контекст разбора, поэтому пишутся человеческим
+    языком, а не кодом.
+    """
+    __tablename__ = "cluster_notes"
+
+    id:      Mapped[int] = mapped_column(Integer, primary_key=True,
+                                         autoincrement=True)
+    cluster: Mapped[str] = mapped_column(String(NAME_LEN), nullable=False)
+    text:    Mapped[str] = mapped_column(Text, nullable=False)
+    author:  Mapped[Optional[str]] = mapped_column(String(NAME_LEN))
+    ts:      Mapped[str] = mapped_column(String(TS_LEN), nullable=False)
+    # Выключенная заметка не удаляется: часто это «пока не актуально»
+    enabled: Mapped[int] = mapped_column(Integer, nullable=False,
+                                         default=1, server_default="1")
+
+    __table_args__ = (Index("idx_notes_cluster", "cluster"),)
+
+
+class ConfigSnapshot(Base):
+    """Снимок переменной MySQL.
+
+    Самый частый вопрос при аварии — «что вчера поменяли». Настройки
+    сравниваются между узлами и разбираются на разумность, но во времени до
+    сих пор не отслеживались.
+
+    Храним по строке на переменную: так диф между снимками считается запросом,
+    а не разбором JSON.
+    """
+    __tablename__ = "config_snapshots"
+
+    id:      Mapped[int] = mapped_column(Integer, primary_key=True,
+                                         autoincrement=True)
+    ts:      Mapped[str] = mapped_column(String(TS_LEN), nullable=False)
+    cluster: Mapped[str] = mapped_column(String(NAME_LEN), nullable=False)
+    host:    Mapped[str] = mapped_column(String(LABEL_LEN), nullable=False)
+    name:    Mapped[str] = mapped_column(String(NAME_LEN), nullable=False)
+    value:   Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    __table_args__ = (Index("idx_config_cluster_ts", "cluster", "ts"),)

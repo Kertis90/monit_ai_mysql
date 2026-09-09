@@ -132,6 +132,16 @@
         </div>
       </div>
       <div id="cluster-body"><div class="muted">Выберите кластер слева.</div></div>
+      <div class="card" id="notes-card" hidden>
+        <h4>Известные особенности
+          <button class="ghost-btn lazy" onclick="App.addNote()">+ Заметка</button></h4>
+        <p class="muted small" style="margin:0 0 8px">
+          То, что знаете вы, но не знает агент: «всплеск в 3:00 — бэкап»,
+          «эта таблица чистится по субботам», «iowait 20% для этого железа
+          нормален». Подмешивается в каждый разбор кластера.
+        </p>
+        <div id="notes-list"></div>
+      </div>
     </section>
 
     <!-- ── ЛОГИ ── -->
