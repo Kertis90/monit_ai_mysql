@@ -248,6 +248,7 @@ def application() -> None:
         foresight(c)
         knowledge(c)
         ssh_access(c)
+        background_answer(c)
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -563,6 +564,88 @@ def ssh_access(client) -> None:
               "SSH_USER" in access_problem(), True)
     finally:
         settings.ssh.user, settings.ssh.key = user, key
+
+
+def background_answer(client) -> None:
+    """Ответ переживает закрытие вкладки.
+
+    Раньше генерация шла в обработчике сокета: обновил страницу — и разбор,
+    на который агент потратил сбор метрик, пропадал целиком.
+    """
+    import time
+
+    from agent.api.routes import chat as chat_routes
+    from agent.services import jobs
+
+    slow = {"go": False}
+
+    async def fake_ctx(text):
+        return "", None, 0
+
+    async def fake_stream(messages):
+        # Первый кусок сразу, остальное — после «перезагрузки страницы»
+        yield "начало "
+        for _ in range(50):
+            if slow["go"]:
+                break
+            await asyncio.sleep(0.05)
+        yield "и конец"
+
+    async def no_tools():
+        return False
+
+    original = (chat_routes.build_chat_context, chat_routes.llm_stream,
+                chat_routes.llm_probe_tools)
+    chat_routes.build_chat_context = fake_ctx
+    chat_routes.llm_stream = fake_stream
+    chat_routes.llm_probe_tools = no_tools
+    try:
+        thread = client.post("/chat/threads?title=Фоновый").json()["id"]
+
+        # Спросили и оборвали соединение, не дождавшись ответа
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({"type": "message", "text": "долгий вопрос",
+                          "client_id": "web-1", "thread_id": thread})
+            kinds = []
+            for _ in range(4):
+                kinds.append(ws.receive_json().get("type"))
+                if "token" in kinds:
+                    break
+            check("ответ начал приходить", "token" in kinds, True)
+
+        check("задача пережила разрыв", jobs.running(thread) is not None, True)
+        check("вопрос сохранён до ответа",
+              client.get("/chat/history?thread=%s" % thread).json()["total"], 1)
+
+        # Вернулись — должны получить накопленное и продолжение
+        slow["go"] = True
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({"type": "attach", "thread_id": thread,
+                          "client_id": "web-1"})
+            seen, answer = [], ""
+            for _ in range(12):
+                msg = ws.receive_json()
+                seen.append(msg.get("type"))
+                if msg.get("type") == "token":
+                    answer += msg.get("text", "")
+                if msg.get("type") == "done":
+                    break
+            check("возврат к ответу распознан", "resume" in seen, True)
+            check("накопленное не потеряно", answer.startswith("начало"), True)
+            check("ответ дописан до конца", answer.endswith("и конец"), True)
+
+        for _ in range(20):
+            if client.get("/chat/history?thread=%s" % thread).json()["total"] >= 2:
+                break
+            time.sleep(0.1)
+        saved = client.get("/chat/history?thread=%s" % thread).json()
+        check("ответ сохранён в историю", saved["total"], 2)
+
+        # Завершённая задача не должна мешать следующему вопросу
+        check("разговор снова свободен", jobs.running(thread) is None, True)
+    finally:
+        (chat_routes.build_chat_context, chat_routes.llm_stream,
+         chat_routes.llm_probe_tools) = original
 
 
 def websocket(client) -> None:

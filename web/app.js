@@ -132,6 +132,15 @@ const App = (() => {
     setChatTitle(active ? threadTitle(active) : 'Новый чат');
   }
 
+  function inlineNote(text) {
+    const div = document.createElement('div');
+    div.className = 'muted';
+    div.style.cssText = 'text-align:center;padding:6px 0;font-size:12px';
+    div.textContent = '— ' + text + ' —';
+    $('messages').appendChild(div);
+    scrollToBottom();
+  }
+
   function setChatTitle(text) {
     const el = $('chat-title');
     if (el) el.textContent = text;
@@ -218,6 +227,11 @@ const App = (() => {
     $('messages').innerHTML = '';
     await restoreHistory();
     renderThreads();
+    // В этом разговоре ответ может считаться прямо сейчас
+    if (state.wsReady) {
+      state.ws.send(JSON.stringify({ type: 'attach', thread_id: id,
+                                     client_id: state.clientId }));
+    }
   }
 
   async function newThread() {
@@ -334,6 +348,12 @@ const App = (() => {
       state.wsReady     = true;
       state.reconnectMs = 1000;
       setConnState('online');
+      // Ответ мог считаться, пока страница перезагружалась: просим сервер
+      // подключить нас обратно к нему
+      if (state.threadId) {
+        ws.send(JSON.stringify({ type: 'attach', thread_id: state.threadId,
+                                 client_id: state.clientId }));
+      }
       // keepalive ping каждые 25с
       clearInterval(state.pingTimer);
       state.pingTimer = setInterval(() => {
@@ -367,6 +387,23 @@ const App = (() => {
     switch (msg.type) {
       case 'pong':
         break;
+
+      case 'resume': {
+        // Вопрос уже виден: он сохраняется в историю до начала генерации.
+        // Остаётся показать, что ответ ещё пишется, и достроить его.
+        if (state.awaitingReply) break;
+        inlineNote('Ответ продолжает готовиться — вы вернулись к нему.');
+        const el = addMsg('assistant', '', 'AI Agent');
+        el.innerHTML = '<span class="thinking"><i></i><i></i><i></i></span>';
+        state.streamingEl   = el;
+        state.streamBuf     = '';
+        state.lastQuestion  = msg.question || '';
+        state.awaitingReply = true;
+        $('input').disabled = true;
+        $('send-btn').style.display = 'none';
+        $('stop-btn').style.display = '';
+        break;
+      }
 
       case 'tools':
         // Показываем, чем агент пользовался: видно, на чём основан ответ
@@ -547,7 +584,10 @@ const App = (() => {
   function stopGeneration() {
     if (!state.awaitingReply) return;
     // Сервер прервёт стрим и пришлёт done — там же снимем блокировку ввода
-    if (state.wsReady) state.ws.send(JSON.stringify({ type: 'stop' }));
+    if (state.wsReady) {
+      state.ws.send(JSON.stringify({ type: 'stop',
+                                     thread_id: state.threadId }));
+    }
     $('stop-btn').disabled = true;
   }
 

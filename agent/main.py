@@ -36,7 +36,7 @@ from agent.db.repositories.alerts import AlertRepository           # noqa: E402
 from agent.db.repositories.audit import AuditRepository            # noqa: E402
 from agent.db.repositories.chats import ChatRepository             # noqa: E402
 from agent.services import (access, anomaly, config_history,       # noqa: E402
-                            digest, followup, growth, selfcheck)
+                            digest, followup, growth, jobs, selfcheck)
 from agent.services.mysql import refresh_db_versions               # noqa: E402
 
 # Пути, доступные без входа. Всё остальное закрыто: забыть добавить проверку
@@ -98,6 +98,9 @@ async def lifespan(app: FastAPI):
         except (asyncio.CancelledError, Exception):
             pass
     await followup.shutdown()
+    # Незавершённые ответы: пережить остановку агента они всё равно
+    # не могут, а висящие задачи задержали бы её
+    await jobs.shutdown()
 
     # Задачу надо снять явно: недоступный сервер БД держит её в таймауте
     # подключения, и без отмены остановка ждёт её завершения

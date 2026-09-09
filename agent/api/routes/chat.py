@@ -20,7 +20,7 @@ from agent.db.base import session_scope
 from agent.db.repositories.chats import ChatRepository, FeedbackRepository
 from agent.db.repositories.users import normalize
 from agent.schemas.api import ChatRequest, FeedbackRequest
-from agent.services import access
+from agent.services import access, jobs
 from agent.services.analysis import system_prompt
 from agent.services.assistant import build_chat_context, llm_with_tools
 from agent.services.intents import detect_chart_intent, detect_export_intent
@@ -134,6 +134,129 @@ async def chat_compact(client_id: str, session_id: str,
     return [{"role": "summary", "content": digest}] + tail
 
 
+async def generate(owner: str, thread_id: str, thread_title: str, text: str,
+                   fp: str, sid: str, history: list, job) -> None:
+    """Собрать контекст и получить ответ.
+
+    Выполняется отдельной задачей, а не в обработчике сокета: закрытая вкладка
+    или обновление страницы больше не отменяют разбор, на который агент уже
+    потратил сбор метрик и чтение логов. Всё, что раньше уходило в сокет,
+    теперь публикуется в задачу — сокет это только пересказывает.
+
+    Вопрос сохраняется в историю ДО генерации: если человек перезагрузит
+    страницу, он должен увидеть свой вопрос на месте, а не пустой чат.
+    """
+    await chat_save(owner, thread_id, "user", text, fp)
+    async with session_scope() as db:
+        await ChatRepository(db).touch_thread(thread_id, text)
+
+    try:
+        context_text, cluster, hours = await build_chat_context(text)
+    except Exception as exc:
+        logger.error("Context error: %s", exc)
+        await job.emit({"type": "error", "text": "Ошибка сбора метрик: %s" % exc})
+        await job.emit({"type": "done", "stopped": False})
+        return
+
+    await job.emit({
+        "type":      "context",
+        "cluster":   cluster["label"] if cluster else None,
+        "hours":     hours if hours > 0 else None,
+        "thread_id": thread_id,
+        "title":     thread_title,
+    })
+
+    # Графики строим ТОЛЬКО если их попросили. Иначе шлём лёгкое предложение
+    # без данных: строка со ссылками под ответом, десять запросов в Prometheus
+    # зря не делаем.
+    if cluster and hours > 0:
+        want_charts = detect_chart_intent(text)
+        want_export = detect_export_intent(text)
+        try:
+            charts = await build_charts(cluster, hours) if want_charts else []
+            await job.emit({
+                "type":          "charts",
+                "mode":          "inline" if want_charts else "offer",
+                "highlight_pdf": want_export,
+                "cluster":       cluster["name"],
+                "cluster_label": cluster["label"],
+                "hours":         hours,
+                "charts":        charts,
+            })
+        except Exception as exc:
+            logger.error("Не удалось собрать графики: %s", exc)
+
+    messages = [{"role": "system", "content": system_prompt()}]
+    # Выжимка вытесненной части + последние реплики дословно
+    messages += history_to_messages(history[-CHAT_CONTEXT_MESSAGES:])
+    messages.append({"role": "user",
+                     "content": "%s\n\n## Вопрос\n\n%s" % (context_text, text)})
+
+    # Если эндпоинт умеет инструменты — даём модели дозапросить недостающее
+    # самой, вместо угадывания по ключевым словам. Собранный контекст
+    # остаётся: он покрывает типовые вопросы без лишних раундов к модели.
+    if await llm_probe_tools():
+        try:
+            messages, used = await llm_with_tools(messages)
+            if used:
+                await job.emit({"type": "tools", "used": used})
+        except Exception as exc:
+            logger.error("Режим инструментов не сработал: %s", exc)
+
+    parts = []
+    async for token in llm_stream(messages):
+        if job.stop_event.is_set():
+            break
+        parts.append(token)
+        await job.emit({"type": "token", "text": token})
+
+    answer = "".join(parts)
+    if job.stop_event.is_set():
+        # Прерванный ответ всё равно сохраняем: пользователь его видел и в
+        # следующем вопросе может на него сослаться
+        answer += "\n\n[генерация остановлена]"
+        await job.emit({"type": "token", "text": "\n\n[остановлено]"})
+        logger.info("Генерация остановлена пользователем: %s", sid)
+
+    await chat_save(owner, thread_id, "assistant", answer, fp)
+    history.append({"role": "user",      "content": text})
+    history.append({"role": "assistant", "content": answer})
+
+    await job.emit({"type": "done", "stopped": job.stop_event.is_set()})
+
+    # Упёрлись в окно контекста — не выбрасываем старое, а сжимаем.
+    # После done: выжимку строит модель, и ждать её пользователю незачем.
+    if len(history) > CHAT_CONTEXT_MESSAGES:
+        history[:] = await chat_compact(owner, thread_id, history)
+
+
+async def relay(ws: WebSocket, job, resume: bool) -> None:
+    """Пересказать клиенту то, что происходит в задаче.
+
+    resume — клиент вернулся к уже идущему ответу: сначала отдаём накопленное,
+    потом продолжаем вживую. Без этого после перезагрузки страницы человек
+    видел бы пустоту до самого конца генерации.
+    """
+    queue = job.subscribe()
+    try:
+        if resume:
+            await ws.send_json({"type": "resume", "thread_id": job.thread_id,
+                                "question": job.question})
+        for event in list(job.events):
+            await ws.send_json(event)
+            if event.get("type") == "done":
+                return
+        while True:
+            event = await queue.get()
+            if event is None:          # задача завершилась
+                return
+            await ws.send_json(event)
+            if event.get("type") == "done":
+                return
+    finally:
+        job.unsubscribe(queue)
+
+
 @router.websocket("/ws")
 async def websocket_chat(ws: WebSocket):
     """
@@ -169,7 +292,6 @@ async def websocket_chat(ws: WebSocket):
     # значит «стоп» никто бы не услышал. Поэтому чтение вынесено в отдельную
     # задачу: она разбирает служебные сообщения сразу, а вопросы кладёт в очередь.
     inbox: asyncio.Queue = asyncio.Queue()
-    stop_event = asyncio.Event()
 
     async def reader():
         try:
@@ -193,41 +315,53 @@ async def websocket_chat(ws: WebSocket):
             if kind == "ping":
                 await ws.send_json({"type": "pong"})
             elif kind == "stop":
-                stop_event.set()
-            elif kind == "message":
+                jobs.stop(str(m.get("thread_id") or "").strip()[:128])
+            elif kind in ("message", "attach"):
                 await inbox.put(m)
 
     reader_task = asyncio.create_task(reader())
+
+    # Клиент мог вернуться к ответу, который считается прямо сейчас, —
+    # например, обновив страницу. Подхватываем его до первого вопроса.
+    async def resume_if_running(thread_id: str) -> None:
+        job = jobs.running(thread_id)
+        if job is not None:
+            await relay(ws, job, resume=True)
 
     try:
         while True:
             msg = await inbox.get()
             if msg is None:            # клиент отключился
                 break
-            stop_event.clear()
-
-            text = msg.get("text", "").strip()
-            sid  = msg.get("session_id", session_id)
-            if not text:
-                continue
 
             # Чей это разговор. Когда включена аутентификация, ключ — ИМЯ
-            # ПОЛЬЗОВАТЕЛЯ: агентом пользуются несколько человек, и history
+            # ПОЛЬЗОВАТЕЛЯ: агентом пользуются несколько человек, и история
             # одного не должна попадать в контекст другого. По браузеру
             # (client_id) делим только когда логина нет вовсе — иначе двое
             # за одной машиной видели бы переписку друг друга, а один человек
             # с ноутбука и с телефона имел бы две несвязанные истории.
             browser_id = str(msg.get("client_id") or "").strip()[:128]
             fp  = str(msg.get("fingerprint") or "").strip()[:128]
+            sid = msg.get("session_id", session_id)
             cid = (f"user:{normalize(ws_user['username'])}"
                    if ws_user else browser_id)
             owner = cid or sid
 
-            # В каком разговоре отвечаем. Клиент присылает выбранный; если
-            # не прислал — берём последний, а при первом обращении заводим
-            # новый. Ключ истории — именно разговор: у одного человека их
-            # несколько, и мешать их в одну ленту значит портить контекст.
             thread_id = str(msg.get("thread_id") or "").strip()[:128]
+            text = str(msg.get("text") or "").strip()
+
+            # Возврат к идущему ответу: вопроса нет, только просьба
+            # подключиться обратно
+            if msg.get("type") == "attach":
+                if thread_id:
+                    await resume_if_running(thread_id)
+                continue
+
+            if not text:
+                continue
+
+            # В каком разговоре отвечаем. Клиент присылает выбранный; если не
+            # прислал — берём последний, а при первом обращении заводим новый.
             async with session_scope() as db:
                 repo = ChatRepository(db)
                 thread = (await repo.get_thread(owner, thread_id)
@@ -242,100 +376,13 @@ async def websocket_chat(ws: WebSocket):
                 history = await chat_restore(owner, thread_id)
                 ws_sessions[thread_id] = history
 
-            # 1. Собрать контекст (метрики) — сообщаем клиенту что нашли
-            try:
-                context_text, cluster, hours = await build_chat_context(text)
-            except Exception as e:
-                logger.error(f"Context error: {e}")
-                await ws.send_json({"type": "error",
-                                    "text": f"Ошибка сбора метрик: {e}"})
-                continue
-
-            await ws.send_json({
-                "type":      "context",
-                "cluster":   cluster["label"] if cluster else None,
-                "hours":     hours if hours > 0 else None,
-                "thread_id": thread_id,
-                "title":     thread_title,
-            })
-
-            # Графики строим ТОЛЬКО если их попросили. Иначе шлём лёгкое
-            # предложение без данных: строка со ссылками под ответом, десять
-            # запросов в Prometheus зря не делаем.
-            if cluster and hours > 0:
-                want_charts = detect_chart_intent(text)
-                want_export = detect_export_intent(text)
-                try:
-                    charts = (await build_charts(cluster, hours)
-                              if want_charts else [])
-                    await ws.send_json({
-                        "type":          "charts",
-                        "mode":          "inline" if want_charts else "offer",
-                        "highlight_pdf": want_export,
-                        "cluster":       cluster["name"],
-                        "cluster_label": cluster["label"],
-                        "hours":         hours,
-                        "charts":        charts,
-                    })
-                except Exception as e:
-                    logger.error(f"Не удалось собрать графики: {e}")
-
-            # 2. Собрать messages
-            messages = [{"role": "system", "content": system_prompt()}]
-            # Выжимка вытесненной части + последние реплики дословно
-            messages += history_to_messages(history[-CHAT_CONTEXT_MESSAGES:])
-            messages.append({
-                "role": "user",
-                "content": f"{context_text}\n\n## Вопрос\n\n{text}",
-            })
-
-            # Если эндпоинт умеет инструменты — даём модели дозапросить
-            # недостающее самой, вместо угадывания по ключевым словам.
-            # Собранный контекст остаётся: он покрывает типовые вопросы
-            # без лишних раундов к LLM.
-            if await llm_probe_tools():
-                try:
-                    messages, used = await llm_with_tools(messages)
-                    if used:
-                        await ws.send_json({"type": "tools", "used": used})
-                except Exception as e:
-                    logger.error(f"Режим инструментов не сработал: {e}")
-
-            # 3. Стримить ответ
-            full_answer = []
-            stopped = False
-            async for token in llm_stream(messages):
-                if stop_event.is_set():
-                    stopped = True
-                    break
-                full_answer.append(token)
-                await ws.send_json({"type": "token", "text": token})
-
-            answer = "".join(full_answer)
-            if stopped:
-                # Прерванный ответ всё равно сохраняем: пользователь его видел,
-                # и в следующем вопросе на него может ссылаться.
-                answer += "\n\n[генерация остановлена]"
-                await ws.send_json({"type": "token",
-                                    "text": "\n\n[остановлено]"})
-                logger.info(f"Генерация остановлена пользователем: {sid}")
-            # 4. Сохранить историю (без огромного контекста метрик) — до
-            # сигнала о завершении: иначе перезагрузка страницы сразу после
-            # ответа не покажет только что состоявшийся обмен
-            history.append({"role": "user",      "content": text})
-            history.append({"role": "assistant", "content": answer})
-            await chat_save(owner, thread_id, "user",      text,   fp)
-            await chat_save(owner, thread_id, "assistant", answer, fp)
-            # Отмечаем разговор свежим; если названия нет — берём из вопроса
-            async with session_scope() as db:
-                await ChatRepository(db).touch_thread(thread_id, text)
-
-            await ws.send_json({"type": "done", "stopped": stopped})
-
-            # Упёрлись в окно контекста — не выбрасываем старое, а сжимаем.
-            # После done: выжимку строит модель, и ждать её пользователю незачем
-            if len(history) > CHAT_CONTEXT_MESSAGES:
-                history[:] = await chat_compact(owner, thread_id, history)
+            # Генерация живёт в задаче, а не в этом обработчике: закрытая
+            # вкладка больше не отменяет разбор
+            job = await jobs.start(
+                thread_id, text,
+                lambda j: generate(owner, thread_id, thread_title, text,
+                                   fp, sid, history, j))
+            await relay(ws, job, resume=job.question != text)
 
     except WebSocketDisconnect:
         logger.info(f"WS disconnected: {session_id}")
