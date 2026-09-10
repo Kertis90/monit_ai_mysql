@@ -72,6 +72,13 @@
   const q       = new URLSearchParams(location.search);
   const cluster = q.get('cluster') || '';
   const hours   = parseFloat(q.get('hours') || '24');
+  // Печатный отчёт повторяет то, что было на экране: если смотрели
+  // произвольный интервал, он должен попасть и сюда
+  const since   = q.get('since') || '';
+  const until   = q.get('until') || '';
+  const period_q = (since && until)
+    ? 'since=' + encodeURIComponent(since) + '&until=' + encodeURIComponent(until)
+    : 'hours=' + encodeURIComponent(hours);
 
   const esc = (s) => String(s ?? '')
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -155,6 +162,17 @@
   }
 
   function periodLabel(h) {
+    if (since && until) {
+      // Границы приезжают в Unix-времени; показываем их местным временем
+      // того, кто печатает отчёт
+      const at = (ts) => {
+        const d = new Date(parseFloat(ts) * 1000);
+        const pad = (n) => String(n).padStart(2, '0');
+        return pad(d.getDate()) + '.' + pad(d.getMonth() + 1) + ' ' +
+               pad(d.getHours()) + ':' + pad(d.getMinutes());
+      };
+      return 'с ' + at(since) + ' до ' + at(until);
+    }
     return h >= 24 ? (h / 24).toFixed(1).replace('.0', '') + ' сут' : h + ' ч';
   }
 
@@ -167,12 +185,12 @@
     }
     try {
       const r = await fetch('api/charts/' + encodeURIComponent(cluster) +
-                            '?hours=' + encodeURIComponent(hours));
+                            '?' + period_q);
       if (r.status === 401) { location.href = new URL('login', document.baseURI).href; return; }
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const d = await r.json();
 
-      const period = periodLabel(hours);
+      const period = periodLabel(d.hours || hours);
       document.getElementById('title').textContent = 'Отчёт: ' + d.cluster_label;
       document.getElementById('subtitle').textContent =
         'Период: последние ' + period + ' · сформирован ' +

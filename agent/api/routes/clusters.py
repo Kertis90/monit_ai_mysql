@@ -27,6 +27,7 @@ from agent.services.workload import (DEFAULT_WINDOW_S, fmt_workload,
                                      workload_delta)
 from agent.services.mysql import db_versions_text, sql_execute
 from agent.services.prometheus import (build_charts, collect_current,
+                                       resolve_window,
                                        collect_history)
 from agent.services.registry import (app_host, cluster_hosts,
                                      enabled_clusters, find_cluster)
@@ -88,8 +89,26 @@ async def series(name: str, user: CurrentUser, hours: float = 3,
 
 @router.get("/api/charts/{name}", tags=["Диагностика"],
             summary="Данные для графиков")
-async def charts(name: str, user: CurrentUser, hours: float = 3):
-    return {"cluster": name, "charts": await build_charts(_need(name), hours)}
+async def charts(name: str, user: CurrentUser, hours: float = 3,
+                 since: float = 0, until: float = 0):
+    """Период задаётся либо длиной (hours), либо границами (since/until).
+
+    Границы — в Unix-времени: часовые пояса браузера и серверов кластера
+    различаются, и «с 3:00» без уточнения, чьи это три часа, бессмысленно.
+    """
+    cluster = _need(name)
+    start, end, span = resolve_window(hours, since, until)
+
+    async def build():
+        return {"cluster": name, "since": int(start), "until": int(end),
+                "hours": round(span, 4),
+                "charts": await build_charts(cluster, since=start, until=end)}
+
+    # Ключ по фактическим границам, округлённым до минуты: соседние запросы
+    # «за 3 часа» отличаются секундами, и без округления общая работа не
+    # переиспользовалась бы ни разу
+    key = "charts:%s:%d:%d" % (name, start // 60, end // 60)
+    return await tasks.shared(key, build, ttl=30)
 
 
 @router.get("/api/db/versions", tags=["Диагностика"],

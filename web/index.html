@@ -121,12 +121,19 @@
       <div class="pane-head">
         <h3 id="cluster-head">Кластер</h3>
         <div class="pane-actions">
-          <select id="cluster-hours" onchange="App.loadClusterPage()">
+          <select id="cluster-hours" onchange="App.periodChanged()">
             <option value="1">за час</option>
             <option value="3" selected>за 3 часа</option>
             <option value="12">за 12 часов</option>
             <option value="24">за сутки</option>
+            <option value="custom">свой интервал…</option>
           </select>
+          <span class="range-pick" id="range-pick" hidden>
+            <input type="datetime-local" id="range-from" step="60">
+            <span class="muted">—</span>
+            <input type="datetime-local" id="range-to" step="60">
+            <button class="ghost-btn" onclick="App.applyRange(this)">Показать</button>
+          </span>
           <button class="ghost-btn" onclick="App.loadClusterPage(this)">↻ Обновить</button>
         </div>
       </div>

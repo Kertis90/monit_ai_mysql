@@ -273,6 +273,10 @@ def application() -> None:
         version_detection()
         diag_by_version()
         skipped_reported()
+        time_window()
+        range_request()
+        charts_range_route(c)
+        range_ui()
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -940,7 +944,7 @@ def web_behaviour() -> None:
           html[html.index('id="tab-btn-cluster"'):
                html.index('id="tab-btn-cluster"') + 160], True)
     check("графики страницы кластера подписаны периодом",
-          "'<h4>Метрики за ' + hours + ' ч</h4>'" in app, True)
+          "'<h4>Метрики ' + esc(periodLabel()) + '</h4>'" in app, True)
     check("выгрузка PDF знает кластер и период",
           "'report?cluster=' + encodeURIComponent(name) +" in app, True)
     check("значок «Здоровья» из общедоступного набора",
@@ -1362,6 +1366,121 @@ def skipped_reported() -> None:
     check("сказано, что пропущено", "Пропущено на этой версии" in text, True)
     check("и почему", "появилась в 5.7" in text, True)
     check("названа версия сервера", "5.6.51" in text, True)
+
+
+def time_window() -> None:
+    """Границы окна приводятся к разумным, а не принимаются как есть."""
+    import time as _time
+
+    from agent.services.prometheus import MAX_METRICS_HOURS, resolve_window
+
+    now = _time.time()
+
+    start, end, hours = resolve_window(3)
+    check("«за 3 часа» — это три часа", round(hours, 2), 3.0)
+    check("и заканчивается сейчас", abs(end - now) < 5, True)
+
+    _, _, hours = resolve_window(100)
+    check("слишком длинное окно обрезано", hours, float(MAX_METRICS_HOURS))
+
+    start, end, hours = resolve_window(0, now - 26 * 3600, now - 24 * 3600)
+    check("свой интервал берётся как есть", round(hours, 2), 2.0)
+    check("и не подтягивается к «сейчас»", abs(end - (now - 24 * 3600)) < 5, True)
+
+    _, _, hours = resolve_window(0, now - 3600, now - 7200)
+    check("перевёрнутый интервал развернут", round(hours, 2), 1.0)
+
+    _, end, _ = resolve_window(0, now - 3600, now + 99999)
+    check("будущее обрезано по «сейчас»", abs(end - now) < 5, True)
+
+    start, end, hours = resolve_window(0, now - 72 * 3600, now)
+    check("трое суток сужены до предела", hours, float(MAX_METRICS_HOURS))
+    check("сужены с сохранением свежего края", abs(end - now) < 5, True)
+
+    _, _, hours = resolve_window(0, now - 10, now)
+    check("слишком узкое окно расширено до минуты",
+          round(hours * 3600), 60)
+
+
+def range_request() -> None:
+    """В Prometheus уходят именно те границы, которые попросили."""
+    class FakeResponse:
+        @staticmethod
+        def json():
+            return {"status": "success", "data": {"result": [
+                {"metric": {}, "values": [[1789000000, "1.5"]]}]}}
+
+    class FakeClient:
+        def __init__(self):
+            self.params = None
+
+        async def get(self, url, params=None, timeout=None):
+            self.params = params
+            return FakeResponse()
+
+    from agent.services.prometheus import prom_range_series
+
+    async def scenario():
+        client = FakeClient()
+        since, until = 1788973200, 1788989400      # 4.5 часа
+        await prom_range_series(client, "up", 0, since, until)
+        check("начало окна передано", client.params["start"], "%d" % since)
+        check("конец окна передан", client.params["end"], "%d" % until)
+        # ~200 точек на график: шаг считается от длины окна, а не от «часов»
+        check("шаг подобран под длину окна",
+              int(client.params["step"]), (until - since) // 200)
+
+        await prom_range_series(client, "up", 3)
+        span = int(client.params["end"]) - int(client.params["start"])
+        check("режим «за N часов» тоже работает", abs(span - 3 * 3600) < 5, True)
+
+    asyncio.run(scenario())
+
+
+def charts_range_route(client) -> None:
+    """Эндпоинт графиков отвечает теми границами, которые применил."""
+    import time as _time
+
+    now = int(_time.time())
+    r = client.get("/api/charts/kemerovo?since=%d&until=%d" % (now - 7200, now))
+    check("график за свой интервал отдан", r.status_code, 200)
+    data = r.json()
+    check("границы возвращены", data["until"] - data["since"], 7200)
+    check("длина окна посчитана", round(data["hours"], 2), 2.0)
+
+    # Слишком широкий интервал сужается, и это видно в ответе
+    wide = client.get("/api/charts/kemerovo?since=%d&until=%d"
+                      % (now - 72 * 3600, now)).json()
+    check("широкий интервал сужен", wide["hours"] <= 24.001, True)
+
+    plain = client.get("/api/charts/kemerovo?hours=3").json()
+    check("прежний способ не сломан", round(plain["hours"], 2), 3.0)
+
+
+def range_ui() -> None:
+    """Выбор интервала в интерфейсе: подстановка и проверки."""
+    app = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
+    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+
+    check("в списке периодов есть свой интервал",
+          'value="custom"' in html, True)
+    check("поля даты есть", html.count('type="datetime-local"'), 2)
+    check("предел суток задан в одном месте",
+          "RANGE_MAX_HOURS = 24" in app, True)
+    for message in ("Конец интервала раньше начала",
+                    "Интервал больше суток",
+                    "Начало в будущем"):
+        if message not in app:
+            check("есть объяснение «%s»" % message, False, True)
+    check("неверный интервал объясняется словами", True, True)
+    check("наружу уходит Unix-время, а не местное",
+          "'since=' + state.range.since" in app, True)
+    check("печатный отчёт получает тот же интервал",
+          "report?cluster=' + encodeURIComponent(name) + '&' + period" in app, True)
+
+    report = (ROOT / "web" / "report.html").read_text(encoding="utf-8")
+    check("отчёт умеет подписать интервал",
+          "since && until" in report, True)
 
 
 def websocket(client) -> None:

@@ -21,6 +21,7 @@ const App = (() => {
     threadId:      null,   // текущий чат
     clusters:      [],
     clusterName:   null,   // открытый на вкладке «Кластер»
+    range:         null,   // свой интервал: {since, until} в Unix-времени
     templates:     [],     // готовые диагностические запросы
     auditOffset:   0,      // сколько записей журнала уже показано
     currentTab:    'chat',
@@ -1701,8 +1702,105 @@ const App = (() => {
   // Всё, что агент собирает для разбора, показано человеку напрямую:
   // раньше это существовало только внутри ответа в чате.
 
+  // ── Период на странице кластера ─────────────────────────────────
+  // Кроме готовых «за 3 часа» нужен произвольный интервал: разбирают
+  // обычно конкретный случай — «вчера в 17:40 всё встало», — и смотреть
+  // надо вокруг этого времени, а не последние сутки, внутри которых
+  // всплеск теряется.
+
+  const RANGE_MAX_HOURS = 24;
+
   function clusterHours() {
-    return parseFloat(($('cluster-hours') || {}).value || '3');
+    const value = ($('cluster-hours') || {}).value;
+    return value === 'custom' ? 3 : parseFloat(value || '3');
+  }
+
+  // Время в поле — местное: человек думает в часах своего города. Наружу
+  // уходит Unix-время, потому что серверы кластера живут в других поясах,
+  // и «с 3:00» без уточнения, чьи это три часа, ничего не значит.
+  function toInput(date) {
+    const pad = (n) => String(n).padStart(2, '0');
+    return date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' +
+           pad(date.getDate()) + 'T' + pad(date.getHours()) + ':' +
+           pad(date.getMinutes());
+  }
+
+  function periodChanged() {
+    const custom = $('cluster-hours').value === 'custom';
+    $('range-pick').hidden = !custom;
+    if (!custom) {
+      state.range = null;
+      loadClusterPage();
+      return;
+    }
+    // Подставляем последние три часа: чаще всего правят только границы
+    if (!$('range-to').value) {
+      const now = new Date();
+      $('range-to').value = toInput(now);
+      $('range-from').value = toInput(new Date(now.getTime() - 3 * 3600 * 1000));
+    }
+    $('range-from').focus();
+  }
+
+  function applyRange(btn) {
+    const from = $('range-from').value, to = $('range-to').value;
+    if (!from || !to) { rangeProblem('Заполните обе границы.'); return; }
+
+    const since = Math.floor(new Date(from).getTime() / 1000);
+    const until = Math.floor(new Date(to).getTime() / 1000);
+    const now = Math.floor(Date.now() / 1000);
+
+    if (isNaN(since) || isNaN(until)) {
+      rangeProblem('Не разобрать дату.'); return;
+    }
+    if (until <= since) {
+      rangeProblem('Конец интервала раньше начала.'); return;
+    }
+    if (since > now) {
+      rangeProblem('Начало в будущем — метрик оттуда ещё нет.'); return;
+    }
+    if (until - since > RANGE_MAX_HOURS * 3600) {
+      rangeProblem('Интервал больше суток. Максимум — ' + RANGE_MAX_HOURS + ' ч.');
+      return;
+    }
+
+    rangeProblem('');
+    // Конец в будущем не ошибка (часы могут спешить), просто обрезаем
+    state.range = { since: since, until: Math.min(until, now) };
+    loadClusterPage(btn);
+  }
+
+  function rangeProblem(text) {
+    let box = $('range-problem');
+    if (!box) {
+      box = document.createElement('span');
+      box.id = 'range-problem';
+      box.className = 'range-problem';
+      $('range-pick').appendChild(box);
+    }
+    box.textContent = text;
+    box.hidden = !text;
+  }
+
+  // Что дописать к запросу метрик и к ссылке на печатный отчёт
+  function periodQuery() {
+    return state.range
+      ? 'since=' + state.range.since + '&until=' + state.range.until
+      : 'hours=' + clusterHours();
+  }
+
+  function periodLabel() {
+    if (!state.range) return 'за ' + clusterHours() + ' ч';
+    const from = new Date(state.range.since * 1000);
+    const to   = new Date(state.range.until * 1000);
+    const day  = (d) => String(d.getDate()).padStart(2, '0') + '.' +
+                        String(d.getMonth() + 1).padStart(2, '0');
+    const time = (d) => String(d.getHours()).padStart(2, '0') + ':' +
+                        String(d.getMinutes()).padStart(2, '0');
+    const same = from.toDateString() === to.toDateString();
+    return same
+      ? day(from) + ' с ' + time(from) + ' до ' + time(to)
+      : 'с ' + day(from) + ' ' + time(from) + ' до ' + day(to) + ' ' + time(to);
   }
 
   async function openCluster(name) {
@@ -2010,14 +2108,14 @@ const App = (() => {
     $('cluster-head').textContent = meta.label || name;
     setBusy(box, 'Собираю состояние, графики и события…');
 
-    const hours = clusterHours();
+    const period = periodQuery();
     try {
       // Состояние и графики — сразу; тяжёлое (профиль нагрузки, репликация,
       // диагностика) грузится по кнопке: у профиля окно в секундах, и ждать
       // его при каждом открытии страницы незачем
       const [st, ch, al] = await Promise.all([
         getJson('clusters/' + encodeURIComponent(name) + '/status'),
-        getJson('api/charts/' + encodeURIComponent(name) + '?hours=' + hours),
+        getJson('api/charts/' + encodeURIComponent(name) + '?' + period),
         getJson('alerts/history?cluster=' + encodeURIComponent(name) +
                 '&hours=24&limit=10'),
       ]);
@@ -2091,13 +2189,12 @@ const App = (() => {
 
       // ── Графики
       if (ch.charts && ch.charts.length) {
-        const pdf = 'report?cluster=' + encodeURIComponent(name) +
-                    '&hours=' + encodeURIComponent(hours);
+        const pdf = 'report?cluster=' + encodeURIComponent(name) + '&' + period;
         html += '<section class="card foldable" id="charts-card">' +
                 '<div class="card-head">' +
                 '<button class="card-fold" type="button">' +
                 '<span class="caret" aria-hidden="true"></span>' +
-                '<h4>Метрики за ' + hours + ' ч</h4>' +
+                '<h4>Метрики ' + esc(periodLabel()) + '</h4>' +
                 '<span class="muted small">' + ch.charts.length +
                 ' графиков</span></button>' +
                 '<a class="ghost-btn" href="' + pdf + '" target="_blank" ' +
@@ -2678,6 +2775,7 @@ const App = (() => {
 
   // Публичный API для onclick в HTML
   return { showTab, pickCluster, useSuggestion, toggleAnalysis, explainAll,
+           periodChanged, applyRange,
            loadStatus, loadAlerts, refreshClusters, logout,
            loadAccess, loadAudit, searchDirectory, grantAgain,
            newThread, deleteThread, switchThread, toggleSidebar,

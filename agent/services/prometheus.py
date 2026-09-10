@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import time
 import logging
 from typing import Optional
 
@@ -159,19 +160,52 @@ async def prom_range_summary(client: httpx.AsyncClient, query: str,
     return {}
 
 
+# Наименьшее осмысленное окно. Уже минуты график состоит из одной точки:
+# Prometheus скрейпит раз в 15 секунд.
+MIN_WINDOW_S = 60
+
+
+def resolve_window(hours: float = 0, since: float = 0,
+                   until: float = 0) -> tuple:
+    """Границы окна из «за N часов» или из явно указанных «с» и «по».
+
+    Возвращает (начало, конец, часов) — всё в Unix-времени, чтобы не
+    зависеть от часового пояса ни браузера, ни сервера: в разных городах
+    кластеры живут в разных поясах, и «с 3:00» без указания, чьи это три
+    часа, ничего не значит.
+
+    Границы приводятся к разумным: перевёрнутый интервал разворачивается,
+    будущее обрезается по «сейчас», а слишком широкое окно сужается до
+    предела с сохранением конца — интересен обычно свежий край.
+    """
+    now = time.time()
+    if since and until:
+        start, end = float(min(since, until)), float(max(since, until))
+        end = min(end, now)
+        if end - start < MIN_WINDOW_S:
+            start = end - MIN_WINDOW_S
+        limit = MAX_METRICS_HOURS * 3600
+        if end - start > limit:
+            start = end - limit
+        return start, end, (end - start) / 3600.0
+
+    span = max(min(float(hours or 3), MAX_METRICS_HOURS), MIN_WINDOW_S / 3600.0)
+    return now - span * 3600, now, span
+
+
 async def prom_range_series(client: httpx.AsyncClient, query: str,
-                            hours: float) -> list[list]:
+                            hours: float = 0, since: float = 0,
+                            until: float = 0) -> list[list]:
     """Сырой ряд [[unix_ts, значение], ...] — для отрисовки графика."""
-    end   = datetime.datetime.utcnow()
-    start = end - datetime.timedelta(hours=hours)
+    start_ts, end_ts, span = resolve_window(hours, since, until)
     # ~200 точек на график: больше браузеру не нужно, меньше — теряется форма
-    step  = max(int(hours * 3600 / 200), 15)
+    step  = max(int(span * 3600 / 200), 15)
     try:
         r = await client.get(
             f"{PROMETHEUS_URL}/api/v1/query_range",
             params={"query": query,
-                    "start": start.isoformat() + "Z",
-                    "end":   end.isoformat() + "Z",
+                    "start": "%.0f" % start_ts,
+                    "end":   "%.0f" % end_ts,
                     "step":  str(step)},
             timeout=20.0)
         d = r.json()
@@ -184,9 +218,16 @@ async def prom_range_series(client: httpx.AsyncClient, query: str,
         return []
 
 
-async def build_charts(cluster: dict, hours: float,
-                       keys: Optional[list[str]] = None) -> list[dict]:
-    """Собрать данные графиков по кластеру за период."""
+async def build_charts(cluster: dict, hours: float = 0,
+                       keys: Optional[list[str]] = None,
+                       since: float = 0, until: float = 0) -> list[dict]:
+    """Собрать данные графиков по кластеру за период.
+
+    Период задаётся либо длиной («за 3 часа»), либо границами («с … по …»).
+    Второе нужно, когда разбирают конкретный случай: «вчера в 17:40 всё
+    встало» — и смотреть надо ровно вокруг этого времени, а не последние
+    сутки, внутри которых всплеск теряется.
+    """
     prim = cluster["primary_ip"]
     repl = cluster.get("replica_ip", "")
     ctx  = {"inst": f"{prim}:9104", "node": f"{prim}:9100",
@@ -198,7 +239,8 @@ async def build_charts(cluster: dict, hours: float,
 
     async with http_client() as client:
         series = await asyncio.gather(
-            *[prom_range_series(client, s["expr"].format(**ctx), hours)
+            *[prom_range_series(client, s["expr"].format(**ctx), hours,
+                                since, until)
               for s in specs])
 
     charts = []
