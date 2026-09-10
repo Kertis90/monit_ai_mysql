@@ -43,7 +43,7 @@ SELECT ID AS id, USER AS usr, DB AS db, TIME AS secs, STATE AS state,
 # Незакрытые блокировки метаданных ловят ALTER намертво
 METADATA_LOCK_SQL = """
 SELECT OBJECT_SCHEMA AS db, OBJECT_NAME AS tbl, LOCK_TYPE AS lock_type,
-       LOCK_STATUS AS status, OWNER_THREAD_ID AS thread
+       LOCK_STATUS AS `status`, OWNER_THREAD_ID AS thread
   FROM performance_schema.metadata_locks
  WHERE LOCK_STATUS = 'PENDING'
  LIMIT 20"""

@@ -110,8 +110,11 @@ DIAG_QUERIES = [
     {
         "key": "table_io", "title": "Таблицы с наибольшим вводом-выводом",
         "why": "указывает, какие таблицы греют диск",
+        # READS — зарезервированное слово MySQL (характеристика хранимых
+        # процедур READS SQL DATA). Без обратных кавычек сервер отвечает 1064,
+        # и раздел молча оставался пустым.
         "sql": """SELECT OBJECT_SCHEMA AS db, OBJECT_NAME AS tbl,
-       COUNT_READ AS reads, COUNT_WRITE AS writes,
+       COUNT_READ AS `reads`, COUNT_WRITE AS `writes`,
        ROUND(SUM_TIMER_WAIT/1e12, 2) AS total_sec
   FROM performance_schema.table_io_waits_summary_by_table
  WHERE OBJECT_SCHEMA NOT IN ('mysql','performance_schema','sys')
@@ -120,7 +123,8 @@ DIAG_QUERIES = [
     {
         "key": "file_io", "title": "Файлы с наибольшим вводом-выводом",
         "why": "подтверждает или опровергает упор в диск",
-        "sql": """SELECT FILE_NAME AS file, COUNT_READ AS reads, COUNT_WRITE AS writes,
+        "sql": """SELECT FILE_NAME AS file,
+       COUNT_READ AS `reads`, COUNT_WRITE AS `writes`,
        ROUND(SUM_NUMBER_OF_BYTES_READ/1048576, 1)  AS read_mb,
        ROUND(SUM_NUMBER_OF_BYTES_WRITE/1048576, 1) AS write_mb
   FROM performance_schema.file_summary_by_instance

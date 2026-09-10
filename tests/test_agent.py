@@ -268,6 +268,8 @@ def application() -> None:
         cluster_page_shape()
         processlist_block()
         diagnose_budget()
+        sql_aliases()
+        long_values()
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -1185,6 +1187,83 @@ def diagnose_budget() -> None:
     app_js = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
     check("504 объясняется по-человечески",
           "proxy_read_timeout" in app_js and "504" in app_js, True)
+
+
+# Слова, которые MySQL 8.0 не даст использовать псевдонимом без кавычек.
+# Список неполный намеренно: здесь те, что реально просятся в псевдоним
+# диагностического запроса. READS уже стоил двух пустых разделов.
+MYSQL_RESERVED = {
+    "read", "reads", "read_write", "write", "writes", "row", "rows", "groups",
+    "system", "rank", "lead", "lag", "over", "window", "recursive", "lateral",
+    "of", "except", "empty", "first_value", "last_value", "dense_rank",
+    "cume_dist", "ntile", "percent_rank", "row_number", "json_table", "range",
+    "interval", "key", "keys", "order", "group", "match", "status", "usage",
+    "partition", "option", "level", "lines", "columns",
+}
+
+
+def sql_aliases() -> None:
+    """Псевдоним, совпавший с зарезервированным словом, ломает весь запрос.
+
+    Сервер отвечает 1064, агент прячет ошибку в текст блока, и раздел
+    выглядит как «данных нет». Найти это по симптому почти невозможно.
+    """
+    import re
+
+    bad = []
+    for path in sorted((ROOT / "agent").rglob("*.py")):
+        src = path.read_text(encoding="utf-8")
+        for m in re.finditer(r"\bAS\s+([A-Za-z_][\w]*)", src):
+            if m.group(1).lower() in MYSQL_RESERVED:
+                line = src[:m.start()].count(chr(10)) + 1
+                bad.append("%s:%d AS %s" % (path.name, line, m.group(1)))
+    check("зарезервированных псевдонимов нет", bad, [], show=", ".join(bad) or "чисто")
+
+    # А в кавычках — можно и нужно
+    from agent.services.analysis import DIAG_QUERIES
+    io_query = next(q for q in DIAG_QUERIES if q["key"] == "table_io")
+    check("проблемные псевдонимы взяты в кавычки",
+          "AS `reads`" in io_query["sql"], True)
+
+    from agent.services.mysql import sql_validate
+    for q in DIAG_QUERIES:
+        ok, why = sql_validate(q["sql"])
+        if not ok:
+            check("запрос %s проходит валидатор" % q["key"], why, "")
+    check("все диагностические запросы читающие", True, True)
+
+
+def long_values() -> None:
+    """Длинное значение печатается целиком, а не первыми шестьюдесятью."""
+    from agent.services.mysql import fmt_sql_result
+
+    innodb = {"host": "10.0.0.5", "query": "SHOW ENGINE INNODB STATUS",
+              "columns": ["Type", "Name", "Status"],
+              "rows": [["InnoDB", "", "BUFFER POOL AND MEMORY" + chr(10) +
+                        "Buffer pool hit rate 998 / 1000" + chr(10) +
+                        "---TRANSACTION 421, ACTIVE 942 sec"]]}
+    out = fmt_sql_result(innodb)
+    check("состояние InnoDB не обрезано",
+          "Buffer pool hit rate 998 / 1000" in out, True)
+    check("и его хвост тоже", "ACTIVE 942 sec" in out, True)
+    check("длинная колонка вынесена отдельно", "Status:" in out, True)
+
+    # Короткие значения по-прежнему таблицей: так их читать удобнее
+    short = {"host": "10.0.0.5", "query": "SHOW GLOBAL STATUS",
+             "columns": ["Variable_name", "Value"],
+             "rows": [["Threads_connected", "126"]]}
+    table = fmt_sql_result(short)
+    check("короткие значения остались таблицей",
+          "Variable_name" in table and "|" in table and "1)" not in table, True)
+
+    # Совсем гигантское значение обрезается, но об этом сказано
+    huge = {"host": "10.0.0.5", "query": "SHOW ENGINE INNODB STATUS",
+            "columns": ["Status"], "rows": [["x" * 60000]]}
+    cut = fmt_sql_result(huge)
+    check("гигантское значение обрезано с пометкой",
+          "далее ещё" in cut, True)
+    check("но взято куда больше шестидесяти символов",
+          cut.count("x") > 10000, True)
 
 
 def websocket(client) -> None:

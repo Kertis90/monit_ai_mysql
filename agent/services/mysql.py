@@ -26,6 +26,15 @@ logger = logging.getLogger("agent.mysql")
 
 SQL_TIMEOUT_S   = settings.sql.timeout_s
 SQL_MAX_ROWS    = settings.sql.max_rows
+
+# С какой длины колонка считается «длинной» и печатается отдельным абзацем,
+# а не ячейкой таблицы. Ниже этого выравнивание в столбик читается лучше.
+WIDE_COLUMN_CHARS = 90
+
+# Предел на одно длинное значение. SHOW ENGINE INNODB STATUS на нагруженном
+# сервере — это десятки килобайт со списком транзакций; начало и середина
+# там информативны, а хвост из тысячи одинаковых записей — нет.
+LONG_VALUE_CHARS = 20000
 LOG_SSH_USER    = settings.ssh.user
 LOG_SSH_PORT    = settings.ssh.port
 LOG_SSH_KEY     = settings.ssh.key
@@ -416,15 +425,49 @@ def fmt_sql_result(res: dict) -> str:
         head.append("  Строк не найдено.")
         return "\n".join(head)
 
-    def cell(v):
-        s = "NULL" if v is None else str(v)
-        return s[:60] + "…" if len(s) > 60 else s
+    def text(v):
+        return "NULL" if v is None else str(v)
 
-    widths = [max(len(c), *(len(cell(r[i])) for r in rows)) for i, c in enumerate(cols)]
-    head.append("  " + " | ".join(c.ljust(w) for c, w in zip(cols, widths)))
-    head.append("  " + "-+-".join("-" * w for w in widths))
-    for r in rows:
-        head.append("  " + " | ".join(cell(v).ljust(w) for v, w in zip(r, widths)))
+    # Какие колонки не влезают в таблицу. Раньше их резали до шестидесяти
+    # символов вместе со всеми остальными — и SHOW ENGINE INNODB STATUS
+    # превращался в первую строку заголовка, а текст запроса в топе тяжёлых
+    # обрывался на середине FROM. Ровно то, ради чего раздел и открывают.
+    longest = [max([len(c)] + [len(text(r[i])) for r in rows])
+               for i, c in enumerate(cols)]
+    # Длинная колонка — или та, внутри которой есть перевод строки: он
+    # разваливает таблицу независимо от длины, а именно так выглядит
+    # SHOW ENGINE INNODB STATUS
+    multiline = {i for i in range(len(cols))
+                 if any("\n" in text(r[i]) for r in rows)}
+    wide = {i for i, size in enumerate(longest)
+            if size > WIDE_COLUMN_CHARS} | multiline
+
+    if not wide:
+        widths = longest
+        head.append("  " + " | ".join(c.ljust(w) for c, w in zip(cols, widths)))
+        head.append("  " + "-+-".join("-" * w for w in widths))
+        for r in rows:
+            head.append("  " + " | ".join(text(v).ljust(w)
+                                          for v, w in zip(r, widths)))
+        if res.get("truncated"):
+            head.append(f"  (показаны первые {SQL_MAX_ROWS} строк)")
+        return "\n".join(head)
+
+    # Есть длинные значения: короткие колонки идут строкой, длинные —
+    # отдельными абзацами и целиком
+    for n, r in enumerate(rows, 1):
+        short = ["%s=%s" % (cols[i], text(v))
+                 for i, v in enumerate(r) if i not in wide]
+        head.append("  %d) %s" % (n, "  ".join(short)) if short else "  %d)" % n)
+        for i in sorted(wide):
+            value = text(r[i])
+            cut = len(value) > LONG_VALUE_CHARS
+            if cut:
+                value = value[:LONG_VALUE_CHARS] + (
+                    "\n… далее ещё %d символов" % (len(text(r[i])) - LONG_VALUE_CHARS))
+            head.append("     %s:" % cols[i])
+            head += ["       " + line for line in value.split("\n")]
+        head.append("")
     if res.get("truncated"):
         head.append(f"  (показаны первые {SQL_MAX_ROWS} строк)")
     return "\n".join(head)
