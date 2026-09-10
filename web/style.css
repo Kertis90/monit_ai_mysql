@@ -852,19 +852,6 @@ textarea#input:disabled { opacity: .55; }
 }
 .card .lazy { font-size: 12px; }
 
-.tiles { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
-.tile {
-  flex: 1 1 130px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 10px 12px;
-}
-.tile .k { font-size: 11px; color: var(--muted); }
-.tile .v { font-size: 18px; color: var(--text-hl); margin-top: 2px; }
-.tile.warn .v { color: var(--yellow); }
-.tile.bad  .v { color: var(--red); }
-.tile.good .v { color: var(--green); }
 
 /* ── Действия на событии ─────────────────────────────────────────── */
 
@@ -1033,20 +1020,6 @@ button[disabled] { opacity: .65; cursor: progress; }
    Выбор запоминается — свернувший блок осознанно не хочет видеть его
    развёрнутым при каждом открытии. */
 
-.fold-btn {
-  background: none;
-  border: none;
-  color: var(--muted);
-  cursor: pointer;
-  font-size: 13px;
-  padding: 0 6px 0 0;
-  line-height: 1;
-}
-.fold-btn:hover { color: var(--text-hl); }
-
-.card.folded > *:not(h4) { display: none; }
-.card.folded h4 { margin-bottom: 0; }
-
 /* Разбор модели: отделён от данных, чтобы не путать наблюдение с выводом */
 .ai-box {
   margin-top: 12px;
@@ -1066,7 +1039,6 @@ button[disabled] { opacity: .65; cursor: progress; }
 .ai-box ul, .ai-box ol { margin: 0 0 8px 18px; }
 .ai-box pre { overflow-x: auto; }
 
-.ai-btn { margin-left: 8px; }
 
 /* ── Постраничный просмотр ──────────────────────────────────────────
    Журнал за месяц — тысячи записей. Отдаём сотнями и дописываем к уже
@@ -1080,3 +1052,312 @@ button[disabled] { opacity: .65; cursor: progress; }
   border-top: 1px solid var(--border);
   margin-top: 8px;
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+   СТРАНИЦА КЛАСТЕРА
+
+   Была стена из тринадцати одинаковых карточек: всё одного веса, всё
+   раскрыто, и до нужного блока надо было прокрутить пять экранов. Стало:
+   состояние одним взглядом сверху, дальше — свёрнутые строки по группам.
+   Видно сразу всё, что можно снять; раскрывается то, что попросили.
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* ── Шапка: как себя чувствует и где живёт ─────────────────────────── */
+
+.cl-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--muted);
+  border-radius: 10px;
+  padding: 12px 16px;
+  margin-bottom: 14px;
+}
+.cl-top.ok   { border-left-color: var(--green); }
+.cl-top.warn { border-left-color: var(--yellow); }
+.cl-top.bad  { border-left-color: var(--red); }
+
+.cl-verdict { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.cl-verdict .dot {
+  width: 9px; height: 9px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex: none;
+}
+.cl-top.ok   .dot { background: var(--green); }
+.cl-top.warn .dot { background: var(--yellow); }
+.cl-top.bad  .dot { background: var(--red); }
+
+.cl-state { color: var(--text-hl); font-size: 14px; }
+.cl-where { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.cl-acts  { display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* ── Плитки состояния ──────────────────────────────────────────────── */
+
+.kpi {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(146px, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.stat {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 11px 13px 12px;
+  min-width: 0;
+}
+.stat-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
+  margin-top: 3px;
+}
+.stat-label {
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Значение всегда цветом текста: цвет несёт состояние в плашке и полосе,
+   а число должно оставаться читаемым при любом зрении и любом фоне */
+.stat-value {
+  font-size: 22px;
+  line-height: 1.2;
+  color: var(--text-hl);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.stat-unit { font-size: 12px; color: var(--muted); margin-left: 2px; }
+
+/* Плашка состояния: слово рядом со знаком — цвет сам по себе ничего не
+   говорит тому, кто его не различает, и мало что новичку */
+.pill {
+  font-size: 10px;
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 999px;
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+.pill.ok   { color: var(--green);  border-color: rgba(56,193,114,.35); }
+.pill.warn { color: var(--yellow); border-color: rgba(227,160,8,.4); }
+.pill.bad  { color: var(--red);    border-color: rgba(239,83,80,.45); }
+
+.meter {
+  height: 3px;
+  border-radius: 2px;
+  background: var(--border);
+  margin-top: 8px;
+  overflow: hidden;
+}
+.meter i {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--accent);
+}
+.stat.warn .meter i { background: var(--yellow); }
+.stat.bad  .meter i { background: var(--red); }
+.stat.ok   .meter i { background: var(--green); }
+
+.stat-spark { margin-top: 7px; color: var(--border-hl); height: 22px; }
+.stat.warn .stat-spark { color: rgba(227,160,8,.65); }
+.stat.bad  .stat-spark { color: rgba(239,83,80,.7); }
+.spark { width: 100%; height: 22px; display: block; }
+
+/* ── Карточки: разбор, графики, события ────────────────────────────── */
+
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.card-head h4 { margin: 0; font-size: 13px; color: var(--text-hl); }
+
+.card.insight { border-color: var(--border-hl); }
+.card.insight .card-head h4::before {
+  content: '';
+  display: inline-block;
+  width: 3px; height: 13px;
+  background: var(--accent);
+  border-radius: 2px;
+  margin-right: 8px;
+  vertical-align: -2px;
+}
+
+.accent-btn {
+  background: var(--accent-dim);
+  border: 1px solid rgba(76,141,255,.45);
+  color: var(--accent);
+  border-radius: 7px;
+  padding: 6px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.accent-btn:hover { background: rgba(76,141,255,.22); }
+.accent-btn[disabled] { opacity: .65; cursor: progress; }
+
+/* ── Блоки диагностики ─────────────────────────────────────────────── */
+
+.blk-group { margin: 18px 0 6px; }
+.group-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .07em;
+  color: var(--muted);
+  margin: 0 0 8px 2px;
+}
+
+.blk {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: 6px;
+  overflow: hidden;
+}
+.blk.open { border-color: var(--border-hl); }
+/* Собранный блок видно по акценту слева: не надо раскрывать все подряд,
+   чтобы вспомнить, что уже сняли */
+.blk.done { border-left-color: var(--accent); }
+
+.blk-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 10px 0 0;
+}
+.blk-toggle {
+  flex: 1;
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  min-width: 0;
+  background: none;
+  border: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  padding: 10px 12px;
+  cursor: pointer;
+}
+.blk-toggle:hover .blk-name { color: var(--text-hl); }
+.blk-toggle .caret {
+  flex: none;
+  width: 0; height: 0;
+  border-left: 5px solid var(--muted);
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  transform-origin: 2px 50%;
+  transition: transform .12s ease;
+  align-self: center;
+}
+.blk.open .caret { transform: rotate(90deg); border-left-color: var(--accent); }
+.blk-name { color: var(--text); font-size: 13px; white-space: nowrap; }
+.blk-short {
+  color: var(--muted);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.blk-actions { display: flex; gap: 6px; flex: none; }
+.blk-actions .ghost-btn { font-size: 12px; padding: 4px 10px; }
+
+.blk-body { padding: 2px 12px 12px 33px; }
+.blk-about {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 0 0 10px;
+  max-width: 74ch;
+}
+.blk-out:empty { display: none; }
+.blk-out .output { max-height: none; margin: 0; }
+/* Длинный вывод не выталкивает страницу: показываем окно с прокруткой */
+.blk-out .output.clipped {
+  max-height: 320px;
+  overflow: auto;
+}
+
+.blk-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+.blk-foot-acts { display: flex; gap: 6px; }
+.blk-foot .ghost-btn { font-size: 12px; padding: 4px 10px; }
+
+@media (max-width: 760px) {
+  .blk-short { display: none; }
+  .blk-body { padding-left: 12px; }
+  .blk-head { flex-wrap: wrap; }
+}
+
+/* Истёкшая сессия: экран поверх страницы, пока идёт переход на форму входа.
+   Молчаливый отказ выглядел как поломка интерфейса. */
+.expired {
+  position: fixed;
+  inset: 0;
+  background: rgba(11,14,20,.82);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 999;
+}
+.expired-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  background: var(--surface);
+  border: 1px solid var(--border-hl);
+  border-radius: 12px;
+  padding: 18px 22px;
+  color: var(--text-hl);
+}
+
+/* Сворачивание большой карточки (графики) — тем же жестом, что и блоки */
+.card-fold {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  background: none;
+  border: none;
+  color: inherit;
+  font: inherit;
+  padding: 0;
+  cursor: pointer;
+}
+.card-fold .caret {
+  flex: none;
+  width: 0; height: 0;
+  border-left: 5px solid var(--muted);
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  transform-origin: 2px 50%;
+  transform: rotate(90deg);
+  transition: transform .12s ease;
+}
+.card.folded .card-fold .caret { transform: none; }
+.card.folded .card-head { margin-bottom: 0; }
+.card-fold .muted { font-weight: normal; }

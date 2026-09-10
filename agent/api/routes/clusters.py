@@ -114,11 +114,29 @@ async def diagnose(name: str, user: CurrentUser, deep: bool = False):
     cluster = _need(name)
 
     async def build():
-        result = await run_diagnostics(cluster)
-        text = fmt_diagnostics(result)
-        if deep:
-            text += "\n\n" + await explain_top_queries(cluster)
-        return {"cluster": name, "report": text}
+        # По каждому серверу отдельно: у основного и реплики разная нагрузка,
+        # и «диагностика кластера» без указания, где именно снято, бесполезна
+        parts = []
+        for ip, role in cluster_hosts(cluster):
+            items = await run_diagnostics(cluster, ip)
+            block = fmt_diagnostics(items, "%s · %s" % (cluster["label"], role), ip)
+            if block:
+                parts.append(block)
+            if deep:
+                plans = await explain_top_queries(cluster, ip)
+                if plans:
+                    parts.append(plans)
+
+        if not parts:
+            parts.append(
+                "## Диагностика Performance Schema\n\n"
+                "  Ничего не собрано. Обычно причина одна из двух:\n"
+                "  - у кластера не заполнена учётка db_user в clusters.json — "
+                "тогда SQL-запросы отключены целиком;\n"
+                "  - performance_schema выключена на сервере "
+                "(SHOW VARIABLES LIKE 'performance_schema').")
+        return {"cluster": name, "report": "\n\n".join(parts)}
+
     return await tasks.shared("diagnose:%s:%d" % (name, int(deep)),
                               build, ttl=60)
 

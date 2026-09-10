@@ -183,8 +183,14 @@ def create_app() -> FastAPI:
 
         if path in PAGE_PATHS:
             return RedirectResponse(f"{prefix}/login", status_code=302)
-        from fastapi.responses import JSONResponse
-        return JSONResponse({"detail": "Требуется вход"}, status_code=401)
+        # Отдельная метка, а не просто 401: браузер должен отличить
+        # «сессия кончилась, иди на форму входа» от «этого делать нельзя».
+        # Без неё вкладка после долгого простоя оставалась открытой и
+        # пустой — запросы молча отказывали, а человек видел пустой экран.
+        return SafeJSONResponse({"detail": "Требуется вход",
+                                 "login_required": True,
+                                 "login_url": f"{prefix}/login"},
+                                status_code=401)
 
     for module in (auth, users, alerts, clusters, chat, system):
         app.include_router(module.router)

@@ -35,6 +35,43 @@ const App = (() => {
 
   const $ = (id) => document.getElementById(id);
 
+  // ═══ ИСТЁКШАЯ СЕССИЯ ════════════════════════════════════════════
+  // После долгого простоя сессия кончается, но вкладка остаётся открытой:
+  // запросы начинают отказывать, и человек видит пустой интерфейс без
+  // объяснений. Перехватываем это в одном месте — иначе пришлось бы
+  // помнить про 401 в каждом из полусотни мест, где идёт запрос.
+
+  let leaving = false;
+
+  function goToLogin(url) {
+    if (leaving) return;          // первый же отказ уводит, остальные молчат
+    leaving = true;
+    try { if (state.ws) state.ws.close(); } catch (e) { /* уже закрыт */ }
+    const box = document.createElement('div');
+    box.className = 'expired';
+    box.innerHTML = '<div class="expired-card"><span class="spinner lg"></span>' +
+                    '<div><b>Сессия истекла</b><div class="muted small">' +
+                    'Открываю страницу входа…</div></div></div>';
+    document.body.appendChild(box);
+    const target = url || new URL('login', document.baseURI).href;
+    setTimeout(() => { window.location.href = target; }, 600);
+  }
+
+  // Обёртка вокруг fetch, а не проверка в каждом обработчике: так ни одно
+  // место не будет забыто, включая те, что появятся позже.
+  const rawFetch = window.fetch.bind(window);
+  window.fetch = async (input, init) => {
+    const res = await rawFetch(input, init);
+    if (res.status === 401) {
+      let data = null;
+      try { data = await res.clone().json(); } catch (e) { /* не JSON */ }
+      if (!data || data.login_required) {
+        goToLogin(data && data.login_url);
+      }
+    }
+    return res;
+  };
+
   // ═══ ИДЕНТИФИКАЦИЯ БРАУЗЕРА ════════════════════════════
 
   // Логина в системе нет, поэтому история чата привязана к браузеру.
@@ -469,13 +506,14 @@ const App = (() => {
       handleWsMessage(msg);
     };
 
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
       state.wsReady = false;
       setConnState('offline');
       clearInterval(state.pingTimer);
       // Если ждали ответ — закрыть стриминг с ошибкой
       if (state.awaitingReply) finishStreaming('\n\n[соединение прервано — переподключаюсь…]');
       // Экспоненциальный реконнект (max 15s)
+      if (ev && ev.code === 4401) { goToLogin(); return; }
       setTimeout(connect, state.reconnectMs);
       state.reconnectMs = Math.min(state.reconnectMs * 1.8, 15000);
     };
@@ -1486,7 +1524,11 @@ const App = (() => {
   // Рисуем сами, инлайновым SVG: в закрытом контуре CDN недоступен,
   // а тащить библиотеку графиков ради линии — лишняя зависимость.
 
-  function fmtNum(v) {
+  function fmtNum(value) {
+    // Метрики приезжают строками: Prometheus отдаёт значения текстом, и
+    // toFixed на них падал. Приводим здесь, а не в каждом месте вызова.
+    const v = typeof value === 'number' ? value : parseFloat(value);
+    if (isNaN(v)) return '—';
     const a = Math.abs(v);
     if (a >= 1e9) return (v / 1e9).toFixed(1) + 'G';
     if (a >= 1e6) return (v / 1e6).toFixed(1) + 'M';
@@ -1684,12 +1726,265 @@ const App = (() => {
       el.addEventListener('click', () => openCluster(el.dataset.cluster)));
   }
 
-  function tile(k, v, cls) {
-    return `<div class="tile ${cls || ''}"><div class="k">${esc(k)}</div>` +
-           `<div class="v">${esc(v)}</div></div>`;
+  // ═══ СТРАНИЦА КЛАСТЕРА ═════════════════════════════════════════
+  // Раньше это была стена из тринадцати одинаковых карточек: всё одного
+  // веса, всё раскрыто, и чтобы дойти до нужного, надо было прокрутить
+  // экран пять раз. Теперь сверху — состояние одним взглядом, ниже —
+  // свёрнутые строки по группам: видно сразу всё, что можно снять, и
+  // раскрывается только то, что попросили.
+
+  // Описание блоков — данными, а не разметкой: добавить блок значит
+  // дописать строчку, а не править шаблон в трёх местах.
+  const CLUSTER_GROUPS = [
+    { title: 'Что происходит сейчас', blocks: [
+      { id: 'workload', out: 'cluster-workload', name: 'Что нагружает базу',
+        short: 'тяжёлые запросы прямо сейчас',
+        about: 'Два среза performance_schema с интервалом в несколько секунд. ' +
+               'Показывает то, что исполняется именно сейчас, а не средние за ' +
+               'всё время работы сервера.',
+        actions: [{ label: 'Снять профиль', fn: 'loadWorkload' }] },
+      { id: 'repl', out: 'cluster-repl', name: 'Репликация',
+        short: 'потоки, ошибки, отставание',
+        about: 'Состояние потоков, ошибки применения, отставание сверх ' +
+               'запланированного. Лаг говорит «на сколько», это — «почему».',
+        actions: [{ label: 'Проверить', fn: 'loadReplication' }] },
+      { id: 'diag', out: 'cluster-diag', name: 'Диагностика Performance Schema',
+        short: 'сканирования, блокировки, планы',
+        about: 'Тяжёлые запросы, полные сканирования, ожидания блокировок и ' +
+               'планы выполнения — по каждому серверу кластера отдельно.',
+        actions: [{ label: 'Выполнить', fn: 'loadDiag' }] },
+      { id: 'anomaly', out: 'cluster-anomaly', name: 'Аномалии',
+        short: 'отклонения от обычного состояния',
+        about: 'Половина поломок не пересекает ни одного порога: запросов ' +
+               'вдвое меньше обычного — отвалилось приложение, а база здорова.',
+        actions: [{ label: 'Сверить', fn: 'loadAnomalies' }] },
+    ] },
+    { title: 'Хватит ли запаса', blocks: [
+      { id: 'forecast', out: 'cluster-forecast', name: 'Запас по ресурсам',
+        short: 'место, соединения, автоинкременты',
+        about: 'Через сколько кончится место на дисках, когда упрёмся в предел ' +
+               'соединений и сколько осталось до переполнения автоинкрементов.',
+        actions: [{ label: 'Посчитать', fn: 'loadForecast' }] },
+      { id: 'growth', out: 'cluster-growth', name: 'Рост данных',
+        short: 'что растёт быстрее всего',
+        about: 'Размеры таблиц и их динамика за месяц: видно, что именно ' +
+               'съедает место, а не только сколько его осталось.',
+        actions: [{ label: 'Показать', fn: 'loadGrowth' }] },
+      { id: 'indexes', out: 'cluster-indexes', name: 'Лишние индексы',
+        short: 'дублирующие и избыточные',
+        about: 'Индекс по (a) не нужен, когда есть (a, b): он занимает место и ' +
+               'обновляется при каждой вставке. Глазами в схеме такое не найти.',
+        actions: [{ label: 'Найти', fn: 'loadIndexes' }] },
+    ] },
+    { title: 'Как настроено', blocks: [
+      { id: 'config', out: 'cluster-config', name: 'Настройки MySQL',
+        short: 'что выставлено неудачно',
+        about: 'Что выставлено неудачно и чем это грозит, с пометкой, что ' +
+               'можно менять на ходу, а что требует перезапуска.',
+        actions: [{ label: 'Разобрать', fn: 'loadConfigAudit' }] },
+      { id: 'changes', out: 'cluster-changes', name: 'Что менялось в настройках',
+        short: 'сравнение снимков за месяц',
+        about: '«Что вчера поменяли» — первый вопрос при внезапной деградации. ' +
+               'Агент снимает слепок настроек по расписанию и сравнивает.',
+        actions: [{ label: 'Показать', fn: 'loadConfigChanges' }] },
+      { id: 'backups', out: 'cluster-backups', name: 'Резервные копии',
+        short: 'возраст и размер последней',
+        about: 'Возраст и размер последней копии на серверах кластера. ' +
+               'Копия, которой нет, обнаруживается ровно тогда, когда нужна.',
+        actions: [{ label: 'Проверить', fn: 'loadBackups' }] },
+    ] },
+    { title: 'Перед обслуживанием', blocks: [
+      { id: 'ready', out: 'cluster-ready', name: 'Можно ли трогать',
+        short: 'долгие транзакции, блокировки, реплики',
+        about: 'Долгие транзакции, зависшие запросы, ожидание блокировок, ' +
+               'состояние реплик — то, что проверяют перед обслуживанием.',
+        actions: [{ label: 'Перезапуск', fn: 'loadReadiness', arg: 'restart' },
+                  { label: 'ALTER', fn: 'loadReadiness', arg: 'alter' },
+                  { label: 'Бэкап', fn: 'loadReadiness', arg: 'backup' }] },
+    ] },
+  ];
+
+  const BLOCK_BY_OUT = {};
+  CLUSTER_GROUPS.forEach(g => g.blocks.forEach(b => { BLOCK_BY_OUT[b.out] = b; }));
+
+  // Какие блоки раскрыты — переживает перезагрузку: раскрывший блок
+  // осознанно хочет видеть его раскрытым и завтра
+  const OPEN_KEY = 'mysql-ai-agent.blocks';
+
+  function openSet() {
+    try { return new Set(JSON.parse(localStorage.getItem(OPEN_KEY) || '[]')); }
+    catch (e) { return new Set(); }
   }
 
-  function pct(v) { return isNaN(num(v)) ? '—' : num(v).toFixed(0) + '%'; }
+  function rememberOpen(id, open) {
+    const set = openSet();
+    open ? set.add(id) : set.delete(id);
+    try { localStorage.setItem(OPEN_KEY, JSON.stringify([...set])); }
+    catch (e) { /* приватный режим */ }
+  }
+
+  // ── Плитки состояния ────────────────────────────────────────────
+  // Цвет сам по себе ничего не значит для того, кто его не различает, и
+  // мало что говорит новичку. Поэтому у каждой тревожной плитки есть
+  // слово: «норма», «внимание», «критично» — цвет только подсказка.
+
+  const MARK = { ok: '✓', warn: '!', bad: '✕' };
+  const WORD = { ok: 'норма', warn: 'внимание', bad: 'критично' };
+
+  function level(value, warn, bad) {
+    const v = num(value);
+    if (isNaN(v)) return '';
+    return v >= bad ? 'bad' : v >= warn ? 'warn' : 'ok';
+  }
+
+  function microSpark(points, status) {
+    if (!points || points.length < 2) return '';
+    const w = 100, h = 22;
+    const ys = points.map(p => p[1]);
+    let lo = Math.min(...ys), hi = Math.max(...ys);
+    if (hi === lo) { hi = lo + 1; lo = Math.max(0, lo - 1); }
+    const step = w / (points.length - 1);
+    const d = points.map((p, i) =>
+      (i ? 'L' : 'M') + (i * step).toFixed(1) + ' ' +
+      (h - 2 - ((p[1] - lo) / (hi - lo)) * (h - 4)).toFixed(1)).join(' ');
+    return '<svg class="spark" viewBox="0 0 ' + w + ' ' + h +
+           '" preserveAspectRatio="none" aria-hidden="true">' +
+           '<path d="' + d + '" fill="none" stroke="currentColor" ' +
+           'stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>' +
+           '</svg>';
+  }
+
+  function statTile(t) {
+    const st = t.status || '';
+    const shown = t.value === undefined || t.value === null || t.value === '—'
+      ? '—' : t.value;
+    const meter = (t.meter !== undefined && !isNaN(num(t.meter)))
+      ? '<div class="meter" role="img" aria-label="' + esc(t.label) + ': ' +
+        Math.round(num(t.meter)) + ' из ' + (t.meterMax || 100) + '">' +
+        '<i style="width:' +
+        Math.max(2, Math.min(100, num(t.meter) / (t.meterMax || 100) * 100)).toFixed(0) +
+        '%"></i></div>'
+      : '';
+    const badge = st && st !== 'ok'
+      ? '<span class="pill ' + st + '">' + MARK[st] + ' ' + WORD[st] + '</span>' : '';
+    return '<div class="stat ' + st + '" title="' + esc(t.hint || t.label) + '">' +
+           '<div class="stat-label">' + esc(t.label) + '</div>' +
+           '<div class="stat-row"><span class="stat-value">' + esc(String(shown)) +
+           (t.unit ? '<span class="stat-unit">' + esc(t.unit) + '</span>' : '') +
+           '</span>' + badge + '</div>' + meter +
+           (t.spark ? '<div class="stat-spark">' + t.spark + '</div>' : '') +
+           '</div>';
+  }
+
+  // Общий вывод по кластеру одной фразой. Человек, открывший страницу,
+  // хочет узнать «всё ли в порядке» раньше, чем начнёт читать числа.
+  function verdict(p, lag, hasReplica) {
+    if (num(p.mysql_up) !== 1) {
+      return { st: 'bad', text: 'MySQL не отвечает' };
+    }
+    const worries = [];
+    if (num(p.connections_pct) > 80) worries.push('соединения на пределе');
+    if (num(p.cpu_pct) > 85) worries.push('процессор загружен');
+    if (num(p.iowait_pct) > 20) worries.push('диск не успевает');
+    if (hasReplica && num(lag) > 300) worries.push('реплика сильно отстала');
+    if (worries.length) {
+      return { st: 'bad', text: 'Требует внимания: ' + worries.join(', ') };
+    }
+    const notes = [];
+    if (num(p.slow_qps) > 1) notes.push('много медленных запросов');
+    if (hasReplica && num(lag) > 60) notes.push('реплика отстаёт');
+    if (num(p.connections_pct) > 60) notes.push('соединений больше обычного');
+    if (notes.length) {
+      return { st: 'warn', text: 'Есть на что посмотреть: ' + notes.join(', ') };
+    }
+    return { st: 'ok', text: 'Работает нормально' };
+  }
+
+  function pct(v) { return isNaN(num(v)) ? '—' : num(v).toFixed(0); }
+
+  function blockHtml(b) {
+    const buttons = b.actions.map(a =>
+      '<button class="ghost-btn" data-run="' + a.fn +
+      (a.arg ? '" data-arg="' + a.arg : '') + '">' + esc(a.label) + '</button>').join('');
+    return '<section class="blk" id="blk-' + b.id + '" data-out="' + b.out + '">' +
+           '<div class="blk-head">' +
+           '<button class="blk-toggle" type="button" aria-expanded="false">' +
+           '<span class="caret" aria-hidden="true"></span>' +
+           '<span class="blk-name">' + esc(b.name) + '</span>' +
+           '<span class="blk-short">' + esc(b.short) + '</span>' +
+           '</button>' +
+           '<span class="blk-actions">' + buttons + '</span></div>' +
+           '<div class="blk-body" hidden>' +
+           '<p class="blk-about">' + esc(b.about) + '</p>' +
+           '<div class="blk-out" id="' + b.out + '"></div>' +
+           '</div></section>';
+  }
+
+  function toggleBlock(section, open) {
+    const body = section.querySelector('.blk-body');
+    const btn = section.querySelector('.blk-toggle');
+    body.hidden = !open;
+    section.classList.toggle('open', open);
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+
+  function bindBlocks(box) {
+    const open = openSet();
+
+    // Карточка графиков сворачивается тем же жестом, что и блоки
+    const cards = box.querySelector('#charts-card');
+    if (cards) {
+      const body = cards.querySelector('.card-body');
+      const show = (on) => {
+        cards.classList.toggle('folded', !on);
+        body.hidden = !on;
+      };
+      // По умолчанию раскрыто — за графиками сюда и приходят. В памяти
+      // держим только осознанное «свернуть».
+      if (open.has('charts-folded')) show(false);
+      cards.querySelector('.card-fold').addEventListener('click', () => {
+        const on = cards.classList.contains('folded');
+        show(on);
+        rememberOpen('charts-folded', !on);
+      });
+    }
+    box.querySelectorAll('.blk').forEach(section => {
+      const id = section.id.replace('blk-', '');
+      section.querySelector('.blk-toggle').addEventListener('click', () => {
+        const now = section.querySelector('.blk-body').hidden;
+        toggleBlock(section, now);
+        rememberOpen(id, now);
+      });
+      if (open.has(id)) toggleBlock(section, true);
+    });
+
+    // Кнопки блоков — одним слушателем на контейнер: разметка
+    // перерисовывается целиком, и вешать их поимённо значит терять их
+    box.addEventListener('click', ev => {
+      const explain = ev.target.closest('button[data-explain]');
+      if (explain) { explainBlock(explain); return; }
+
+      const expand = ev.target.closest('button[data-expand]');
+      if (expand) {
+        const pre = expand.closest('.blk').querySelector('.output');
+        const clipped = pre.classList.toggle('clipped');
+        expand.textContent = clipped ? 'Показать целиком' : 'Свернуть вывод';
+        return;
+      }
+
+      const btn = ev.target.closest('button[data-run]');
+      if (!btn) return;
+      const section = btn.closest('.blk');
+      if (section) {
+        toggleBlock(section, true);
+        rememberOpen(section.id.replace('blk-', ''), true);
+      }
+      const fn = App[btn.dataset.run];
+      if (typeof fn === 'function') {
+        btn.dataset.arg ? fn(btn.dataset.arg, btn) : fn(btn);
+      }
+    });
+  }
 
   async function loadClusterPage(btn) {
     if (btn) return withBusy(btn, () => loadClusterPage());
@@ -1712,248 +2007,136 @@ const App = (() => {
       // диагностика) грузится по кнопке: у профиля окно в секундах, и ждать
       // его при каждом открытии страницы незачем
       const [st, ch, al] = await Promise.all([
-        fetch('clusters/' + encodeURIComponent(name) + '/status').then(r => r.json()),
-        fetch('api/charts/' + encodeURIComponent(name) + '?hours=' + hours).then(r => r.json()),
-        fetch('alerts/history?cluster=' + encodeURIComponent(name) + '&hours=24&limit=10')
-          .then(r => r.json()),
+        getJson('clusters/' + encodeURIComponent(name) + '/status'),
+        getJson('api/charts/' + encodeURIComponent(name) + '?hours=' + hours),
+        getJson('alerts/history?cluster=' + encodeURIComponent(name) +
+                '&hours=24&limit=10'),
       ]);
 
       const p = st.primary || {};
       const r = st.replica || {};
       const lag = r.replication_lag_over_plan_s;
+      const charts = {};
+      (ch.charts || []).forEach(c => { charts[c.key] = c; });
+      const spark = (key, status) =>
+        charts[key] ? microSpark(charts[key].points, status) : '';
+
+      const up = num(p.mysql_up) === 1;
+      const state1 = verdict(p, lag, !!meta.replica_ip);
+
+      // ── Шапка: кто это, как себя чувствует, что с ним можно сделать
+      let html = '<div class="cl-top ' + state1.st + '">' +
+        '<div class="cl-verdict"><span class="dot"></span>' +
+        '<div><div class="cl-state">' + esc(state1.text) + '</div>' +
+        '<div class="cl-where">' + esc(meta.primary_ip || '') +
+        (meta.replica_ip ? ' · реплика ' + esc(meta.replica_ip) : '') +
+        (meta.app_ip ? ' · ядро ' + esc(meta.app_ip) : '') +
+        ' · обновлено ' + new Date().toTimeString().slice(0, 5) +
+        '</div></div></div>' +
+        '<button class="ghost-btn" onclick="App.askAboutCluster()">' +
+        'Спросить агента об этом</button></div>';
+
+      // ── Состояние одним взглядом
       const tiles = [
-        tile('MySQL', p.mysql_up == 1 ? 'работает' : 'НЕ ОТВЕЧАЕТ',
-             p.mysql_up == 1 ? 'good' : 'bad'),
-        tile('Запросов/с', p.qps ?? '—'),
-        tile('Медленных/с', p.slow_qps ?? '—', num(p.slow_qps) > 1 ? 'warn' : ''),
-        tile('Соединений', pct(p.connections_pct),
-             num(p.connections_pct) > 80 ? 'bad' : num(p.connections_pct) > 60 ? 'warn' : ''),
-        tile('CPU', pct(p.cpu_pct), num(p.cpu_pct) > 85 ? 'warn' : ''),
-        tile('iowait', pct(p.iowait_pct), num(p.iowait_pct) > 20 ? 'warn' : ''),
+        statTile({ label: 'MySQL', value: up ? 'работает' : 'не отвечает',
+                   status: up ? 'ok' : 'bad',
+                   hint: 'Отвечает ли сервер на опрос экспортёра' }),
+        statTile({ label: 'Запросов/с', value: fmtNum(p.qps),
+                   spark: spark('qps'),
+                   hint: 'Запросов в секунду к основному серверу' }),
+        statTile({ label: 'Медленных/с', value: fmtNum(p.slow_qps),
+                   status: level(p.slow_qps, 0.5, 2), spark: spark('slow'),
+                   hint: 'Запросы дольше long_query_time' }),
+        statTile({ label: 'Соединения', value: pct(p.connections_pct), unit: '%',
+                   status: level(p.connections_pct, 60, 80),
+                   meter: num(p.connections_pct), spark: spark('conn_pct'),
+                   hint: 'Занято от max_connections' }),
+        statTile({ label: 'CPU', value: pct(p.cpu_pct), unit: '%',
+                   status: level(p.cpu_pct, 70, 85),
+                   meter: num(p.cpu_pct), spark: spark('cpu'),
+                   hint: 'Загрузка процессора основного сервера' }),
+        statTile({ label: 'iowait', value: pct(p.iowait_pct), unit: '%',
+                   status: level(p.iowait_pct, 10, 20),
+                   meter: num(p.iowait_pct), meterMax: 50, spark: spark('iowait'),
+                   hint: 'Процессор ждёт диск. Выше 20% — диск не успевает' }),
       ];
       if (meta.replica_ip) {
-        tiles.push(tile('Лаг сверх плана',
-                        isNaN(num(lag)) ? '—' : num(lag).toFixed(0) + ' с',
-                        num(lag) > 300 ? 'bad' : num(lag) > 60 ? 'warn' : 'good'));
+        tiles.push(statTile({
+          label: 'Лаг реплики', value: isNaN(num(lag)) ? '—' : num(lag).toFixed(0),
+          unit: ' с', status: level(lag, 60, 300), spark: spark('repl_lag'),
+          hint: 'Отставание сверх запланированной задержки' }));
       }
+      html += '<div class="kpi">' + tiles.join('') + '</div>';
 
-      let html = '<div class="tiles">' + tiles.join('') + '</div>';
-
-      // Общий разбор идёт первым: главное обычно видно на пересечении
-      // блоков, а не внутри одного из них
-      html += '<div class="card" id="insight-card"><h4>Разбор ИИ по кластеру' +
-              '<button class="ghost-btn lazy" onclick="App.explainAll(this)">' +
-              'Разобрать всё собранное</button></h4>' +
+      // ── Разбор ИИ: сразу под состоянием, потому что ради вывода
+      // человек сюда и пришёл
+      html += '<section class="card insight" id="insight-card">' +
+              '<div class="card-head"><h4>Разбор по кластеру</h4>' +
+              '<button class="accent-btn" onclick="App.explainAll(this)">' +
+              'Разобрать всё собранное</button></div>' +
               '<div id="cluster-insight" class="muted small">' +
-              'Модель посмотрит на всё, что собрано на этой странице, разом: ' +
-              'состояние, профиль нагрузки, репликацию, настройки, запас ' +
-              'ресурсов — и скажет, что из этого складывается в одну причину. ' +
-              'Чем больше блоков вы раскрыли кнопками ниже, тем полнее разбор.' +
-              '</div></div>';
+              'Модель посмотрит разом на всё, что собрано на этой странице: ' +
+              'самое важное обычно видно не внутри одного блока, а на их ' +
+              'пересечении. Чем больше блоков раскрыто, тем полнее разбор.' +
+              '</div></section>';
 
+      // ── Графики
       if (ch.charts && ch.charts.length) {
-        html += '<div class="card"><h4>Метрики за ' + hours + ' ч</h4>' +
-                '<div id="cluster-charts"></div></div>';
+        const pdf = 'report?cluster=' + encodeURIComponent(name) +
+                    '&hours=' + encodeURIComponent(hours);
+        html += '<section class="card foldable" id="charts-card">' +
+                '<div class="card-head">' +
+                '<button class="card-fold" type="button">' +
+                '<span class="caret" aria-hidden="true"></span>' +
+                '<h4>Метрики за ' + hours + ' ч</h4>' +
+                '<span class="muted small">' + ch.charts.length +
+                ' графиков</span></button>' +
+                '<a class="ghost-btn" href="' + pdf + '" target="_blank" ' +
+                'rel="noopener">Выгрузить PDF</a></div>' +
+                '<div class="card-body"><div class="cg-grid">' +
+                ch.charts.map(chartCard).join('') + '</div></div></section>';
       }
 
-      html += `
-        <div class="card">
-          <h4>Что нагружает базу сейчас
-            <button class="ghost-btn lazy" onclick="App.loadWorkload(this)">Снять профиль</button></h4>
-          <div id="cluster-workload" class="muted small">
-            Два среза performance_schema с интервалом в несколько секунд —
-            показывает то, что исполняется именно сейчас, а не средние за всё
-            время работы сервера.</div>
-        </div>
-        <div class="card">
-          <h4>Репликация
-            <button class="ghost-btn lazy" onclick="App.loadReplication(this)">Проверить</button></h4>
-          <div id="cluster-repl" class="muted small">
-            Состояние потоков, ошибки применения, отставание сверх
-            запланированного.</div>
-        </div>
-        <div class="card">
-          <h4>Диагностика Performance Schema
-            <button class="ghost-btn lazy" onclick="App.loadDiag(this)">Выполнить</button></h4>
-          <div id="cluster-diag" class="muted small">
-            Тяжёлые запросы, полные сканирования, ожидания блокировок,
-            планы выполнения.</div>
-        </div>
-        <div class="card">
-          <h4>Запас по ресурсам
-            <button class="ghost-btn lazy" onclick="App.loadForecast(this)">Посчитать</button></h4>
-          <div id="cluster-forecast" class="muted small">
-            Через сколько кончится место на дисках, когда упрёмся в предел
-            соединений и сколько осталось до переполнения автоинкрементов.</div>
-        </div>
-        <div class="card">
-          <h4>Настройки MySQL
-            <button class="ghost-btn lazy" onclick="App.loadConfigAudit(this)">Разобрать</button></h4>
-          <div id="cluster-config" class="muted small">
-            Что выставлено неудачно и чем это грозит, с пометкой, что можно
-            менять на ходу.</div>
-        </div>
-        <div class="card">
-          <h4>Рост данных
-            <button class="ghost-btn lazy" onclick="App.loadGrowth(this)">Показать</button>
-          </h4>
-          <div id="cluster-growth" class="muted small">
-            Что растёт быстрее всех, где место не вернулось диску, где нет
-            первичного ключа.</div>
-        </div>
-        <div class="card">
-          <h4>Отклонения от обычного
-            <button class="ghost-btn lazy" onclick="App.loadAnomalies(this)">Сверить</button></h4>
-          <div id="cluster-anomaly" class="muted small">
-            Сравнение с медианой за несколько недель на этот же час: ловит то,
-            на что нет порога.</div>
-        </div>
-        <div class="card">
-          <h4>Лишние индексы
-            <button class="ghost-btn lazy" onclick="App.loadIndexes(this)">Найти</button></h4>
-          <div id="cluster-indexes" class="muted small">
-            Дублирующие и избыточные: индекс по (a) не нужен, когда есть
-            (a, b), — он занимает место и обновляется при каждой вставке.</div>
-        </div>
-        <div class="card">
-          <h4>Изменения настроек
-            <button class="ghost-btn lazy" onclick="App.loadConfigChanges(this)">Показать</button></h4>
-          <div id="cluster-changes" class="muted small">
-            Что менялось за месяц и когда — первое, что нужно при внезапной
-            деградации.</div>
-        </div>
-        <div class="card">
-          <h4>Резервные копии
-            <button class="ghost-btn lazy" onclick="App.loadBackups(this)">Проверить</button></h4>
-          <div id="cluster-backups" class="muted small">
-            Возраст и размер последней копии на серверах кластера.</div>
-        </div>
-        <div class="card">
-          <h4>Можно ли трогать
-            <span>
-              <button class="ghost-btn lazy" onclick="App.loadReadiness('restart', this)">Перезапуск</button>
-              <button class="ghost-btn lazy" onclick="App.loadReadiness('alter', this)">ALTER</button>
-              <button class="ghost-btn lazy" onclick="App.loadReadiness('backup', this)">Бэкап</button>
-            </span>
-          </h4>
-          <div id="cluster-ready" class="muted small">
-            Долгие транзакции, зависшие запросы, ожидание блокировок,
-            состояние реплик — то, что проверяют перед обслуживанием.</div>
-        </div>`;
+      // ── Блоки диагностики по группам
+      html += CLUSTER_GROUPS.map(g =>
+        '<div class="blk-group"><div class="group-title">' + esc(g.title) +
+        '</div>' + g.blocks.map(blockHtml).join('') + '</div>').join('');
 
-      html += '<div class="card"><h4>События за сутки</h4>' +
+      // ── События
+      html += '<section class="card"><div class="card-head">' +
+              '<h4>События за сутки</h4></div>' +
               (al.items && al.items.length
-                ? al.items.map(a => `
-                    <div class="alert-item">
-                      <div><b>${esc(a.alert)}</b>
-                        <span class="ctx-chip">${esc(a.severity || '?')}</span>
-                        <span class="muted">${esc(String(a.ts).slice(0, 16).replace('T', ' '))}</span></div>
-                      <div class="muted" style="font-size:12px">${esc(a.summary || '')}</div>
-                    </div>`).join('')
-                : '<div class="muted small">Событий не было.</div>') +
-              '</div>';
+                ? al.items.map(a =>
+                    '<div class="alert-item"><div><b>' + esc(a.alert) + '</b> ' +
+                    '<span class="ctx-chip">' + esc(a.severity || '?') + '</span> ' +
+                    '<span class="muted">' +
+                    esc(String(a.ts).slice(0, 16).replace('T', ' ')) + '</span></div>' +
+                    '<div class="muted" style="font-size:12px">' +
+                    esc(a.summary || '') + '</div></div>').join('')
+                : '<div class="muted small">Событий не было — это хорошая новость.</div>') +
+              '</section>';
 
       box.innerHTML = html;
-      decorateCards(box);
-      if (ch.charts && ch.charts.length) {
-        attachCharts($('cluster-charts'),
-                     { cluster: name, hours: hours, charts: ch.charts,
-                       mode: 'inline' });
-      }
+      bindBlocks(box);
       loadNotes();
     } catch (e) {
-      box.innerHTML = '<div class="muted">Не удалось собрать данные: ' + esc(e) + '</div>';
+      box.innerHTML = '<div class="muted">Не удалось собрать данные: ' +
+                      esc(e.message || e) + '</div>';
     }
   }
 
-  // ═══ РАЗБОР СТРАНИЦЫ КЛАСТЕРА ═══════════════════════════════════
-  // Каждый блок можно свернуть и попросить разобрать. Само по себе
-  // «Handler_read_rnd_next 4 млрд» ничего не говорит человеку, который
-  // пришёл разбираться в аварии, а не изучать performance_schema.
+  // ═══ РАЗБОР СОБРАННОГО ══════════════════════════════════════════
+  // Само по себе «Handler_read_rnd_next 4 млрд» ничего не говорит тому,
+  // кто пришёл разбираться в аварии, а не изучать performance_schema.
 
-  const FOLD_KEY = 'mysql-ai-agent.folded';
-
-  function foldedSet() {
-    try { return new Set(JSON.parse(localStorage.getItem(FOLD_KEY) || '[]')); }
-    catch (e) { return new Set(); }
+  function blockTitle(section) {
+    const name = section.querySelector('.blk-name');
+    return name ? name.textContent.trim() : 'Блок';
   }
 
-  function rememberFold(key, folded) {
-    const set = foldedSet();
-    folded ? set.add(key) : set.delete(key);
-    try { localStorage.setItem(FOLD_KEY, JSON.stringify([...set])); }
-    catch (e) { /* приватный режим */ }
-  }
-
-  function cardTitle(card) {
-    const h = card.querySelector('h4');
-    if (!h) return 'Блок';
-    // В заголовке живут кнопки — берём только собственный текст
-    return [...h.childNodes]
-      .filter(n => n.nodeType === 3).map(n => n.textContent).join(' ')
-      .replace(/\s+/g, ' ').trim() || 'Блок';
-  }
-
-  // Текст блока — то же, что видит человек. Разбирать надо именно это,
-  // а не пересобранный на сервере срез пятью минутами позже.
-  function cardText(card) {
-    const parts = [];
-    card.querySelectorAll('pre.output, .res-wrap table').forEach(el =>
-      parts.push(el.innerText || el.textContent || ''));
-    if (!parts.length) {
-      const body = card.querySelector('.tiles, .lazy-body');
-      if (body) parts.push(body.innerText || '');
-    }
-    return parts.join('\n\n').trim();
-  }
-
-  function setFold(card, folded) {
-    card.classList.toggle('folded', folded);
-    const btn = card.querySelector('.fold-btn');
-    if (btn) {
-      btn.textContent = folded ? '▸' : '▾';
-      btn.title = folded ? 'Развернуть' : 'Свернуть';
-    }
-  }
-
-  function decorateCards(box) {
-    if (!box) return;
-    const folded = foldedSet();
-    box.querySelectorAll('.card').forEach(card => {
-      const head = card.querySelector('h4');
-      if (!head) return;
-      const key = cardTitle(card);
-
-      if (!card.dataset.folding) {
-        card.dataset.folding = '1';
-        const fold = document.createElement('button');
-        fold.type = 'button';
-        fold.className = 'fold-btn';
-        fold.textContent = '▾';
-        fold.title = 'Свернуть';
-        fold.addEventListener('click', ev => {
-          ev.stopPropagation();
-          const now = !card.classList.contains('folded');
-          setFold(card, now);
-          rememberFold(key, now);
-        });
-        head.insertBefore(fold, head.firstChild);
-        if (folded.has(key)) setFold(card, true);
-      }
-
-      // Кнопка разбора появляется, только когда в блоке есть что разбирать
-      const has = cardText(card).length > 40;
-      let ai = card.querySelector('.ai-btn');
-      if (has && !ai) {
-        ai = document.createElement('button');
-        ai.type = 'button';
-        ai.className = 'ghost-btn ai-btn';
-        ai.textContent = 'Разобрать';
-        ai.title = 'Объяснить, что здесь важно и что делать';
-        ai.addEventListener('click', () => explainCard(card, ai));
-        head.appendChild(ai);
-      }
-    });
+  function blockText(section) {
+    const out = section.querySelector('.blk-out');
+    return out ? (out.innerText || out.textContent || '').trim() : '';
   }
 
   async function askInsight(blocks, scope, question) {
@@ -1965,25 +2148,26 @@ const App = (() => {
     });
   }
 
-  function insightBox(card) {
-    let box = card.querySelector('.ai-box');
+  function insightBox(section) {
+    let box = section.querySelector('.ai-box');
     if (!box) {
       box = document.createElement('div');
       box.className = 'ai-box';
-      card.appendChild(box);
+      section.querySelector('.blk-body').appendChild(box);
     }
     return box;
   }
 
-  async function explainCard(card, btn) {
-    const text = cardText(card);
+  async function explainBlock(btn) {
+    const section = btn.closest('.blk');
+    if (!section) return;
+    const text = blockText(section);
     if (!text) return;
-    const box = insightBox(card);
-    setFold(card, false);
+    const box = insightBox(section);
     setBusy(box, 'Модель разбирает этот блок…');
     await withBusy(btn, async () => {
       try {
-        const d = await askInsight([{ title: cardTitle(card), text: text }], 'one');
+        const d = await askInsight([{ title: blockTitle(section), text: text }], 'one');
         box.innerHTML = '<div class="ai-head">Разбор модели</div>' +
                         renderMarkdown(d.text || '');
       } catch (e) {
@@ -1999,17 +2183,16 @@ const App = (() => {
     const box = $('cluster-insight');
     if (!box) return;
     const blocks = [];
-    document.querySelectorAll('#cluster-body .card').forEach(card => {
-      if (card.id === 'insight-card') return;
-      const text = cardText(card);
-      if (text.length > 40) blocks.push({ title: cardTitle(card), text: text });
+    document.querySelectorAll('#cluster-body .blk').forEach(section => {
+      const text = blockText(section);
+      if (text.length > 40) blocks.push({ title: blockTitle(section), text: text });
     });
-    const tiles = document.querySelector('#cluster-body .tiles');
-    if (tiles) blocks.unshift({ title: 'Состояние сейчас', text: tiles.innerText });
+    const kpi = document.querySelector('#cluster-body .kpi');
+    if (kpi) blocks.unshift({ title: 'Состояние сейчас', text: kpi.innerText });
 
     if (!blocks.length) {
       box.innerHTML = '<div class="muted small">Пока нечего разбирать: ' +
-        'соберите блоки кнопками выше — профиль нагрузки, репликацию, ' +
+        'снимите хотя бы один блок ниже — профиль нагрузки, репликацию, ' +
         'настройки — и нажмите ещё раз.</div>';
       return;
     }
@@ -2027,16 +2210,42 @@ const App = (() => {
     });
   }
 
+
+  // Длинный вывод не должен выталкивать всё остальное за экран: держим
+  // его в окне с прокруткой, с возможностью раскрыть целиком.
+  const OUTPUT_TALL_LINES = 24;
+
+  function markLoaded(section, text) {
+    section.classList.add('done');
+    const rows = text.split('\n').length;
+    let foot = section.querySelector('.blk-foot');
+    if (!foot) {
+      foot = document.createElement('div');
+      foot.className = 'blk-foot';
+      section.querySelector('.blk-body').appendChild(foot);
+    }
+    foot.innerHTML =
+      '<span class="muted small">снято ' +
+      new Date().toTimeString().slice(0, 5) + ' · строк: ' + rows + '</span>' +
+      '<span class="blk-foot-acts">' +
+      (rows > OUTPUT_TALL_LINES
+        ? '<button class="ghost-btn" data-expand>Показать целиком</button>' : '') +
+      '<button class="ghost-btn" data-explain>Разобрать</button></span>';
+    const pre = section.querySelector('.blk-out .output');
+    if (pre && rows > OUTPUT_TALL_LINES) pre.classList.add('clipped');
+  }
+
   async function lazyBlock(id, url, label, btn) {
     const box = $(id);
     if (!box) return;
     if (btn) return withBusy(btn, () => lazyBlock(id, url, label));
     box.innerHTML = busyHtml(label);
+    const section = box.closest('.blk');
     try {
       const d = await getJson(url);
-      box.innerHTML = '<pre class="output">' +
-                      esc(d.text || d.report || d.error || 'Нет данных.') + '</pre>';
-      decorateCards($('cluster-body'));
+      const text = d.text || d.report || d.error || 'Нет данных.';
+      box.innerHTML = '<pre class="output">' + esc(text) + '</pre>';
+      if (section) markLoaded(section, text);
     } catch (e) {
       box.innerHTML = '<span class="muted small">Не получилось: ' +
                       esc(e.message || e) + '</span>';

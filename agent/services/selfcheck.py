@@ -22,6 +22,7 @@ from agent.core.config import settings
 from agent.db.base import session_scope
 from agent.db.repositories.alerts import AlertRepository
 from agent.services.mysql import cluster_db_creds, sql_execute
+from agent.services.prometheus import http_client
 from agent.services.registry import app_host, cluster_hosts, enabled_clusters
 from agent.services.ssh import remote_time
 
@@ -37,7 +38,7 @@ def _item(name: str, ok: bool, detail: str, fix: str = "") -> dict:
 
 async def check_prometheus() -> dict:
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with http_client(timeout=10) as client:
             r = await client.get(settings.prometheus.url + "/api/v1/query",
                                  params={"query": "up"})
             data = r.json()

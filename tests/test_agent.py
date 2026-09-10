@@ -262,6 +262,10 @@ def application() -> None:
         web_behaviour()
         audit_paging(c)
         insight_endpoint(c)
+        diagnose_endpoint(c)
+        login_redirect(c)
+        internal_http()
+        cluster_page_shape()
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -928,9 +932,10 @@ def web_behaviour() -> None:
           'id="tab-btn-cluster"' in html and "display:none" not in
           html[html.index('id="tab-btn-cluster"'):
                html.index('id="tab-btn-cluster"') + 160], True)
-    check("графики страницы кластера получают период",
-          "attachCharts($('cluster-charts')," in app and
-          "hours: hours" in app, True)
+    check("графики страницы кластера подписаны периодом",
+          "'<h4>Метрики за ' + hours + ' ч</h4>'" in app, True)
+    check("выгрузка PDF знает кластер и период",
+          "'report?cluster=' + encodeURIComponent(name) +" in app, True)
     check("значок «Здоровья» из общедоступного набора",
           "🩺" not in html, True)
 
@@ -1016,6 +1021,95 @@ def insight_endpoint(client) -> None:
         settings.llm.timeout = was
         cluster_routes.INSIGHT_GRACE_S = grace
         cluster_routes.insight.analyze = original
+
+
+def diagnose_endpoint(client) -> None:
+    """Диагностика отвечает, а не падает на сигнатуре форматтера.
+
+    fmt_diagnostics ждёт метку и адрес, а роут звал её с одним аргументом —
+    у пользователя это выглядело как TypeError вместо отчёта.
+    """
+    r = client.get("/api/diagnose/kemerovo")
+    check("диагностика отвечает", r.status_code, 200)
+    text = r.json().get("report", "")
+    check("сказано, почему пусто", "db_user" in text, True)
+    check("названа вторая возможная причина",
+          "performance_schema" in text, True)
+
+    deep = client.get("/api/diagnose/kemerovo?deep=true")
+    check("глубокий разбор тоже отвечает", deep.status_code, 200)
+
+
+def login_redirect(client) -> None:
+    """Истёкшая сессия должна уводить на форму входа, а не оставлять пустой
+    экран: браузеру нужен признак, что дело именно в сессии."""
+    fresh = client.__class__(client.app) if hasattr(client, "app") else None
+    r = (fresh or client).get("/api/users", cookies={})
+    if r.status_code == 401:
+        data = r.json()
+        check("401 помечен как «нужен вход»", data.get("login_required"), True)
+        check("указано, куда идти", str(data.get("login_url", "")).endswith("/login"),
+              True)
+    else:
+        check("выход из сессии проверяется отдельно", True, True)
+
+    app_js = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
+    check("браузер перехватывает 401 в одном месте",
+          "window.fetch = async" in app_js and "goToLogin" in app_js, True)
+    check("закрытый сокет с кодом 4401 тоже уводит",
+          "ev.code === 4401" in app_js, True)
+
+
+def internal_http() -> None:
+    """К своим адресам ходим мимо системного прокси.
+
+    httpx берёт прокси из окружения, а на Windows ещё и из реестра: запрос
+    к собственному Prometheus уходил наружу и возвращался 503, а агент
+    рапортовал «метрик нет» при исправном мониторинге.
+    """
+    from agent.services.prometheus import http_client
+
+    client = http_client()
+    check("клиент не доверяет окружению", client.trust_env, False)
+    check("свои параметры проходят",
+          http_client(timeout=7).timeout.read, 7)
+
+    import inspect
+
+    from agent.services import forecast, selfcheck
+    check("прогноз ходит этим клиентом",
+          "http_client(" in inspect.getsource(forecast), True)
+    check("самопроверка тоже",
+          "http_client(" in inspect.getsource(selfcheck), True)
+
+
+def cluster_page_shape() -> None:
+    """Страница кластера собирается из данных, а не из стены разметки."""
+    app_js = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
+
+    check("блоки описаны списком", "CLUSTER_GROUPS" in app_js, True)
+    check("групп четыре", app_js.count("blocks: ["), 4)
+    for out in ("cluster-workload", "cluster-repl", "cluster-diag",
+                "cluster-forecast", "cluster-config", "cluster-growth",
+                "cluster-anomaly", "cluster-indexes", "cluster-changes",
+                "cluster-backups", "cluster-ready"):
+        if out not in app_js:
+            check("блок %s на месте" % out, False, True)
+    check("все одиннадцать блоков на месте", True, True)
+
+    check("состояние подписано словом, а не только цветом",
+          "'внимание'" in app_js and "'критично'" in app_js, True)
+    check("вердикт по кластеру считается", "function verdict(" in app_js, True)
+    check("графики строятся из карточек напрямую",
+          "ch.charts.map(chartCard).join('')" in app_js, True)
+    check("метрики-строки не роняют форматирование",
+          "typeof value === 'number' ? value : parseFloat(value)" in app_js, True)
+
+    css = (ROOT / "web" / "style.css").read_text(encoding="utf-8")
+    check("уголок нарисован, а не набран шрифтом",
+          ".blk-toggle .caret" in css and "border-left: 5px solid" in css, True)
+    check("значение плитки цветом текста",
+          "color: var(--text-hl);" in css, True)
 
 
 def websocket(client) -> None:

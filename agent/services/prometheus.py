@@ -58,6 +58,23 @@ CHART_SPECS = [
 ]
 
 
+
+def http_client(**kwargs) -> httpx.AsyncClient:
+    """Клиент для внутренних адресов — мимо системного прокси.
+
+    httpx по умолчанию берёт прокси из окружения, а на Windows ещё и из
+    реестра. Prometheus, экспортёры и база живут внутри периметра, и
+    отправлять запросы к ним через корпоративный прокси незачем: он в
+    лучшем случае добавит задержку, в худшем — ответит 503 на собственный
+    же адрес, и агент отрапортует «метрик нет» при исправном мониторинге.
+
+    Диагностировать такое почти невозможно: curl с того же сервера
+    работает, а агент видит пустоту.
+    """
+    kwargs.setdefault("trust_env", False)
+    return httpx.AsyncClient(**kwargs)
+
+
 async def prom_query(client: httpx.AsyncClient, query: str) -> Optional[float]:
     try:
         r = await client.get(f"{PROMETHEUS_URL}/api/v1/query",
@@ -179,7 +196,7 @@ async def build_charts(cluster: dict, hours: float,
              if (not s.get("needs_replica") or repl)
              and (not keys or s["key"] in keys)]
 
-    async with httpx.AsyncClient() as client:
+    async with http_client() as client:
         series = await asyncio.gather(
             *[prom_range_series(client, s["expr"].format(**ctx), hours)
               for s in specs])
@@ -204,7 +221,7 @@ async def build_charts(cluster: dict, hours: float,
 
 async def collect_current(cluster: dict) -> dict:
     """Текущие метрики кластера (async, параллельно)."""
-    async with httpx.AsyncClient() as client:
+    async with http_client() as client:
         async def metrics_for(ip: str) -> dict:
             inst  = f"{ip}:9104"
             node  = f"{ip}:9100"
@@ -272,7 +289,7 @@ async def collect_history(cluster: dict, hours: float) -> dict:
     repl = cluster.get("replica_ip", "")
     inst = f"{prim}:9104"
 
-    async with httpx.AsyncClient() as client:
+    async with http_client() as client:
         queries = {
             "qps":             f'rate(mysql_global_status_queries{{instance="{inst}"}}[5m])',
             "slow_qps":        f'rate(mysql_global_status_slow_queries{{instance="{inst}"}}[5m])',

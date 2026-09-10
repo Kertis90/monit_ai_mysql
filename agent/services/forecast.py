@@ -20,7 +20,7 @@ import httpx
 
 from agent.core.config import settings
 from agent.services.mysql import cluster_db_creds, sql_execute
-from agent.services.prometheus import prom_query, prom_query_map
+from agent.services.prometheus import http_client, prom_query, prom_query_map
 from agent.services.registry import cluster_hosts
 
 logger = logging.getLogger("agent.forecast")
@@ -85,7 +85,7 @@ async def disk_forecast(cluster: dict) -> list[dict]:
     непредсказуемы.
     """
     out = []
-    async with httpx.AsyncClient() as client:
+    async with http_client() as client:
         for ip, role in cluster_hosts(cluster):
             node = f'{ip}:9100'
             # Только реальные файловые системы: tmpfs и overlay не интересны
@@ -137,7 +137,7 @@ async def connections_forecast(cluster: dict) -> dict:
     """
     inst = f'{cluster["primary_ip"]}:9104'
     conn_metric = f'mysql_global_status_threads_connected{{instance="{inst}"}}'
-    async with httpx.AsyncClient() as client:
+    async with http_client() as client:
         peak_now, peak_before, cap_raw, now_raw = await asyncio.gather(
             prom_query(client, f'max_over_time({conn_metric}[{TREND_WINDOW}])'),
             prom_query(client,
@@ -232,7 +232,7 @@ async def _why_no_metrics(inst: str, cap) -> str:
     Три разные причины выглядят одинаково («данных нет»), а чинятся
     по-разному, поэтому различаем их явно.
     """
-    async with httpx.AsyncClient() as client:
+    async with http_client() as client:
         up = await prom_query(client, 'up{instance="%s"}' % inst)
         any_status = await prom_query_map(
             client, 'count({__name__=~"mysql_global_status_.+",'

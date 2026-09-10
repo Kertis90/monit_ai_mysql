@@ -241,10 +241,9 @@ async def audit(cluster: dict, host: Optional[str] = None) -> dict:
 
     ram = None
     try:
-        from agent.services.prometheus import prom_query
-        import httpx
+        from agent.services.prometheus import http_client, prom_query
         node = "%s:9100" % (host or cluster["primary_ip"])
-        async with httpx.AsyncClient() as client:
+        async with http_client() as client:
             total = await prom_query(
                 client, 'node_memory_MemTotal_bytes{instance="%s"}' % node)
         if total is not None:

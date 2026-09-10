@@ -20,8 +20,8 @@ from agent.services.intents import parse_step_seconds
 from agent.services.mysql import (cluster_db_creds, db_versions_text,
                                   fmt_sql_result, sql_execute)
 from agent.services.prometheus import (collect_current, collect_history,
-                                       prom_query, prom_range_series,
-                                       prom_range_summary)
+                                       http_client, prom_query,
+                                       prom_range_series, prom_range_summary)
 from agent.services.registry import (cluster_hosts, clusters_index_text,
                                      enabled_clusters)
 
@@ -208,7 +208,7 @@ async def _baseline_at(cluster: dict, hours: float, days_ago: int) -> dict:
         "iowait_pct":      (f'avg by(instance)(rate(node_cpu_seconds_total'
                             f'{{mode="iowait",instance="{prim}:9100"}}[5m] offset {off}))*100'),
     }
-    async with httpx.AsyncClient() as client:
+    async with http_client() as client:
         keys = list(queries.keys())
         res  = await asyncio.gather(
             *[prom_range_summary(client, queries[k], hours) for k in keys])
@@ -629,7 +629,7 @@ async def collect_series_table(cluster: dict, hours: float, step_s: int,
             logger.error(f"Ряд не получен: {e}")
             return {}
 
-    async with httpx.AsyncClient() as client:
+    async with http_client() as client:
         series = await asyncio.gather(
             *[one(client, expr.format(w=w, **ctx)) for _, expr in SERIES_SPECS])
 
