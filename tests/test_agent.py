@@ -266,6 +266,8 @@ def application() -> None:
         login_redirect(c)
         internal_http()
         cluster_page_shape()
+        processlist_block()
+        diagnose_budget()
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -1110,6 +1112,79 @@ def cluster_page_shape() -> None:
           ".blk-toggle .caret" in css and "border-left: 5px solid" in css, True)
     check("значение плитки цветом текста",
           "color: var(--text-hl);" in css, True)
+
+
+def processlist_block() -> None:
+    """Профиль нагрузки показывает и полный текст того, что идёт сейчас.
+
+    Дайджест performance_schema нормализован: значения заменены на «?», а
+    строка обрезана. По такому запросу нельзя ни повторить, ни объяснить,
+    почему он сегодня читает миллион строк.
+    """
+    from agent.services import workload
+
+    check("берётся именно полный список",
+          workload.ACTIVE_SQL, "SHOW FULL PROCESSLIST")
+
+    lines = workload._fmt_active({
+        "total": 412, "sleeping": 409, "busy_total": 3,
+        "items": [
+            {"id": 771, "user": "billing", "from": "10.0.0.9:51844",
+             "db": "lanbilling", "command": "Query", "time_s": 42.0,
+             "state": "Sending data", "cut": False,
+             "query": "SELECT `uid`, `agrm_id` FROM `agreements` "
+                      "WHERE `archive` = 0 AND `balance` < -100"},
+        ]})
+    text = "\n".join(lines)
+    check("виден полный запрос с значениями",
+          "`balance` < -100" in text, True)
+    check("видно, сколько соединений спит", "спящих 409" in text, True)
+    check("видно, сколько запрос уже идёт", "42 с" in text, True)
+    check("видно, кто и откуда", "billing@10.0.0.9" in text, True)
+
+    idle = "\n".join(workload._fmt_active(
+        {"total": 120, "sleeping": 120, "busy_total": 0, "items": []}))
+    check("простой назван простоем", "все 120 соединений простаивают" in idle, True)
+
+    broken = "\n".join(workload._fmt_active({"error": "нет прав"}))
+    check("отказ объяснён, а не проглочен", "нет прав" in broken, True)
+
+
+def diagnose_budget() -> None:
+    """Долгий разбор отвечает раньше, чем прокси теряет терпение."""
+    from agent.services import tasks
+
+    async def scenario():
+        slow_done = {"n": 0}
+
+        async def slow():
+            await asyncio.sleep(0.4)
+            slow_done["n"] += 1
+            return {"report": "готово"}
+
+        data, in_time = await tasks.shared_within("долгая", slow,
+                                                  budget=0.05, ttl=30)
+        check("не успели — сказано честно", in_time, False)
+        check("пустышка вместо результата", data is None, True)
+
+        # Главное: работа не брошена, и следующий спросивший получит готовое
+        await asyncio.sleep(0.6)
+        check("работа доведена до конца", slow_done["n"], 1)
+        again, ok = await tasks.shared_within("долгая", slow, budget=0.05, ttl=30)
+        check("повторный запрос отдаёт готовое", ok, True)
+        check("это тот же результат", again["report"], "готово")
+        check("заново не считали", slow_done["n"], 1)
+        await tasks.shutdown()
+
+    asyncio.run(scenario())
+
+    from agent.services.analysis import DIAG_PARALLEL
+    check("набор идёт не по одному запросу", DIAG_PARALLEL > 1, True)
+    check("но и не всем скопом", DIAG_PARALLEL <= 8, True)
+
+    app_js = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
+    check("504 объясняется по-человечески",
+          "proxy_read_timeout" in app_js and "504" in app_js, True)
 
 
 def websocket(client) -> None:

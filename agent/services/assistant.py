@@ -331,7 +331,9 @@ async def build_chat_context(user_message: str, progress=None
     десятку запросов, чтение логов по SSH. Всё это время человек смотрел на
     три точки и не знал, работает агент или завис.
     """
-    async def step(text: str) -> None:
+    async def say(text: str) -> None:
+        """Рассказать, чем агент занят. Имя нарочно не «step»: рядом уже
+        есть шаг разбивки в секундах, и переменная затирала бы функцию."""
         if progress is not None:
             try:
                 await progress(text)
@@ -363,11 +365,11 @@ async def build_chat_context(user_message: str, progress=None
             blocks.append(notes)
 
         if hours > 0:
-            await step("Читаю метрики Prometheus за %g ч" % hours)
+            await say("Читаю метрики Prometheus за %g ч" % hours)
             hist = await collect_history(cluster, hours)
             blocks.append(fmt_history(hist, cluster["label"]))
             # С чем сравнивать: те же метрики неделю назад
-            await step("Сравниваю с тем же периодом неделю назад")
+            await say("Сравниваю с тем же периодом неделю назад")
             try:
                 base = await collect_baseline(cluster, hours)
                 cmp_block = fmt_baseline(hist, base, cluster["label"])
@@ -385,7 +387,7 @@ async def build_chat_context(user_message: str, progress=None
                 # и ресурсы у них разные
                 for tb in await collect_series_tables(cluster, hours, step):
                     blocks.append(fmt_series_table(tb, cluster["label"]))
-        await step("Снимаю текущее состояние " + cluster["label"])
+        await say("Снимаю текущее состояние " + cluster["label"])
         current = await collect_current(cluster)
         blocks.append(fmt_current(current))
 
@@ -406,7 +408,7 @@ async def build_chat_context(user_message: str, progress=None
         if detect_diagnose_intent(user_message) and cluster_db_creds(cluster):
             # Что грузит базу ПРЯМО СЕЙЧАС. Накопленная статистика показывает
             # средние за всё время работы сервера и текущую проблему прячет.
-            await step("Снимаю профиль нагрузки: два среза performance_schema")
+            await say("Снимаю профиль нагрузки: два среза performance_schema")
             live = await workload_delta(cluster)
             if live.get("error"):
                 gaps.append("не снят профиль нагрузки: %s" % live["error"])
@@ -414,7 +416,7 @@ async def build_chat_context(user_message: str, progress=None
                 blocks.append(fmt_workload(live, cluster["label"]))
 
             # Лаг говорит «на сколько», состояние репликации — «почему»
-            await step("Проверяю состояние репликации")
+            await say("Проверяю состояние репликации")
             repl = await collect_replication(cluster)
             block = fmt_replication(repl, cluster["label"])
             if block:
@@ -425,7 +427,7 @@ async def build_chat_context(user_message: str, progress=None
                                 % state["error"])
 
             for ip, role in cluster_hosts(cluster):
-                await step("Диагностические запросы на %s (%s)" % (ip, role))
+                await say("Диагностические запросы на %s (%s)" % (ip, role))
                 diag = await run_diagnostics(cluster, ip)
                 if diag:
                     blocks.append(fmt_diagnostics(
@@ -442,7 +444,7 @@ async def build_chat_context(user_message: str, progress=None
 
             # Планы выполнения — превращают «запрос медленный»
             # в конкретную рекомендацию по индексам
-            await step("Строю планы выполнения тяжёлых запросов")
+            await say("Строю планы выполнения тяжёлых запросов")
             try:
                 plans = await explain_top_queries(cluster, cluster["primary_ip"])
                 if plans:
@@ -468,7 +470,7 @@ async def build_chat_context(user_message: str, progress=None
         if detect_log_intent(user_message):
             win = hours if hours > 0 else 2.0
             for ip, role in cluster_hosts(cluster):
-                await step("Читаю логи на %s по SSH" % ip)
+                await say("Читаю логи на %s по SSH" % ip)
                 t = await remote_time(ip)
                 if t is None:
                     gaps.append("логи с %s (%s) не прочитаны: сервер не "

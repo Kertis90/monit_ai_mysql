@@ -183,8 +183,17 @@ const App = (() => {
     let data = null;
     try { data = JSON.parse(body); } catch (e) { /* ниже */ }
     if (data === null) {
+      // Ответ не от агента, а от прокси: nginx на исходе своего терпения
+      // отдаёт HTML-страницу. Показывать её целиком незачем — человеку
+      // нужно знать, что делать.
+      if (r.status === 502 || r.status === 503 || r.status === 504) {
+        throw new Error('обратный прокси не дождался ответа (код ' + r.status +
+                        '). Агент продолжает работу — нажмите ещё раз через ' +
+                        'полминуты. Если повторяется, поднимите ' +
+                        'proxy_read_timeout в nginx.');
+      }
       throw new Error('сервер ответил не JSON (код ' + r.status + '): ' +
-                      body.slice(0, 300));
+                      body.slice(0, 200));
     }
     if (!r.ok && data.error) throw new Error(data.error);
     if (!r.ok) throw new Error(data.detail || ('код ' + r.status));
@@ -2245,7 +2254,8 @@ const App = (() => {
       const d = await getJson(url);
       const text = d.text || d.report || d.error || 'Нет данных.';
       box.innerHTML = '<pre class="output">' + esc(text) + '</pre>';
-      if (section) markLoaded(section, text);
+      // Ещё не досчиталось — блок не «собран», и разбирать там нечего
+      if (section && !d.running) markLoaded(section, text);
     } catch (e) {
       box.innerHTML = '<span class="muted small">Не получилось: ' +
                       esc(e.message || e) + '</span>';

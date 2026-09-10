@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
+import os
 import re
 from typing import Optional
 
@@ -26,6 +27,10 @@ from agent.services.registry import (cluster_hosts, clusters_index_text,
                                      enabled_clusters)
 
 logger = logging.getLogger("agent.analysis")
+
+# Сколько диагностических запросов выполняем одновременно. Больше — быстрее,
+# но в режиме туннеля каждый запрос поднимает свой ssh.
+DIAG_PARALLEL = max(1, int(os.environ.get("DIAG_PARALLEL", "4")))
 
 BASELINE_OFFSET_DAYS = settings.prometheus.baseline_offset_days
 BASELINE_WEEKS       = settings.prometheus.baseline_weeks
@@ -381,11 +386,23 @@ async def run_diagnostics(cluster: dict, host: Optional[str] = None,
     sys.innodb_lock_waits и часть представлений есть не во всех сборках."""
     if not cluster_db_creds(cluster):
         return []
+
+    wanted = [q for q in DIAG_QUERIES if not keys or q["key"] in keys]
+
+    # По очереди набор идёт минутами и не укладывается в терпение прокси, а
+    # запросы независимы. Но и разом их пускать нельзя: в режиме туннеля
+    # каждый поднимает свой ssh, и десяток одновременных — это десяток
+    # процессов и соединений к базе.
+    gate = asyncio.Semaphore(DIAG_PARALLEL)
+
+    async def run(q):
+        async with gate:
+            return await sql_execute(cluster, q["sql"], host)
+
+    results = await asyncio.gather(*[run(q) for q in wanted])
+
     out = []
-    for q in DIAG_QUERIES:
-        if keys and q["key"] not in keys:
-            continue
-        res = await sql_execute(cluster, q["sql"], host)
+    for q, res in zip(wanted, results):
         if res.get("error"):
             # необязательные молча пропускаем — иначе половина отчёта
             # состояла бы из «нет доступа к sys»

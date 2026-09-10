@@ -91,6 +91,25 @@ async def shared(key: str, factory: Callable[[], Any],
     return await asyncio.shield(task)
 
 
+async def shared_within(key: str, factory: Callable[[], Any], budget: float,
+                        ttl: float = DEFAULT_TTL) -> tuple:
+    """Подождать результат не дольше budget. Возвращает (результат, успели).
+
+    Не успели — работа НЕ отменяется: она доходит до конца и кладёт
+    результат в кэш, а человек, нажав ещё раз через полминуты, получает
+    его сразу. Это лучше, чем и ждать впустую, и потерять сделанное.
+
+    Смысл в том, чтобы ответить раньше, чем истечёт терпение обратного
+    прокси: nginx по умолчанию ждёт минуту и на её исходе отдаёт 504 —
+    страницу с HTML вместо JSON, из-за которой в интерфейсе появлялась
+    невнятная ошибка разбора.
+    """
+    try:
+        return await asyncio.wait_for(shared(key, factory, ttl), timeout=budget), True
+    except asyncio.TimeoutError:
+        return None, False
+
+
 def drop(key: str) -> None:
     """Забыть результат: нужно после действия, которое его меняет."""
     _cache.pop(key, None)

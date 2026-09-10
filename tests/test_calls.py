@@ -78,6 +78,51 @@ def problem(node: ast.Call, func) -> str:
     return ""
 
 
+def shadowed(tree: ast.AST):
+    """Вложенные функции, чьё имя в той же области затирают переменной.
+
+    Ровно так сломался сбор метрик: внутри build_chat_context объявлена
+    функция step(), а ниже по коду `step = parse_step_seconds(...)` —
+    и следующий её вызов упал с «'int' object is not callable». Имена
+    разрешаются, сигнатуры сходятся, а работает до первой такой строки.
+    """
+    SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+
+    def own_nodes(scope):
+        """Узлы этой области: во вложенные функции не заходим — там своё
+        пространство имён, и присваивание в них ничего не затирает."""
+        stack = list(ast.iter_child_nodes(scope))
+        while stack:
+            node = stack.pop()
+            yield node
+            if not isinstance(node, SCOPES):
+                stack.extend(ast.iter_child_nodes(node))
+
+    found = []
+    scopes = [tree] + [n for n in ast.walk(tree) if isinstance(n, SCOPES)]
+    for scope in scopes:
+        body = getattr(scope, "body", [])
+        if not isinstance(body, list):
+            continue
+        defs = {c.name: c.lineno for c in body
+                if isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        if not defs:
+            continue
+        for node in own_nodes(scope):
+            targets = []
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+                targets = [node.target]
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                targets = [node.target]
+            for t in targets:
+                for name in ast.walk(t):
+                    if isinstance(name, ast.Name) and name.id in defs:
+                        found.append((name.id, defs[name.id], name.lineno))
+    return found
+
+
 bad = 0
 checked = 0
 for info in pkgutil.walk_packages(agent.__path__, "agent."):
@@ -98,6 +143,11 @@ for info in pkgutil.walk_packages(agent.__path__, "agent."):
         print("  %-32s НЕ РАЗБИРАЕТСЯ: %s" % (name, exc))
         bad += 1
         continue
+
+    for name_, def_line, use_line in shadowed(tree):
+        bad += 1
+        print("  %s:%d  переменная затирает функцию %s() (объявлена на %d)"
+              % (name, use_line, name_, def_line))
 
     namespace = vars(module)
     for node in ast.walk(tree):

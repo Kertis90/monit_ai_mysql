@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
+import os
 
 from fastapi import APIRouter, HTTPException, Request
 
@@ -37,6 +38,12 @@ router = APIRouter(tags=["Кластеры"])
 # события, заметки) тоже занимает время, и обрывать запрос ровно по
 # таймауту самой модели было бы рано.
 INSIGHT_GRACE_S = 30
+
+# Сколько ждём тяжёлый разбор, прежде чем ответить «идёт, зайдите ещё раз».
+# Обратный прокси ждёт своё (nginx — минуту) и на исходе отдаёт 504 с
+# HTML-страницей; лучше ответить раньше него и по делу. Работа при этом не
+# бросается: она досчитается в фоне, и повторное нажатие вернёт готовое.
+DIAGNOSE_BUDGET_S = float(os.environ.get("DIAGNOSE_BUDGET_S", "40"))
 
 # Поля реестра, которые наружу не отдаются ни при каких обстоятельствах
 SECRET_FIELDS = {"mysql_exporter_password", "db_password"}
@@ -113,19 +120,26 @@ async def diagnose(name: str, user: CurrentUser, deep: bool = False):
     performance_schema и представления sys."""
     cluster = _need(name)
 
+    async def one_host(ip: str, role: str) -> list:
+        items = await run_diagnostics(cluster, ip)
+        out = []
+        block = fmt_diagnostics(items, "%s · %s" % (cluster["label"], role), ip)
+        if block:
+            out.append(block)
+        if deep:
+            plans = await explain_top_queries(cluster, ip)
+            if plans:
+                out.append(plans)
+        return out
+
     async def build():
         # По каждому серверу отдельно: у основного и реплики разная нагрузка,
-        # и «диагностика кластера» без указания, где именно снято, бесполезна
-        parts = []
-        for ip, role in cluster_hosts(cluster):
-            items = await run_diagnostics(cluster, ip)
-            block = fmt_diagnostics(items, "%s · %s" % (cluster["label"], role), ip)
-            if block:
-                parts.append(block)
-            if deep:
-                plans = await explain_top_queries(cluster, ip)
-                if plans:
-                    parts.append(plans)
+        # и «диагностика кластера» без указания, где именно снято, бесполезна.
+        # Серверы опрашиваем разом — ждать их по очереди значит складывать
+        # время, а запросы независимы.
+        done = await asyncio.gather(*[one_host(ip, role)
+                                      for ip, role in cluster_hosts(cluster)])
+        parts = [block for host_blocks in done for block in host_blocks]
 
         if not parts:
             parts.append(
@@ -137,8 +151,17 @@ async def diagnose(name: str, user: CurrentUser, deep: bool = False):
                 "(SHOW VARIABLES LIKE 'performance_schema').")
         return {"cluster": name, "report": "\n\n".join(parts)}
 
-    return await tasks.shared("diagnose:%s:%d" % (name, int(deep)),
-                              build, ttl=60)
+    data, in_time = await tasks.shared_within(
+        "diagnose:%s:%d" % (name, int(deep)), build,
+        budget=DIAGNOSE_BUDGET_S, ttl=60)
+    if in_time:
+        return data
+    return {"cluster": name, "running": True, "report": (
+        "## Диагностика Performance Schema\n\n"
+        "  Набор ещё выполняется — на большой базе он занимает больше %d с.\n"
+        "  Работа не прервана и идёт дальше: нажмите «Выполнить» ещё раз "
+        "через полминуты,\n  и готовый отчёт покажется сразу."
+        % int(DIAGNOSE_BUDGET_S))}
 
 
 @router.get("/api/workload/{name}", tags=["Диагностика"],

@@ -29,9 +29,12 @@ DEFAULT_WINDOW_S = max(5.0, min(60.0,
 MIN_WINDOW_S = 5
 MAX_WINDOW_S = 60
 
+# Текст дайджеста режется на сервере: там значения уже заменены на «?»,
+# и сверхдлинный нормализованный запрос читать всё равно невозможно. Полный
+# текст с настоящими значениями берётся из processlist — см. ACTIVE_SQL.
 DIGEST_SQL = """
 SELECT DIGEST                         AS digest,
-       LEFT(DIGEST_TEXT, 400)         AS query,
+       LEFT(DIGEST_TEXT, 900)         AS query,
        SCHEMA_NAME                    AS db,
        COUNT_STAR                     AS calls,
        SUM_TIMER_WAIT                 AS time_ps,
@@ -57,6 +60,26 @@ STATUS_VARS = (
 STATUS_SQL = ("SHOW GLOBAL STATUS WHERE Variable_name IN (%s)"
               % ", ".join("'%s'" % v for v in STATUS_VARS))
 
+# Что выполняется прямо сейчас — целиком, с настоящими значениями.
+#
+# Дайджест performance_schema отвечает на вопрос «что грузило базу за окно»,
+# но текст в нём нормализован: литералы заменены на «?», а сама строка
+# обрезана по performance_schema_max_digest_length. Для «покажи мне этот
+# запрос» это не годится: по нему нельзя ни повторить, ни объяснить, почему
+# он читает миллион строк именно сегодня.
+#
+# SHOW FULL PROCESSLIST даёт полный текст того, что исполняется в эту
+# секунду. Одно без другого неполно, поэтому показываем оба.
+ACTIVE_SQL = "SHOW FULL PROCESSLIST"
+
+# Сколько строк processlist забирать. На занятой базе соединений бывают
+# тысячи, но подавляющее большинство спит.
+ACTIVE_MAX_ROWS = 500
+
+# Длина запроса в отчёте. Обрезаем только совсем гигантские — многотысячный
+# IN (...) не несёт информации сверх первых строк, а отчёт делает нечитаемым.
+QUERY_MAX_CHARS = 4000
+
 
 def _rows_as_dicts(result: dict) -> list[dict]:
     cols = result.get("columns") or []
@@ -68,6 +91,53 @@ def _num(value) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+async def active_queries(cluster: dict, host: Optional[str] = None,
+                         limit: int = 12) -> dict:
+    """Незаснувшие соединения: что выполняется и сколько уже длится.
+
+    Спящие отбрасываем: их обычно девять из десяти, и они ничего не говорят
+    о нагрузке. Число их всё же считаем — «соединений 400, из них 398 спят»
+    само по себе диагноз.
+    """
+    res = await sql_execute(cluster, ACTIVE_SQL, host, ACTIVE_MAX_ROWS)
+    if res.get("error"):
+        return {"error": res["error"]}
+
+    rows = _rows_as_dicts(res)
+    # Регистр имён колонок различается между сборками и режимами доступа
+    def field(row: dict, *names):
+        for name in names:
+            for key in row:
+                if key.lower() == name:
+                    return row[key]
+        return None
+
+    sleeping, busy = 0, []
+    for row in rows:
+        command = str(field(row, "command") or "")
+        query = (field(row, "info") or "")
+        if command.lower() == "sleep" or not str(query).strip():
+            sleeping += 1
+            continue
+        text = " ".join(str(query).split())
+        cut = len(text) > QUERY_MAX_CHARS
+        busy.append({
+            "id":      field(row, "id"),
+            "user":    str(field(row, "user") or ""),
+            "from":    str(field(row, "host") or ""),
+            "db":      str(field(row, "db") or ""),
+            "command": command,
+            "time_s":  _num(field(row, "time")),
+            "state":   str(field(row, "state") or ""),
+            "query":   text[:QUERY_MAX_CHARS] + ("…" if cut else ""),
+            "cut":     cut,
+        })
+
+    busy.sort(key=lambda r: -r["time_s"])
+    return {"total": len(rows), "sleeping": sleeping,
+            "items": busy[:limit], "busy_total": len(busy)}
 
 
 async def _snapshot(cluster: dict, host: Optional[str]) -> tuple:
@@ -149,7 +219,10 @@ async def workload_delta(cluster: dict, seconds: float = DEFAULT_WINDOW_S,
                          % first_digest["error"]}
 
     await asyncio.sleep(window)
-    second_digest, second_status = await _snapshot(cluster, host)
+    # Второй срез и живой processlist — одним заходом: они должны описывать
+    # один и тот же момент, иначе «сейчас выполняется» окажется про другое
+    (second_digest, second_status), active = await asyncio.gather(
+        _snapshot(cluster, host), active_queries(cluster, host))
     if second_digest.get("error"):
         return {"error": "Второй срез не снят: %s" % second_digest["error"]}
 
@@ -160,6 +233,7 @@ async def workload_delta(cluster: dict, seconds: float = DEFAULT_WINDOW_S,
         "window":  window,
         "queries": queries,
         "status":  status,
+        "active":  active,
         # Пустой список — не ошибка: база могла просто простаивать
         "idle":    not queries,
     }
@@ -198,6 +272,8 @@ def fmt_workload(data: dict, label: str) -> str:
                 lines.append("  %s: +%d за окно" % (name, item["delta"]))
         lines.append("")
 
+    lines += _fmt_active(data.get("active") or {})
+
     if data.get("idle"):
         lines.append("  За это окно ни один запрос не завершился — база "
                      "простаивала. Если жалуются на медленную работу, "
@@ -219,5 +295,42 @@ def fmt_workload(data: dict, label: str) -> str:
         if q["lock_s"] >= 0.01:
             detail.append("в блокировках %s c" % q["lock_s"])
         lines.append("       " + ", ".join(detail))
-        lines.append("       %s" % " ".join(q["query"].split())[:300])
+        lines.append("       %s" % " ".join(q["query"].split())[:900])
+    lines.append("")
+    lines.append("  Текст выше нормализован: значения заменены на «?», и это "
+                 "суммы по одинаковым запросам.")
+    lines.append("  Целиком, с настоящими значениями — в списке выполняемых "
+                 "сейчас.")
     return "\n".join(lines)
+
+
+def _fmt_active(active: dict) -> list:
+    """Список того, что выполняется прямо сейчас, полными запросами."""
+    if not active:
+        return []
+    if active.get("error"):
+        return ["  Список выполняемых запросов не прочитан: %s"
+                % active["error"], ""]
+
+    total, sleeping = active.get("total", 0), active.get("sleeping", 0)
+    items = active.get("items") or []
+    out = ["  Выполняется прямо сейчас (SHOW FULL PROCESSLIST):"]
+    if not items:
+        out.append("    Ничего: все %d соединений простаивают." % total)
+        out.append("")
+        return out
+
+    out.append("    Соединений %d, из них спящих %d, работают %d."
+               % (total, sleeping, active.get("busy_total", len(items))))
+    out.append("")
+    for i, q in enumerate(items, 1):
+        where = q["user"] + ("@" + q["from"].split(":")[0] if q["from"] else "")
+        head = "  %d. %.0f с · %s" % (i, q["time_s"], where)
+        if q["db"]:
+            head += " · база " + q["db"]
+        if q["state"]:
+            head += " · " + q["state"]
+        out.append(head)
+        out.append("       " + q["query"])
+    out.append("")
+    return out
