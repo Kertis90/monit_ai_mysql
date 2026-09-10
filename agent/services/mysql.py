@@ -473,6 +473,72 @@ def fmt_sql_result(res: dict) -> str:
     return "\n".join(head)
 
 
+# Версия сервера, разобранная в сравнимый вид. Меняется только при
+# обновлении СУБД, поэтому запоминаем надолго — но не навсегда: агент
+# работает месяцами, а обновление может случиться под ним.
+_VERSION_CACHE: dict = {}
+VERSION_TTL_S = 3600
+
+
+def parse_version(text: str) -> tuple:
+    """«8.0.36-0ubuntu» -> (8, 0, 36). Не разобралось — (0, 0, 0).
+
+    Сборок много: Oracle MySQL, Percona Server, MariaDB. Числа в начале
+    строки одинаковы у всех, всё остальное — украшения вендора.
+    """
+    numbers = re.match(r"\s*(\d+)\.(\d+)(?:\.(\d+))?", str(text or ""))
+    if not numbers:
+        return (0, 0, 0)
+    return (int(numbers.group(1)), int(numbers.group(2)),
+            int(numbers.group(3) or 0))
+
+
+def flavour(text: str) -> str:
+    """Какая это сборка. MariaDB — отдельная ветка нумерации: её 10.x
+    новее восьмёрки Oracle, и сравнивать их числами напрямую нельзя."""
+    low = str(text or "").lower()
+    if "mariadb" in low:
+        return "mariadb"
+    if "percona" in low:
+        return "percona"
+    return "mysql"
+
+
+def has_sys_schema(version: tuple, kind: str) -> bool:
+    """Есть ли схема sys. У Oracle и Percona — с 5.7, у MariaDB — с 10.6.
+
+    На 5.6 её нет вовсе, и половина современных рецептов диагностики,
+    написанных «просто выполните SELECT из sys...», там неприменима.
+    """
+    if kind == "mariadb":
+        return version >= (10, 6)
+    return version >= (5, 7)
+
+
+async def server_version(cluster: dict, host: Optional[str] = None) -> tuple:
+    """(версия, сборка) сервера. Пусто не бывает: (0,0,0) значит «не узнали»."""
+    key = "%s:%s" % (cluster.get("name", "?"), host or cluster.get("primary_ip", ""))
+    hit = _VERSION_CACHE.get(key)
+    if hit and time.time() - hit[0] < VERSION_TTL_S:
+        return hit[1]
+
+    if not cluster_db_creds(cluster):
+        return (0, 0, 0), "mysql"
+
+    res = await sql_execute(cluster, "SELECT VERSION() AS v", host)
+    if res.get("error") or not res.get("rows"):
+        logger.info("Версия %s не определена: %s", key,
+                    res.get("error", "пустой ответ"))
+        return (0, 0, 0), "mysql"
+
+    raw = str(res["rows"][0][0])
+    found = (parse_version(raw), flavour(raw))
+    _VERSION_CACHE[key] = (time.time(), found)
+    logger.info("Сервер %s: %s (%s %s)", key, raw, found[1],
+                ".".join(str(n) for n in found[0]))
+    return found
+
+
 async def refresh_db_versions() -> None:
     """Спросить версию у каждого кластера. Без этого агент советует синтаксис
     наугад: у 5.7 и 8.0 разные имена таблиц performance_schema и разный SHOW."""

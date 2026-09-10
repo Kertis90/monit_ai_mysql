@@ -19,7 +19,8 @@ import httpx
 from agent.core.config import settings
 from agent.services.intents import parse_step_seconds
 from agent.services.mysql import (cluster_db_creds, db_versions_text,
-                                  fmt_sql_result, sql_execute)
+                                  fmt_sql_result, has_sys_schema,
+                                  server_version, sql_execute)
 from agent.services.prometheus import (collect_current, collect_history,
                                        http_client, prom_query,
                                        prom_range_series, prom_range_summary)
@@ -67,6 +68,21 @@ SERIES_SPECS = [
     ("conn",     'mysql_global_status_threads_connected{{instance="{inst}"}}'),
 ]
 
+# Диагностический набор.
+#
+# Порядок не случаен и повторяет методику из документации Performance
+# Schema: сначала «во что упёрлись» (классы ожиданий), потом конкретные
+# запросы, потом схема. Гадать по одному показателю — самый долгий путь.
+#
+# У каждой проверки указано, на какой версии она работает. Это не
+# формальность: sys появилась в 5.7 (у MariaDB — в 10.6), а
+# information_schema.innodb_lock_waits, наоборот, убрали в 8.0. Проверки
+# без пометки работают везде.
+#
+#   min_version / max_version — границы применимости, включительно
+#   needs      — "sys" (нужна схема sys) или "no_sys" (запасной путь для
+#                тех, у кого её нет); попадает в отчёт о пропущенном
+#   optional   — отказ не считается ошибкой: проверку просто пропускаем
 DIAG_QUERIES = [
     {
         "key": "top_queries", "title": "Самые тяжёлые запросы (по суммарному времени)",
@@ -136,14 +152,14 @@ DIAG_QUERIES = [
         "sql": """SELECT waiting_pid, waiting_query, blocking_pid, blocking_query,
        wait_age
   FROM sys.innodb_lock_waits LIMIT 10""",
-        "optional": True,
+        "needs": "sys", "optional": True,
     },
     {
         "key": "unused_idx", "title": "Неиспользуемые индексы",
         "why": "лишние индексы замедляют запись и занимают память",
         "sql": """SELECT object_schema AS db, object_name AS tbl, index_name
   FROM sys.schema_unused_indexes LIMIT 20""",
-        "optional": True,
+        "needs": "sys", "optional": True,
     },
     {
         "key": "conn", "title": "Подключения и потоки",
@@ -157,6 +173,127 @@ DIAG_QUERIES = [
         "why": "буферный пул, ожидания строк, дедлоки",
         "sql": "SHOW ENGINE INNODB STATUS",
         "optional": True,
+    },
+
+    # ── Куда уходит время: методика «сначала классы ожиданий» ──────────
+    # Первое, что советует документация Performance Schema: не гадать, а
+    # посмотреть, во что сервер упирается — в диск, в блокировки или в
+    # сеть. Дальше уже искать конкретные запросы.
+    {
+        "key": "wait_classes", "title": "Во что упирается сервер (классы ожиданий)",
+        "why": "отвечает на вопрос «диск, блокировки или сеть» до разбора запросов",
+        "sql": """SELECT event_class, total, total_latency, avg_latency, max_latency
+  FROM sys.wait_classes_global_by_latency
+ LIMIT 15""",
+        "min_version": (5, 7), "needs": "sys", "optional": True,
+    },
+    {
+        "key": "stmt_full_scans", "title": "Запросы, читающие таблицы целиком",
+        "why": "готовая выборка sys: доля выполнений без индекса и сколько строк читается впустую",
+        "sql": """SELECT db, exec_count, total_latency, no_index_used_pct,
+       rows_examined_avg, rows_sent_avg, query
+  FROM sys.statements_with_full_table_scans
+ ORDER BY total_latency DESC LIMIT 10""",
+        "min_version": (5, 7), "needs": "sys", "optional": True,
+    },
+    {
+        "key": "stmt_temp_disk", "title": "Запросы, создающие временные таблицы на диске",
+        "why": "временная таблица на диске — это лишний ввод-вывод там, где хватило бы памяти",
+        "sql": """SELECT db, exec_count, total_latency, memory_tmp_tables,
+       disk_tmp_tables, tmp_tables_to_disk_pct, query
+  FROM sys.statements_with_temp_tables
+ WHERE disk_tmp_tables > 0
+ ORDER BY disk_tmp_tables DESC LIMIT 10""",
+        "min_version": (5, 7), "needs": "sys", "optional": True,
+    },
+    {
+        "key": "stmt_sorting", "title": "Запросы с тяжёлой сортировкой",
+        "why": "сортировка с проходами по диску обычно лечится индексом под ORDER BY",
+        "sql": """SELECT db, exec_count, total_latency, sort_merge_passes,
+       rows_sorted, query
+  FROM sys.statements_with_sorting
+ WHERE sort_merge_passes > 0
+ ORDER BY sort_merge_passes DESC LIMIT 10""",
+        "min_version": (5, 7), "needs": "sys", "optional": True,
+    },
+    {
+        "key": "tables_scanned", "title": "Таблицы, которые читают целиком",
+        "why": "показывает, какой таблице не хватает индекса, а не какому запросу",
+        "sql": """SELECT object_schema, object_name, rows_full_scanned, latency
+  FROM sys.schema_tables_with_full_table_scans
+ LIMIT 15""",
+        "min_version": (5, 7), "needs": "sys", "optional": True,
+    },
+    {
+        "key": "memory", "title": "На что уходит память сервера",
+        "why": "различает «съел буферный пул» и «съели соединения и временные таблицы»",
+        "sql": """SELECT event_name, current_count, current_alloc, high_alloc
+  FROM sys.memory_global_by_current_bytes
+ LIMIT 12""",
+        "min_version": (5, 7), "needs": "sys", "optional": True,
+    },
+
+    # ── Схема: то, что не видно в метриках, но стоит дорого ────────────
+    {
+        "key": "no_pk", "title": "Таблицы без первичного ключа",
+        "why": "при строчной репликации каждое изменение такой таблицы заставляет "
+               "реплику перечитывать её целиком — самая частая причина лага",
+        "sql": """SELECT t.table_schema AS db, t.table_name AS tbl, t.engine,
+       t.table_rows AS rows_est
+  FROM information_schema.tables t
+  JOIN information_schema.columns c
+    ON c.table_schema = t.table_schema AND c.table_name = t.table_name
+ WHERE t.table_schema NOT IN ('mysql','information_schema','sys','performance_schema')
+   AND t.table_type = 'BASE TABLE'
+ GROUP BY t.table_schema, t.table_name, t.engine, t.table_rows
+HAVING SUM(IF(c.column_key IN ('PRI','UNI'), 1, 0)) = 0
+ ORDER BY t.table_rows DESC
+ LIMIT 20""",
+        "optional": True,
+    },
+    {
+        "key": "wide_pk", "title": "Нецелочисленные первичные ключи",
+        "why": "первичный ключ дописывается в каждый вторичный индекс: строковый "
+               "ключ раздувает их все",
+        "sql": """SELECT table_schema AS db, table_name AS tbl, column_name AS col,
+       data_type, character_maximum_length AS len
+  FROM information_schema.columns
+ WHERE column_key IN ('PRI','UNI') AND ordinal_position = 1
+   AND data_type NOT IN ('tinyint','smallint','mediumint','int','bigint',
+                         'timestamp','datetime')
+   AND table_schema NOT IN ('mysql','information_schema','sys','performance_schema')
+ LIMIT 20""",
+        "optional": True,
+    },
+
+    # ── Блокировки на старых версиях ──────────────────────────────────
+    # sys.innodb_lock_waits появилась в 5.7. Там, где её нет — MySQL 5.6,
+    # MariaDB до 10.6, — те же данные лежат в information_schema, которую в
+    # 8.0 Oracle, наоборот, убрал. Поэтому условие не «до версии такой-то»,
+    # а «там, где нет sys»: оно описывает причину, а не совпадение.
+    {
+        "key": "locks_56", "title": "Ожидания блокировок (без схемы sys)",
+        "why": "кто кого блокирует прямо сейчас",
+        "sql": """SELECT w.requesting_trx_id AS waiting_trx,
+       w.blocking_trx_id AS blocking_trx,
+       r.trx_query AS waiting_query, b.trx_query AS blocking_query,
+       TIMESTAMPDIFF(SECOND, r.trx_wait_started, NOW()) AS wait_sec
+  FROM information_schema.innodb_lock_waits w
+  JOIN information_schema.innodb_trx r ON r.trx_id = w.requesting_trx_id
+  JOIN information_schema.innodb_trx b ON b.trx_id = w.blocking_trx_id
+ LIMIT 10""",
+        "needs": "no_sys", "optional": True,
+    },
+
+    # ── Временные таблицы: соотношение, а не абсолютные числа ─────────
+    {
+        "key": "tmp_ratio", "title": "Временные таблицы и сортировки",
+        "why": "доля временных таблиц, ушедших на диск, — прямой признак нехватки "
+               "tmp_table_size или запросов, которые её не переживают",
+        "sql": """SHOW GLOBAL STATUS WHERE Variable_name IN
+       ('Created_tmp_tables','Created_tmp_disk_tables','Created_tmp_files',
+        'Sort_merge_passes','Sort_scan','Sort_range','Select_full_join',
+        'Select_scan','Handler_read_rnd_next')""",
     },
 ]
 
@@ -384,6 +521,32 @@ async def explain_top_queries(cluster: dict, host: str, limit: int = 3) -> str:
             + "\n".join(out))
 
 
+def unsupported(check: dict, version: tuple, kind: str) -> str:
+    """Почему проверку нельзя выполнить здесь. Пусто — можно.
+
+    Версию могли не узнать (нет учётки, сервер не ответил) — тогда не
+    отсеиваем ничего: пусть лучше запрос упадёт и пропустится как
+    необязательный, чем мы вырежем работающую проверку из-за незнания.
+    """
+    if version == (0, 0, 0):
+        return ""
+    if check.get("needs") == "sys" and not has_sys_schema(version, kind):
+        return ("нужна схема sys: у MariaDB она с 10.6" if kind == "mariadb"
+                else "нужна схема sys: она появилась в 5.7")
+    if check.get("needs") == "no_sys" and has_sys_schema(version, kind):
+        return "здесь то же самое берётся из sys — запасной путь не нужен"
+    # Сравниваем ровно по стольким числам, сколько указано в границе:
+    # «5.7» значит семейство 5.7, а не 5.7.0, иначе 5.7.44 оказалась бы
+    # «новее верхней границы 5.7» и проверка отсеклась бы не по делу.
+    low = check.get("min_version")
+    if low and version[:len(low)] < low:
+        return "нужна версия %s или новее" % ".".join(str(n) for n in low)
+    high = check.get("max_version")
+    if high and version[:len(high)] > high:
+        return "работает по %s включительно" % ".".join(str(n) for n in high)
+    return ""
+
+
 async def run_diagnostics(cluster: dict, host: Optional[str] = None,
                           keys: Optional[list] = None) -> list:
     """Выполнить диагностический набор. Недоступные запросы пропускаются:
@@ -391,7 +554,20 @@ async def run_diagnostics(cluster: dict, host: Optional[str] = None,
     if not cluster_db_creds(cluster):
         return []
 
-    wanted = [q for q in DIAG_QUERIES if not keys or q["key"] in keys]
+    # Что применимо к этому серверу. Версии в парке разные — от 5.6 до
+    # 8.x, — и половина современных рецептов диагностики написана под sys,
+    # которой на 5.6 нет вовсе. Молча выполнять их и молча получать отказ
+    # значит показывать пустой отчёт вместо объяснения.
+    version, kind = await server_version(cluster, host)
+    wanted, skipped = [], []
+    for q in DIAG_QUERIES:
+        if keys and q["key"] not in keys:
+            continue
+        why = unsupported(q, version, kind)
+        if why:
+            skipped.append((q, why))
+            continue
+        wanted.append(q)
 
     # По очереди набор идёт минутами и не укладывается в терпение прокси, а
     # запросы независимы. Но и разом их пускать нельзя: в режиме туннеля
@@ -416,6 +592,15 @@ async def run_diagnostics(cluster: dict, host: Optional[str] = None,
                 logger.info(f"Диагностика: {q['key']} пропущен ({res['error'][:80]})")
             continue
         out.append({**q, "result": res})
+
+    if skipped and version != (0, 0, 0):
+        out.append({
+            "key": "_skipped",
+            "title": "Пропущено на этой версии",
+            "why": "%s %s" % (kind, ".".join(str(n) for n in version)),
+            "note": "\n".join("  %s — %s" % (q["title"], why)
+                               for q, why in skipped),
+        })
     return out
 
 
@@ -427,7 +612,10 @@ def fmt_diagnostics(items: list, label: str, host: str) -> str:
             "  Опирайся на них, а не на общие рекомендации.", ""]
     for it in items:
         head.append(f"### {it['title']} — {it['why']}")
-        head.append(fmt_sql_result(it["result"]).split("\n", 1)[1].lstrip("\n"))
+        if it.get("note"):
+            head.append(it["note"])
+        else:
+            head.append(fmt_sql_result(it["result"]).split("\n", 1)[1].lstrip("\n"))
         head.append("")
     return "\n".join(head)
 

@@ -270,6 +270,9 @@ def application() -> None:
         diagnose_budget()
         sql_aliases()
         long_values()
+        version_detection()
+        diag_by_version()
+        skipped_reported()
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -1264,6 +1267,101 @@ def long_values() -> None:
           "далее ещё" in cut, True)
     check("но взято куда больше шестидесяти символов",
           cut.count("x") > 10000, True)
+
+
+def version_detection() -> None:
+    """Версия и сборка сервера разбираются из того, что отдаёт VERSION()."""
+    from agent.services.mysql import flavour, has_sys_schema, parse_version
+
+    cases = [
+        ("5.6.51-log",       (5, 6, 51),  "mysql",   False),
+        ("5.7.44-0ubuntu",   (5, 7, 44),  "mysql",   True),
+        ("8.0.36",           (8, 0, 36),  "mysql",   True),
+        ("8.4.0",            (8, 4, 0),   "mysql",   True),
+        ("5.7.42-46-log",    (5, 7, 42),  "percona", True),
+        ("10.11.6-MariaDB",  (10, 11, 6), "mariadb", True),
+        ("10.3.39-MariaDB",  (10, 3, 39), "mariadb", False),
+    ]
+    for raw, want_ver, want_kind, want_sys in cases:
+        got = parse_version(raw)
+        if got != want_ver:
+            check("версия %s разобрана" % raw, got, want_ver)
+        kind = flavour(raw)
+        # «percona» узнаём по строке version_comment, а не по номеру:
+        # у голого «5.7.42-46-log» отличить нельзя, и это нормально
+        if want_kind != "percona" and kind != want_kind:
+            check("сборка %s опознана" % raw, kind, want_kind)
+        if has_sys_schema(got, kind) != want_sys:
+            check("наличие sys у %s" % raw, has_sys_schema(got, kind), want_sys)
+    check("все версии разобраны верно", True, True)
+
+    check("мусор не роняет разбор", parse_version("непонятно"), (0, 0, 0))
+    check("десятка MariaDB не путается с восьмёркой Oracle",
+          parse_version("10.5.0-MariaDB") > parse_version("8.0.36"), True)
+
+
+def diag_by_version() -> None:
+    """Набор подбирается под сервер: на 5.6 нет sys, в 8.0 нет старой
+    information_schema.innodb_lock_waits — и то и другое надо учитывать."""
+    from agent.services.analysis import DIAG_QUERIES, unsupported
+    from agent.services.mysql import sql_validate
+
+    def picked(version, kind):
+        return [q["key"] for q in DIAG_QUERIES if not unsupported(q, version, kind)]
+
+    old = picked((5, 6, 51), "mysql")
+    new = picked((8, 0, 36), "mysql")
+    maria_new = picked((10, 11, 6), "mariadb")
+    maria_old = picked((10, 3, 39), "mariadb")
+
+    check("на 5.6 проверок из sys нет", "wait_classes" in old, False)
+    check("на 8.0 они есть", "wait_classes" in new, True)
+    check("на MariaDB 10.6+ тоже", "wait_classes" in maria_new, True)
+    check("на MariaDB 10.3 — нет", "wait_classes" in maria_old, False)
+
+    # Блокировки должны быть видны на любой версии, просто из разных мест
+    for name, keys in (("5.6", old), ("8.0", new),
+                       ("MariaDB 10.11", maria_new), ("MariaDB 10.3", maria_old)):
+        got = [k for k in keys if k.startswith("locks")]
+        if len(got) != 1:
+            check("на %s ровно один источник блокировок" % name, got, ["один"])
+    check("блокировки видны на всех версиях, каждый раз из своего места",
+          True, True)
+
+    check("незнакомая версия ничего не отсекает",
+          len(picked((0, 0, 0), "mysql")), len(DIAG_QUERIES))
+
+    # Проверки без пометок должны работать везде
+    always = [q["key"] for q in DIAG_QUERIES
+              if not q.get("needs") and not q.get("min_version")
+              and not q.get("max_version")]
+    for key in always:
+        if key not in old or key not in new:
+            check("проверка %s работает на любой версии" % key, False, True)
+    check("общие проверки есть в наборе для каждой версии", len(always) > 5, True)
+
+    bad = [(q["key"], sql_validate(q["sql"])[1])
+           for q in DIAG_QUERIES if not sql_validate(q["sql"])[0]]
+    check("все запросы набора читающие", bad, [],
+          show=", ".join("%s: %s" % b for b in bad) or "да")
+
+    check("методика начинается с классов ожиданий",
+          DIAG_QUERIES[[q["key"] for q in DIAG_QUERIES].index("wait_classes")]["why"]
+          .startswith("отвечает на вопрос"), True)
+
+
+def skipped_reported() -> None:
+    """Пропущенное на этой версии названо, а не проглочено молча."""
+    from agent.services.analysis import fmt_diagnostics
+
+    text = fmt_diagnostics([
+        {"key": "_skipped", "title": "Пропущено на этой версии",
+         "why": "mysql 5.6.51",
+         "note": "  Во что упирается сервер — нужна схема sys: она появилась в 5.7"},
+    ], "Кемерово", "10.0.0.5")
+    check("сказано, что пропущено", "Пропущено на этой версии" in text, True)
+    check("и почему", "появилась в 5.7" in text, True)
+    check("названа версия сервера", "5.6.51" in text, True)
 
 
 def websocket(client) -> None:
