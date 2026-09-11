@@ -97,6 +97,75 @@ def log_date_patterns(since, until, extra_utc=False) -> list:
     return out
 
 
+# До какого окна имеет смысл искать по часам. Дальше шаблонов становится
+# больше, чем строк в выводе grep, и проще отобрать по суткам.
+HOUR_PATTERN_LIMIT = 26
+
+
+def log_hour_patterns(since, until) -> list:
+    """Шаблоны «дата и час» для grep -F.
+
+    Поиск по одной дате возвращает целые сутки: человек просит логи за два
+    часа, а получает всё, что случилось за день, обрезанное по числу строк
+    с конца. Здесь в шаблон входит и час — «11.09.2026 09:», — и в выводе
+    оказывается именно запрошенное окно.
+
+    Разделитель между датой и часом у разных логов свой: slow-лог MySQL
+    5.7+ пишет ISO с «T», syslog и приложения — с пробелом. Отдаём оба.
+    """
+    hours, point = [], since.replace(minute=0, second=0, microsecond=0)
+    while point <= until:
+        hours.append(point)
+        point += datetime.timedelta(hours=1)
+        if len(hours) > HOUR_PATTERN_LIMIT:
+            return []          # слишком широкое окно, отбираем по суткам
+
+    out = []
+    for h in hours:
+        out.append(h.strftime("%Y-%m-%dT%H:"))    # 2026-09-11T09:  slow-лог 5.7+
+        out.append(h.strftime("%Y-%m-%d %H:"))    # 2026-09-11 09:  syslog
+        out.append(h.strftime("%d.%m.%Y %H:"))    # 11.09.2026 09:  Lanbilling
+        out.append(h.strftime("%d/%m/%Y %H:"))    # 11/09/2026 09:
+    return out
+
+
+def log_window_patterns(since, until, since_epoch: float = 0,
+                        until_epoch: float = 0, utc_dates: bool = False) -> list:
+    """Чем отбирать строки за период. Час, если окно узкое, иначе сутки.
+
+    utc_dates — метки в файле пишутся в UTC, а не в поясе сервера. Так по
+    умолчанию делает MySQL 5.7.2+ со своим log_timestamps=UTC: сервер живёт
+    во Владивостоке, а в slow-логе стоит время на семь часов назад. Отсюда
+    и брались «не те» строки: запрашиваешь последние два часа по местному
+    времени, а в файле это время наступит только к вечеру.
+
+    Поэтому для таких файлов окно пересчитывается в UTC — из абсолютного
+    времени, которое от пояса не зависит вовсе. Локальные шаблоны при этом
+    остаются: в одном каталоге могут лежать логи, писанные и так и так.
+    """
+    windows = [(since, until)]
+    if utc_dates and since_epoch and until_epoch:
+        def as_utc(ts):
+            # fromtimestamp с явным поясом вместо utcfromtimestamp: та
+            # объявлена устаревшей и в 3.12 уже предупреждает
+            return (datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)
+                    .replace(tzinfo=None))
+
+        windows.append((as_utc(since_epoch), as_utc(until_epoch)))
+
+    out = []
+    for start, end in windows:
+        narrow = log_hour_patterns(start, end)
+        out += narrow if narrow else log_date_patterns(start, end)
+
+    seen, unique = set(), []
+    for pattern in out:
+        if pattern not in seen:
+            seen.add(pattern)
+            unique.append(pattern)
+    return unique
+
+
 def log_reader_cmd(path: str, args: str) -> str:
     """Команда чтения под формат файла.
 
@@ -194,11 +263,17 @@ async def read_log_group(host: str, dirs: list, pattern: str, since, until,
                 "  Файлов за этот период нет. Всего найдено {}, самый свежий "
                 "изменён {:%Y-%m-%d %H:%M}.".format(len(files), newest))
 
+    narrow = len(patterns) > 0 and ":" in patterns[0]
     out = ["### " + title + " " + host,
-           "  Просмотрено файлов: {} из {} (выбраны по времени изменения)"
-           .format(len(picked), len(files))]
+           "  Период: {:%d.%m %H:%M} — {:%d.%m %H:%M} по времени сервера{}"
+           .format(since, until,
+                   ", метки в файле в UTC — окно пересчитано" if utc_dates else ""),
+           "  Отбор по {}; просмотрено файлов: {} из {}"
+           .format("дате и часу" if narrow else "дате",
+                   len(picked), len(files))]
     per_file = max(LOG_MAX_LINES // len(picked), 40)
-    patterns = log_date_patterns(since, until, utc_dates)
+    patterns = log_window_patterns(since, until, since_epoch, until_epoch,
+                                   utc_dates)
 
     # Файлы читаем разом, а не по очереди: это независимые команды на одном
     # сервере, и ждать их последовательно значит складывать таймауты

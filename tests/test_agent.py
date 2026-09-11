@@ -288,6 +288,7 @@ def application() -> None:
         explain_text()
         explain_rights()
         explain_endpoint(c)
+        log_window()
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -1882,6 +1883,68 @@ def explain_endpoint(client) -> None:
     app = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
     check("кнопки есть в интерфейсе",
           "explainSql" in app and "explainLive" in app, True)
+
+
+def log_window() -> None:
+    """Окно логов отсчитывается от времени сервера и в его формате.
+
+    Две беды были рядом. Первая: отбор шёл по дате, и «последние два часа»
+    возвращали целые сутки, обрезанные по числу строк. Вторая: slow-лог
+    MySQL 5.7+ пишет метки в UTC, а окно строилось по местному времени
+    сервера — во Владивостоке это промах на семь часов.
+    """
+    import datetime as dt
+
+    from agent.services.logs import (HOUR_PATTERN_LIMIT, log_date_patterns,
+                                     log_hour_patterns, log_window_patterns)
+
+    # Сервер во Владивостоке: местное 10:00 — это 03:00 UTC
+    local_until = dt.datetime(2026, 9, 11, 10, 0)
+    local_since = local_until - dt.timedelta(hours=2)
+    until_epoch = dt.datetime(2026, 9, 11, 3, 0,
+                              tzinfo=dt.timezone.utc).timestamp()
+    since_epoch = until_epoch - 2 * 3600
+
+    app = log_window_patterns(local_since, local_until, since_epoch,
+                              until_epoch, utc_dates=False)
+    check("в шаблон вошёл час, а не только дата",
+          "11.09.2026 09:" in app, True)
+    check("соседний час тоже", "11.09.2026 08:" in app, True)
+    check("чужих часов не набрано", "11.09.2026 12:" in app, False)
+    check("формат slow-лога с «T» тоже есть", "2026-09-11T09:" in app, True)
+
+    # Для slow-лога добавляется то же окно в UTC: метки там в UTC
+    slow = log_window_patterns(local_since, local_until, since_epoch,
+                               until_epoch, utc_dates=True)
+    check("окно пересчитано в UTC", "2026-09-11T02:" in slow, True)
+    check("и местное осталось", "2026-09-11T09:" in slow, True)
+    check("дубликатов нет", len(slow), len(set(slow)))
+
+    # Широкое окно: по часам шаблонов стало бы больше, чем строк в ответе
+    wide = log_window_patterns(local_until - dt.timedelta(hours=40),
+                               local_until, 0, 0)
+    check("широкое окно отбирается по суткам",
+          all(":" not in p for p in wide), True)
+    check("предел перехода задан величиной",
+          HOUR_PATTERN_LIMIT >= 24, True)
+    check("часовые шаблоны на широком окне не строятся",
+          log_hour_patterns(local_until - dt.timedelta(hours=40), local_until),
+          [])
+
+    # Отбор по суткам остался прежним — он нужен как запасной
+    days = log_date_patterns(local_since, local_until)
+    check("суточные шаблоны знают все форматы",
+          "2026-09-11" in days and "11.09.2026" in days and "260911" in days,
+          True)
+
+    import inspect
+
+    from agent.services import logs
+    src = inspect.getsource(logs.read_log_group)
+    check("в отчёте сказано, за какой период отбирали",
+          "по времени сервера" in src, True)
+    check("и что метки в файле в UTC",
+          "метки в файле в UTC" in src, True)
 
 
 def websocket(client) -> None:
