@@ -32,6 +32,7 @@ const App = (() => {
     awaitingReply: false,
     replyTimer:    null,
     attachedTo:    null,   // к какому разговору уже просились подключиться
+    restoring:     false,  // идёт восстановление ленты — не анимируем её
     pingTimer:     null,
   };
 
@@ -413,6 +414,7 @@ const App = (() => {
   }
 
   async function restoreHistory() {
+    state.restoring = true;
     try {
       const r = await fetch('chat/history?limit=50&' + cid() +
                             (state.threadId ? '&thread=' + encodeURIComponent(state.threadId) : ''));
@@ -436,6 +438,8 @@ const App = (() => {
       scrollToBottom();
     } catch (e) {
       console.warn('История чата недоступна:', e);
+    } finally {
+      state.restoring = false;
     }
   }
 
@@ -717,7 +721,10 @@ const App = (() => {
   function setConnState(s) {
     const dot   = $('conn-dot');
     const badge = $('ws-badge');
-    dot.className = 'conn-dot ' + (s === 'online' ? 'online' : s === 'offline' ? 'offline' : '');
+    // Промежуточное состояние — пульсация: «связи нет» и «подключаюсь»
+    // выглядели одинаково, хотя во втором случае ждать имеет смысл
+    dot.className = 'conn-dot ' + (s === 'online' ? 'online'
+                                 : s === 'offline' ? 'offline' : 'connecting');
     badge.textContent = s === 'online' ? 'wss ✓'
                        : s === 'offline' ? 'нет связи'
                        : 'подключение…';
@@ -777,7 +784,9 @@ const App = (() => {
   function addMsg(role, text, metaText) {
     const wrap = $('messages');
     const div  = document.createElement('div');
-    div.className = 'msg ' + role;
+    // Новое сообщение выезжает, восстановленная переписка — нет: полсотни
+    // разом выезжающих реплик это не «живой интерфейс», а рябь
+    div.className = 'msg ' + role + (state.restoring ? '' : ' enter');
     div.innerHTML =
       `<div class="msg-meta">${esc(metaText)}</div>` +
       `<div class="msg-body"></div>`;
@@ -855,6 +864,14 @@ const App = (() => {
       if (lag !== null && !isNaN(lag)) {
         const cls = lag > 60 ? 'crit' : lag > 10 ? 'warn' : 'ok';
         html += `<span class="mini-badge ${cls}" title="Отставание сверх плановой задержки">лаг ${lag.toFixed(0)}s</span>`;
+      }
+      // Числа обновляются раз в минуту молча, и заметить, что лаг вырос
+      // втрое, можно было только сравнив с тем, что помнишь. Изменившееся
+      // подсвечивается на мгновение — глазу этого достаточно.
+      if (el.innerHTML && el.innerHTML !== html) {
+        el.classList.remove('changed');
+        void el.offsetWidth;          // перезапуск проигрывания
+        el.classList.add('changed');
       }
       el.innerHTML = html;
     } catch { /* тихо */ }
@@ -2045,18 +2062,19 @@ const App = (() => {
            '<span class="blk-short">' + esc(b.short) + '</span>' +
            '</button>' +
            '<span class="blk-actions">' + buttons + '</span></div>' +
-           '<div class="blk-body" hidden>' +
+           '<div class="blk-body"><div class="blk-inner">' +
            '<p class="blk-about">' + esc(b.about) + '</p>' +
            '<div class="blk-out" id="' + b.out + '"></div>' +
-           '</div></section>';
+           '</div></div></section>';
   }
 
   function toggleBlock(section, open) {
-    const body = section.querySelector('.blk-body');
-    const btn = section.querySelector('.blk-toggle');
-    body.hidden = !open;
+    // Раскрытие ведёт класс, а не hidden: у скрытого элемента нечему
+    // проигрываться, и блок раньше появлялся рывком. Высота едет от 0fr
+    // к 1fr — так не нужно знать её заранее и измерять.
     section.classList.toggle('open', open);
-    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    section.querySelector('.blk-toggle')
+           .setAttribute('aria-expanded', open ? 'true' : 'false');
   }
 
   function bindBlocks(box) {
@@ -2082,7 +2100,7 @@ const App = (() => {
     box.querySelectorAll('.blk').forEach(section => {
       const id = section.id.replace('blk-', '');
       section.querySelector('.blk-toggle').addEventListener('click', () => {
-        const now = section.querySelector('.blk-body').hidden;
+        const now = !section.classList.contains('open');
         toggleBlock(section, now);
         rememberOpen(id, now);
       });
@@ -2283,7 +2301,7 @@ const App = (() => {
     if (!box) {
       box = document.createElement('div');
       box.className = 'ai-box';
-      section.querySelector('.blk-body').appendChild(box);
+      section.querySelector('.blk-inner').appendChild(box);
     }
     return box;
   }
@@ -2352,7 +2370,7 @@ const App = (() => {
     if (!foot) {
       foot = document.createElement('div');
       foot.className = 'blk-foot';
-      section.querySelector('.blk-body').appendChild(foot);
+      section.querySelector('.blk-inner').appendChild(foot);
     }
     foot.innerHTML =
       '<span class="muted small">снято ' +
@@ -2743,6 +2761,9 @@ const App = (() => {
     const now = parseInt(cnt.textContent || '0', 10) || 0;
     cnt.textContent = now + 1;
     cnt.classList.add('show');
+    cnt.classList.remove('bump');
+    void cnt.offsetWidth;
+    cnt.classList.add('bump');
   }
 
   function esc(s) {

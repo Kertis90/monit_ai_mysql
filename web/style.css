@@ -1281,7 +1281,7 @@ button[disabled] { opacity: .65; cursor: progress; }
 .blk-actions { display: flex; gap: 6px; flex: none; }
 .blk-actions .ghost-btn { font-size: 12px; padding: 4px 10px; }
 
-.blk-body { padding: 2px 12px 12px 33px; }
+.blk-inner { padding: 0 12px 0 33px; }
 .blk-about {
   color: var(--muted);
   font-size: 12px;
@@ -1310,7 +1310,7 @@ button[disabled] { opacity: .65; cursor: progress; }
 
 @media (max-width: 760px) {
   .blk-short { display: none; }
-  .blk-body { padding-left: 12px; }
+  .blk-inner { padding-left: 12px; }
   .blk-head { flex-wrap: wrap; }
 }
 
@@ -1586,4 +1586,183 @@ header h1 { font-size: var(--fs-lg); }
   font-size: var(--fs-xs);
   color: var(--muted);
   margin-top: var(--sp-1);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   ДВИЖЕНИЕ
+
+   Здесь оно работает, а не украшает. В мониторинге движение — это ещё
+   один способ сказать «посмотри сюда»: число изменилось, пришло событие,
+   связь пропала. Поэтому анимируются только изменения состояния, и ни
+   одно из них не длится дольше трети секунды: интерфейс, который
+   заставляет ждать свою анимацию, раздражает уже на второй день.
+
+   Чего здесь нет намеренно: появления блоков по прокрутке, «дышащих»
+   карточек, разъезжающихся заголовков. Всё, что должно быть прочитано,
+   видно сразу, без движения.
+   ═══════════════════════════════════════════════════════════════════ */
+
+:root {
+  --dur-fast: 110ms;
+  --dur:      180ms;
+  --dur-slow: 320ms;
+  /* Быстрый старт, мягкая остановка: так движение выглядит следствием
+     действия, а не самостоятельным событием */
+  --ease: cubic-bezier(.2, .7, .3, 1);
+}
+
+/* ── Смена раздела ──────────────────────────────────────────────────
+   Короткий подъём с проявлением. Не ради красоты: он показывает, что
+   содержимое сменилось целиком, — без него переход между вкладками
+   выглядит как подмена кадра. */
+
+@keyframes pane-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: none; }
+}
+.tab-pane:not([hidden]) {
+  animation: pane-in var(--dur) var(--ease);
+}
+/* Чат — исключение: он не «появляется», в нём продолжается разговор */
+#tab-chat:not([hidden]) { animation: none; }
+
+/* ── Раскрытие блока диагностики ────────────────────────────────────
+   Высота едет от 0fr к 1fr: так не нужно знать её заранее и измерять,
+   а содержимое не дёргается при перерисовке. */
+
+.blk-body {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows var(--dur-slow) var(--ease);
+}
+.blk.open .blk-body { grid-template-rows: 1fr; }
+.blk-inner {
+  overflow: hidden;
+  min-height: 0;
+  /* Нулевая высота прячет содержимое от глаз, но не от экранного
+     диктора — он прочитал бы все свёрнутые блоки подряд. visibility
+     убирает и оттуда, а переключается в конце сворачивания, чтобы не
+     обрывать движение */
+  visibility: hidden;
+  transition: padding var(--dur-slow) var(--ease),
+              visibility 0s linear var(--dur-slow);
+}
+.blk.open .blk-inner {
+  padding-top: 2px;
+  padding-bottom: 12px;
+  visibility: visible;
+  transition: padding var(--dur-slow) var(--ease), visibility 0s;
+}
+.blk-toggle .caret { transition: transform var(--dur) var(--ease); }
+
+/* ── Графики: разворачиваются слева направо ─────────────────────────
+   По направлению времени. Ступенька между соседними — чтобы взгляд шёл
+   по сетке, а не рябило от десяти одновременных вспышек. */
+
+@keyframes chart-reveal {
+  from { clip-path: inset(0 100% 0 0); }
+  to   { clip-path: inset(0 0 0 0); }
+}
+.cg-grid .cg-card .cg-svg {
+  animation: chart-reveal var(--dur-slow) var(--ease) backwards;
+}
+.cg-grid .cg-card:nth-child(2) .cg-svg  { animation-delay: 40ms; }
+.cg-grid .cg-card:nth-child(3) .cg-svg  { animation-delay: 80ms; }
+.cg-grid .cg-card:nth-child(4) .cg-svg  { animation-delay: 120ms; }
+.cg-grid .cg-card:nth-child(n+5) .cg-svg { animation-delay: 160ms; }
+
+/* Спарклайн на плитке — тем же жестом и в то же время */
+.stat-spark .spark {
+  animation: chart-reveal var(--dur-slow) var(--ease) backwards;
+}
+
+/* ── Появление реплики ──────────────────────────────────────────────
+   Только у новой: восстановленная переписка выезжает вся разом, и это
+   не «живой интерфейс», а рябь. */
+
+@keyframes msg-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: none; }
+}
+.msg.enter { animation: msg-in var(--dur) var(--ease); }
+
+/* ── Шаги работы агента ─────────────────────────────────────────────
+   Каждый новый шаг въезжает снизу: видно, что работа продвинулась, а не
+   просто сменилась надпись. */
+
+@keyframes step-in {
+  from { opacity: 0; transform: translateX(-6px); }
+  to   { opacity: 1; transform: none; }
+}
+.steps .step { animation: step-in var(--dur-fast) var(--ease); }
+
+/* ── Изменившиеся числа ─────────────────────────────────────────────
+   Значения в списке кластеров обновляются раз в минуту молча. Вспышка
+   на четверть секунды — единственный способ заметить, что лаг вырос,
+   не сравнивая с тем, что помнишь. */
+
+@keyframes changed {
+  0%   { background: var(--accent-dim); }
+  100% { background: transparent; }
+}
+.cbadges.changed {
+  animation: changed 900ms var(--ease);
+  border-radius: var(--r-sm);
+}
+
+/* ── Новое событие ──────────────────────────────────────────────────
+   Счётчик на вкладке подскакивает: он маленький, и без этого прибавка
+   незаметна. */
+
+@keyframes bump {
+  0%   { transform: scale(1); }
+  40%  { transform: scale(1.35); }
+  100% { transform: scale(1); }
+}
+.alert-count.bump { animation: bump var(--dur-slow) var(--ease); }
+
+/* Всплывающее уведомление приезжает справа — оттуда же, где живёт
+   остальное о событиях */
+@keyframes toast-in {
+  from { opacity: 0; transform: translateX(24px); }
+  to   { opacity: 1; transform: none; }
+}
+.toast { animation: toast-in var(--dur) var(--ease); }
+
+/* ── Состояние соединения ───────────────────────────────────────────
+   «Нет связи» и «подключаюсь» выглядели одинаково, хотя во втором
+   случае ждать имеет смысл. Пульсация как раз и означает ожидание. */
+
+@keyframes dot-pulse {
+  0%, 100% { opacity: 1;  box-shadow: 0 0 0 0 rgba(227,160,8,.5); }
+  50%      { opacity: .5; box-shadow: 0 0 0 4px rgba(227,160,8,0); }
+}
+.conn-dot.connecting {
+  background: var(--yellow);
+  animation: dot-pulse 1.4s var(--ease) infinite;
+}
+
+/* ── Наведение ──────────────────────────────────────────────────────
+   Отклик на наведение — обещание, что элемент нажимается. Коротко,
+   чтобы не тянуться за курсором. */
+
+.cluster-card, .pick-card, .blk, .thread-item {
+  transition: background var(--dur-fast) var(--ease),
+              border-color var(--dur-fast) var(--ease);
+}
+.tab { transition: color var(--dur-fast) var(--ease),
+                   border-color var(--dur-fast) var(--ease); }
+
+/* ── Отключаемое движение ───────────────────────────────────────────
+   Системная настройка «меньше движения» ставится людьми, которым от
+   него плохо. Уважается целиком: остаются только смены состояния,
+   выраженные цветом. */
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .001ms !important;
+  }
+  .conn-dot.connecting { opacity: .7; }
 }

@@ -280,6 +280,7 @@ def application() -> None:
         attach_after_reload()
         tick_dates()
         design_system()
+        motion()
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -1553,6 +1554,56 @@ def design_system() -> None:
           'class="input-hint"' in html, True)
     check("пустые состояния объясняют, а не командуют",
           html.count('class="empty"') >= 2 and "empty-title" in html, True)
+
+
+def motion() -> None:
+    """Движение привязано к изменению состояния, а не насыпано поверх."""
+    css = (ROOT / "web" / "style.css").read_text(encoding="utf-8")
+    app = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
+
+    # Длительности и кривая — величинами, а не числами по месту
+    for token in ("--dur-fast:", "--dur:", "--dur-slow:", "--ease:"):
+        if token not in css:
+            check("задана величина %s" % token, False, True)
+    check("длительности заданы одним набором", True, True)
+
+    # Ничего затяжного: интерфейс не должен заставлять ждать свою анимацию
+    import re
+
+    long_ones = [ms for ms in re.findall(r"--dur[\w-]*:\s*(\d+)ms", css)
+                 if int(ms) > 400]
+    check("нет затяжных анимаций", long_ones, [],
+          show=", ".join(long_ones) or "да")
+
+    # Каждая анимация отвечает на изменение, а не играет сама по себе
+    for name in ("pane-in", "msg-in", "step-in", "changed", "bump",
+                 "toast-in", "dot-pulse", "chart-reveal"):
+        if ("@keyframes " + name) not in css:
+            check("есть движение «%s»" % name, False, True)
+    check("движение есть там, где меняется состояние", True, True)
+
+    check("новая реплика выезжает, восстановленная — нет",
+          "state.restoring ? '' : ' enter'" in app, True)
+    check("подсвечивается изменившееся, а не любое обновление",
+          "el.innerHTML !== html" in app, True)
+    check("подключение отличается от обрыва",
+          "'connecting'" in app and ".conn-dot.connecting" in css, True)
+
+    # Раскрытие блока: класс вместо hidden, иначе переходу нечего играть
+    check("раскрытие ведёт класс", "grid-template-rows: 0fr" in css, True)
+    check("свёрнутое не читается диктором",
+          "visibility: hidden;" in css and "visibility 0s linear" in css, True)
+
+    # Системная настройка «меньше движения» уважается целиком
+    block = css[css.index("@media (prefers-reduced-motion: reduce) {",
+                          css.index("ДВИЖЕНИЕ")):]
+    check("движение отключается целиком",
+          "animation-duration: .001ms !important;" in block[:600] and
+          "transition-duration: .001ms !important;" in block[:600], True)
+
+    # Ничего не ждёт прокрутки: всё, что должно быть прочитано, видно сразу
+    check("нет появления по прокрутке",
+          "IntersectionObserver" in app, False)
 
 
 def websocket(client) -> None:
