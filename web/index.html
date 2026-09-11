@@ -270,7 +270,7 @@
       <pre id="health-out" class="output" hidden></pre>
     </section>
 
-    <section id="tab-access" class="tab-pane" hidden>
+    <section id="tab-access" class="tab-pane pad-pane" hidden>
       <h3 style="margin:0 0 4px">Кто может входить в систему</h3>
       <p class="muted" style="margin:0 0 18px;font-size:13px">
         Доменной учётной записи мало — вход разрешён только тем, кто есть
@@ -305,12 +305,18 @@
         </div>
       </div>
 
-      <h4 style="margin:0 0 10px">Выданные доступы</h4>
+      <div class="pane-head" style="margin-top:6px">
+        <h4 style="margin:0">Выданные доступы</h4>
+        <div class="pane-actions">
+          <input id="access-filter" type="search" oninput="App.filterAccess()"
+                 placeholder="фильтр: логин, имя или роль">
+        </div>
+      </div>
       <div id="access-list"><div class="muted">Загрузка…</div></div>
       <button class="ghost-btn" onclick="App.loadAccess()">↻ Обновить</button>
     </section>
 
-    <section id="tab-audit" class="tab-pane" hidden>
+    <section id="tab-audit" class="tab-pane pad-pane" hidden>
       <h3 style="margin:0 0 4px">Журнал действий</h3>
       <p class="muted" style="margin:0 0 18px;font-size:13px">
         Входы, выдача и отзыв доступов, удаление событий, записанные решения

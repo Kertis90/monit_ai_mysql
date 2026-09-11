@@ -24,6 +24,8 @@ const App = (() => {
     range:         null,   // свой интервал: {since, until} в Unix-времени
     templates:     [],     // готовые диагностические запросы
     auditOffset:   0,      // сколько записей журнала уже показано
+    accessItems:   [],     // выданные доступы целиком
+    accessShown:   50,     // сколько из них показано
     currentTab:    'chat',
     streamingEl:   null,   // элемент .msg-body куда стримятся токены
     streamBuf:     '',     // сырой текст ответа до разметки
@@ -1121,6 +1123,61 @@ const App = (() => {
 
   // ═══ УПРАВЛЕНИЕ ДОСТУПАМИ (только для админов) ══════════════════
 
+  // Выданных доступов в большой организации сотни: показываем частями,
+  // как и журнал. Поиск по списку тут же, потому что искать глазами в
+  // трёх сотнях строк — не поиск.
+  const ACCESS_PAGE = 50;
+
+  function accessRow(u) {
+    return `
+        <div class="alert-item" style="display:flex;align-items:center;gap:12px">
+          <div style="flex:1">
+            <div><b>${esc(u.username)}</b>${u.role === 'admin'
+                 ? ' <span class="ctx-chip">админ</span>' : ''}${!u.enabled
+                 ? ' <span class="ctx-chip">отозван</span>' : ''}</div>
+            <div class="muted" style="font-size:12px">
+              ${esc(u.display_name || '')}${u.email ? ' · ' + esc(u.email) : ''}
+              ${u.granted_by ? ' · выдал ' + esc(u.granted_by) : ''}
+              ${u.granted_at ? ' · ' + esc(String(u.granted_at).slice(0, 10)) : ''}
+            </div>
+          </div>
+          ${u.enabled
+            ? `<button class="ghost-btn" onclick="App.revokeAccess('${esc(u.username)}')">Отозвать</button>`
+            : `<button class="ghost-btn" onclick="App.grantAgain('${esc(u.username)}','${esc(u.role)}')">Вернуть</button>`}
+        </div>`;
+  }
+
+  function filterAccess() {
+    state.accessShown = ACCESS_PAGE;
+    renderAccessList(state.accessItems || []);
+  }
+
+  function renderAccessList(items) {
+    const box = $('access-list');
+    const needle = ($('access-filter') && $('access-filter').value || '')
+      .trim().toLowerCase();
+    const found = needle
+      ? items.filter(u => (u.username + ' ' + (u.display_name || '') + ' ' +
+                           (u.role || '')).toLowerCase().includes(needle))
+      : items;
+    const shown = found.slice(0, state.accessShown);
+
+    box.innerHTML = shown.map(accessRow).join('') +
+      '<div class="pager">' +
+      '<span class="muted small">Показано ' + shown.length + ' из ' +
+      found.length + (needle ? ' найденных' : '') +
+      (shown.length >= found.length ? ' — это все' : '') + '</span>' +
+      (shown.length < found.length
+        ? '<button class="ghost-btn" id="access-more">Показать ещё ' +
+          Math.min(ACCESS_PAGE, found.length - shown.length) + '</button>'
+        : '') + '</div>';
+
+    $('access-more')?.addEventListener('click', () => {
+      state.accessShown += ACCESS_PAGE;
+      renderAccessList(items);
+    });
+  }
+
   async function loadAccess() {
     const box = $('access-list');
     setBusy(box, 'Читаю список доступов…');
@@ -1154,22 +1211,9 @@ const App = (() => {
                         'Войти сможет только локальный администратор.</div>';
         return;
       }
-      box.innerHTML = d.items.map(u => `
-        <div class="alert-item" style="display:flex;align-items:center;gap:12px">
-          <div style="flex:1">
-            <div><b>${esc(u.username)}</b>${u.role === 'admin'
-                 ? ' <span class="ctx-chip">админ</span>' : ''}${!u.enabled
-                 ? ' <span class="ctx-chip">отозван</span>' : ''}</div>
-            <div class="muted" style="font-size:12px">
-              ${esc(u.display_name || '')}${u.email ? ' · ' + esc(u.email) : ''}
-              ${u.granted_by ? ' · выдал ' + esc(u.granted_by) : ''}
-              ${u.granted_at ? ' · ' + esc(String(u.granted_at).slice(0, 10)) : ''}
-            </div>
-          </div>
-          ${u.enabled
-            ? `<button class="ghost-btn" onclick="App.revokeAccess('${esc(u.username)}')">Отозвать</button>`
-            : `<button class="ghost-btn" onclick="App.grantAgain('${esc(u.username)}','${esc(u.role)}')">Вернуть</button>`}
-        </div>`).join('');
+      state.accessItems = d.items;
+      state.accessShown = ACCESS_PAGE;
+      renderAccessList(d.items);
     } catch (e) {
       box.innerHTML = '<div class="muted">Не удалось загрузить список: ' + esc(e) + '</div>';
     }
@@ -1216,7 +1260,8 @@ const App = (() => {
       const shown = state.auditOffset + d.items.length;
       const foot =
         '<div class="pager">' +
-        '<span class="muted small">Показано ' + shown + ' из ' + d.total + '</span>' +
+        '<span class="muted small">Показано ' + shown + ' из ' + d.total +
+        (d.has_more ? '' : ' — это всё за период') + '</span>' +
         (d.has_more
           ? '<button class="ghost-btn" id="audit-more">Показать ещё ' +
             Math.min(AUDIT_PAGE, d.total - shown) + '</button>'
@@ -1931,6 +1976,17 @@ const App = (() => {
                'обновляется при каждой вставке. Глазами в схеме такое не найти.',
         actions: [{ label: 'Найти', fn: 'loadIndexes' }] },
     ] },
+    { title: 'Что в базе', blocks: [
+      { id: 'schema', out: 'cluster-schema', name: 'Схема базы',
+        short: 'таблицы, столбцы, индексы',
+        about: 'Снимок схемы хранится у агента и читается мгновенно — ' +
+               'боевой сервер при этом не трогается. По нему модель пишет ' +
+               'выборки настоящими именами, а не выдуманными. Пересъёмка ' +
+               'доступна администраторам: это обход information_schema на ' +
+               'боевом сервере, и делать его походя не стоит.',
+        actions: [{ label: 'Показать', fn: 'loadSchema' },
+                  { label: 'Снять заново', fn: 'resnapSchema' }] },
+    ] },
     { title: 'Как настроено', blocks: [
       { id: 'config', out: 'cluster-config', name: 'Настройки MySQL',
         short: 'что выставлено неудачно',
@@ -2493,6 +2549,32 @@ const App = (() => {
     'api/growth/' + encodeURIComponent(state.clusterName) + '?days=30',
     'Сравниваю снимки…', btn);
 
+  const loadSchema = (btn) => lazyBlock('cluster-schema',
+    'api/schema/' + encodeURIComponent(state.clusterName),
+    'Читаю снимок схемы…', btn);
+
+  // Пересъёмка идёт на боевой сервер, поэтому спрашиваем подтверждение и
+  // говорим, чем это обернётся
+  async function resnapSchema(btn) {
+    if (!confirm('Снять схему заново?\n\nАгент обойдёт information_schema ' +
+                 'на боевом сервере. На базе с тысячами таблиц это занимает ' +
+                 'несколько секунд и создаёт нагрузку.')) return;
+    const box = $('cluster-schema');
+    setBusy(box, 'Обхожу information_schema…', 'это может занять минуту');
+    await withBusy(btn, async () => {
+      try {
+        const d = await getJson('api/schema/' +
+                                encodeURIComponent(state.clusterName) + '/snapshot',
+                                { method: 'POST' });
+        box.innerHTML = '<pre class="output">' +
+                        esc(d.text || d.error || 'Снимок пуст.') + '</pre>';
+      } catch (e) {
+        box.innerHTML = '<div class="muted small">Не удалось снять: ' +
+                        esc(e.message || e) + '</div>';
+      }
+    });
+  }
+
   const loadMemory = (btn) => lazyBlock('cluster-memory',
     'api/memory/' + encodeURIComponent(state.clusterName),
     'Смотрю память и журнал ядра…', btn);
@@ -2889,7 +2971,7 @@ const App = (() => {
   return { showTab, pickCluster, useSuggestion, toggleAnalysis, explainAll,
            periodChanged, applyRange,
            loadStatus, loadAlerts, refreshClusters, logout,
-           loadAccess, loadAudit, searchDirectory, grantAgain,
+           loadAccess, loadAudit, filterAccess, searchDirectory, grantAgain,
            newThread, deleteThread, switchThread, toggleSidebar,
            toggleClusters, openCluster, loadClusterPage, loadWorkload,
            loadReplication, loadDiag, askAboutCluster, analyzeAlert,
@@ -2897,7 +2979,8 @@ const App = (() => {
            useTemplate, runSearch,
            loadForecast, loadConfigAudit, loadGrowth, loadAnomalies,
            loadReadiness, loadHealth, loadIndexes, loadConfigChanges,
-           loadBackups, loadMemory, addNote, toggleNote, deleteNote,
+           loadBackups, loadMemory, loadSchema, resnapSchema,
+           addNote, toggleNote, deleteNote,
            grantManual, revokeAccess, deleteAlert, deleteAlertsByName,
            resolveAlert,
            stopGeneration };

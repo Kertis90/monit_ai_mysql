@@ -117,6 +117,23 @@ def tool_specs() -> list:
                                  "description": "шаг разбивки, по умолчанию 300"}},
                 "required": ["cluster", "hours"]}}},
         {"type": "function", "function": {
+            "name": "get_schema",
+            "description": "Схема базы из снимка агента: список таблиц, "
+                           "столбцы и индексы конкретной таблицы, поиск "
+                           "таблиц и столбцов по куску имени. Нужен, чтобы "
+                           "писать выборки по настоящим именам, а не по "
+                           "выдуманным. Читается мгновенно: боевой сервер "
+                           "при этом не трогается.",
+            "parameters": {"type": "object", "properties": {
+                "cluster": cl,
+                "table": {"type": "string",
+                          "description": "имя таблицы или база.таблица — "
+                                         "вернёт столбцы и индексы"},
+                "search": {"type": "string",
+                           "description": "кусок имени: найдёт таблицы и "
+                                          "столбцы, где он встречается"}},
+                "required": ["cluster"]}}},
+        {"type": "function", "function": {
             "name": "explain_query",
             "description": "План выполнения запроса (EXPLAIN) с разбором: "
                            "полные сканирования, сортировки без индекса, "
@@ -193,11 +210,24 @@ async def run_tool(name: str, args: dict) -> str:
 
     if name in ("get_current_metrics", "get_history", "get_breakdown",
                 "run_diagnostics", "run_sql", "read_logs", "explain_query",
-                "get_workload", "get_replication") and not cluster:
+                "get_schema", "get_workload", "get_replication") and not cluster:
         return f"Кластер «{cname}» не найден. Доступные: " + \
                ", ".join(c["name"] for c in enabled_clusters())
 
     try:
+        if name == "get_schema":
+            from agent.services import schema as schema_service
+            snapshot = await schema_service.load(cluster["name"])
+            if not snapshot:
+                return schema_service.fmt_snapshot({}, cluster["label"])
+            if args.get("table"):
+                return schema_service.fmt_describe(
+                    schema_service.describe(snapshot, str(args["table"])))
+            if args.get("search"):
+                return schema_service.fmt_find(
+                    schema_service.find(snapshot, str(args["search"])))
+            return schema_service.fmt_snapshot(snapshot, cluster["label"])
+
         if name == "explain_query":
             from agent.services import explain as explain_service
             data = await explain_service.explain(
@@ -410,6 +440,18 @@ async def build_chat_context(user_message: str, progress=None
                 # и ресурсы у них разные
                 for tb in await collect_series_tables(cluster, hours, step):
                     blocks.append(fmt_series_table(tb, cluster["label"]))
+        # Что вообще есть в базе. Из снимка, поэтому бесплатно; без этого
+        # верхнего слоя модель не знает имён и либо отказывается писать
+        # выборку, либо придумывает таблицы
+        try:
+            from agent.services import schema as schema_service
+            brief = schema_service.fmt_brief(
+                await schema_service.load(cluster["name"]))
+            if brief:
+                blocks.append(brief)
+        except Exception as exc:
+            logger.info("Справка по схеме не добавлена: %s", exc)
+
         await say("Снимаю текущее состояние " + cluster["label"])
         current = await collect_current(cluster)
         blocks.append(fmt_current(current))

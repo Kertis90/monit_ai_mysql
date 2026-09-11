@@ -15,7 +15,7 @@ from agent.db.repositories.notes import NoteRepository
 from agent.services import (anomaly, audit, backups, config_audit,
                             config_history, forecast, growth, indexes,
                             explain, insight, memory, readiness,
-                            tasks)
+                            schema, tasks)
 from agent.schemas.api import (ExplainRequest, InsightOut,
                                InsightRequest, SqlRequest, SqlResult)
 from agent.services.analysis import (DIAG_QUERIES, collect_series_table,
@@ -433,6 +433,56 @@ async def analyze_blocks(req: InsightRequest, user: CurrentUser,
                                 else "один блок", len(blocks)),
                       ip=audit.client_ip(request), ok=ok)
     return {"cluster": req.cluster, "text": text}
+
+
+@router.get("/api/schema/{name}", tags=["Диагностика"],
+            summary="Схема базы из снимка")
+async def schema_read(name: str, user: CurrentUser, table: str = "",
+                      search: str = ""):
+    """Читает снимок, а не базу: обход information_schema стоит дорого, и
+    делать его на каждый вопрос незачем."""
+    cluster = _need(name)
+    snapshot = await schema.load(name)
+
+    if table:
+        data = schema.describe(snapshot, table)
+        return {"cluster": name, "taken_at": snapshot.get("taken_at", ""),
+                "text": schema.fmt_describe(data)}
+    if search:
+        data = schema.find(snapshot, search)
+        return {"cluster": name, "taken_at": snapshot.get("taken_at", ""),
+                "text": schema.fmt_find(data)}
+    return {"cluster": name, "taken_at": snapshot.get("taken_at", ""),
+            "databases": len(snapshot.get("databases") or []),
+            "tables": len(snapshot.get("tables") or {}),
+            "text": schema.fmt_snapshot(snapshot, cluster["label"])}
+
+
+@router.post("/api/schema/{name}/snapshot", tags=["Диагностика"],
+             summary="Снять схему заново")
+async def schema_snapshot(name: str, admin: AdminUser, journal: Audit,
+                          request: Request):
+    """Пересъёмка — действие администратора: это обращение к боевому
+    серверу, и запускать его походя не стоит."""
+    cluster = _need(name)
+    data = await schema.collect(cluster)
+    if data.get("error"):
+        await journal.add(action="Снимок схемы", username=admin.get("username", ""),
+                          target=name, detail=data["error"][:500],
+                          ip=audit.client_ip(request), ok=False)
+        return {"cluster": name, "error": data["error"],
+                "text": "## Схема базы\n\n  " + data["error"]}
+
+    await schema.save(name, data)
+    await journal.add(action="Снимок схемы", username=admin.get("username", ""),
+                      target=name,
+                      detail="баз %d, таблиц %d" % (len(data.get("databases") or []),
+                                                    len(data.get("tables") or {})),
+                      ip=audit.client_ip(request))
+    return {"cluster": name, "taken_at": data.get("taken_at", ""),
+            "databases": len(data.get("databases") or []),
+            "tables": len(data.get("tables") or {}),
+            "text": schema.fmt_snapshot(data, cluster["label"])}
 
 
 @router.post("/api/explain", tags=["Диагностика"],

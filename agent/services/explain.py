@@ -202,6 +202,70 @@ async def explain(cluster: dict, sql: str = "", connection_id: int = 0,
     return data
 
 
+# С какой длительности запрос стоит объяснять сам собой. Секунда — это
+# шум, пять секунд на боевой базе — уже повод посмотреть план.
+SLOW_NOW_SECONDS = 5
+MAX_RUNNING_PLANS = 3
+
+
+async def explain_running(cluster: dict, items: list,
+                          host: Optional[str] = None,
+                          min_seconds: float = SLOW_NOW_SECONDS,
+                          limit: int = MAX_RUNNING_PLANS) -> list:
+    """Планы для запросов, которые выполняются прямо сейчас и долго.
+
+    Это тот случай, ради которого EXPLAIN FOR CONNECTION и существует:
+    запрос висит, его видно в списке процессов, но воспроизвести его
+    негде — параметры неизвестны, а данные за время разбирательства
+    изменятся. План при этом можно взять прямо с работающего соединения.
+
+    Схемы таблиц к таким планам не прикладываем: разбор идёт по горячим
+    следам, и лишние обращения к базе, которой и так плохо, тут ни к чему.
+    """
+    slow = [q for q in (items or [])
+            if (q.get("time_s") or 0) >= min_seconds and q.get("id")]
+    slow.sort(key=lambda q: -(q.get("time_s") or 0))
+
+    out = []
+    for q in slow[:limit]:
+        data = await explain(cluster, connection_id=int(q["id"]), host=host,
+                             with_schema=False)
+        # Запрос мог закончиться, пока мы до него шли — это нормально и
+        # ничего не значит
+        if data.get("error") and "уже завершилось" in data["error"]:
+            continue
+        out.append({"id": q["id"], "time_s": q.get("time_s"),
+                    "query": q.get("query", ""), "plan": data})
+    return out
+
+
+def fmt_running_plans(plans: list) -> str:
+    """Планы висящих запросов с выводами, без пересказа самого плана."""
+    if not plans:
+        return ""
+    lines = ["  Планы выполнения для запросов, которые идут прямо сейчас:"]
+    for item in plans:
+        lines.append("")
+        lines.append("  Соединение %s, идёт %.0f с:"
+                     % (item["id"], item.get("time_s") or 0))
+        lines.append("    " + " ".join(str(item.get("query", "")).split())[:300])
+        data = item.get("plan") or {}
+        if data.get("error"):
+            lines.append("    План не получен: " + str(data["error"])[:200])
+            continue
+        found = data.get("findings") or []
+        if not found:
+            lines.append("    План без замечаний: запрос идёт по индексам, "
+                         "долго — не из-за плана.")
+            continue
+        for f in found:
+            lines.append("    [%s] %s — %s"
+                         % ("ВАЖНО" if f["level"] == "critical" else "стоит",
+                            f["table"], f["what"]))
+            lines.append("         " + f["do"])
+    return "\n".join(lines)
+
+
 def _explain_hint(error: str, for_connection: bool) -> str:
     """Отказ EXPLAIN почти всегда упирается в права, и в разные.
 

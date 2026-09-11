@@ -228,12 +228,24 @@ async def workload_delta(cluster: dict, seconds: float = DEFAULT_WINDOW_S,
 
     queries = _digest_delta(first_digest, second_digest, limit)
     status  = _status_delta(first_status, second_status, window)
+
+    # Долго висящий запрос — первый кандидат на разбор, и план для него
+    # можно взять прямо с работающего соединения. Спрашивать об этом
+    # отдельной кнопкой значит терять время там, где его и так нет.
+    plans = []
+    try:
+        from agent.services import explain as explain_service
+        plans = await explain_service.explain_running(
+            cluster, (active or {}).get("items") or [], host)
+    except Exception as exc:
+        logger.info("Планы для идущих запросов не получены: %s", exc)
     return {
         "host":    second_digest.get("host", ""),
         "window":  window,
         "queries": queries,
         "status":  status,
         "active":  active,
+        "plans":   plans,
         # Пустой список — не ошибка: база могла просто простаивать
         "idle":    not queries,
     }
@@ -273,6 +285,11 @@ def fmt_workload(data: dict, label: str) -> str:
         lines.append("")
 
     lines += _fmt_active(data.get("active") or {})
+
+    if data.get("plans"):
+        from agent.services.explain import fmt_running_plans
+        lines.append(fmt_running_plans(data["plans"]))
+        lines.append("")
 
     if data.get("idle"):
         lines.append("  За это окно ни один запрос не завершился — база "

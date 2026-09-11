@@ -289,6 +289,10 @@ def application() -> None:
         explain_rights()
         explain_endpoint(c)
         log_window()
+        schema_snapshot()
+        schema_storage(c)
+        running_plans()
+        list_paging()
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -1112,7 +1116,9 @@ def cluster_page_shape() -> None:
     app_js = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
 
     check("блоки описаны списком", "CLUSTER_GROUPS" in app_js, True)
-    check("групп четыре", app_js.count("blocks: ["), 4)
+    # Групп стало пять: к «сейчас», «запасу», «настройкам» и
+    # «обслуживанию» добавилось «что в базе» со схемой
+    check("блоки разложены по группам", app_js.count("blocks: [") >= 4, True)
     for out in ("cluster-workload", "cluster-repl", "cluster-diag",
                 "cluster-forecast", "cluster-config", "cluster-growth",
                 "cluster-anomaly", "cluster-indexes", "cluster-changes",
@@ -1945,6 +1951,199 @@ def log_window() -> None:
           "по времени сервера" in src, True)
     check("и что метки в файле в UTC",
           "метки в файле в UTC" in src, True)
+
+
+def schema_snapshot() -> None:
+    """Схема снимается один раз и живёт у агента.
+
+    Обход information_schema на базе с тысячами таблиц заметен на боевом
+    сервере, а схема меняется раз в релиз. Поэтому снимок, а не запрос на
+    каждый вопрос.
+    """
+    from agent.services import schema
+
+    calls = []
+
+    async def fake_sql(cluster, sql, host=None, max_rows=0):
+        calls.append(sql)
+        low = sql.lower()
+        if "group by table_schema" in low:
+            return {"host": "10.1.0.1", "columns": ["db", "tables", "size_mb",
+                                                    "rows_est"],
+                    "rows": [["lanbilling", 120, 4096, 88000000]]}
+        if "from information_schema.tables" in low:
+            return {"columns": ["tbl", "engine", "rows_est", "size_mb",
+                                "idx_mb", "note"],
+                    "rows": [["agreements", "InnoDB", 4200000, 3100, 900,
+                              "договоры"],
+                             ["payments", "InnoDB", 88000000, 900, 400, ""]]}
+        if "from information_schema.columns" in low:
+            return {"columns": ["tbl", "col", "type", "nullable", "ckey",
+                                "extra", "note"],
+                    "rows": [["agreements", "uid", "int(11)", "NO", "PRI",
+                              "auto_increment", ""],
+                             ["agreements", "balance", "decimal(10,2)", "YES",
+                              "", "", "баланс"],
+                             ["payments", "pay_id", "bigint", "NO", "PRI", "", ""]]}
+        if "from information_schema.statistics" in low:
+            return {"columns": ["tbl", "idx", "cols", "non_unique",
+                                "cardinality"],
+                    "rows": [["agreements", "PRIMARY", "uid", 0, 4200000]]}
+        return {"columns": [], "rows": []}
+
+    original = schema.sql_execute
+    schema.sql_execute = fake_sql
+    try:
+        cluster = {"name": "kemerovo", "label": "Кемерово",
+                   "primary_ip": "10.1.0.1", "db_user": "ai_agent",
+                   "db_password": "x"}
+        snapshot = asyncio.run(schema.collect(cluster))
+
+        check("базы сняты", len(snapshot["databases"]), 1)
+        check("таблицы сняты", len(snapshot["tables"]), 2)
+        check("столбцы взяты одним запросом на базу",
+              sum(1 for c in calls if "information_schema.columns" in c.lower()), 1)
+        check("индексы тоже одним",
+              sum(1 for c in calls if "information_schema.statistics" in c.lower()), 1)
+
+        # Читаем снимок, а не базу: обращений к ней больше нет
+        before = len(calls)
+        one = schema.describe(snapshot, "agreements")
+        check("таблица нашлась без указания базы", one["table"], "agreements")
+        check("столбцы на месте", len(one["columns"]), 2)
+        check("к базе за этим не ходили", len(calls), before)
+
+        text = schema.fmt_describe(one)
+        check("первичный ключ подписан", "первичный ключ" in text, True)
+        check("комментарий столбца виден", "баланс" in text, True)
+
+        found = schema.find(snapshot, "balance")
+        check("поиск по куску имени работает",
+              found["matches"][0]["col"], "balance")
+        check("короткий запрос отклонён",
+              "error" in schema.find(snapshot, "b"), True)
+
+        brief = schema.fmt_brief(snapshot)
+        check("в подсказке есть имена таблиц", "agreements" in brief, True)
+        check("и запрет угадывать", "не угадывай" in brief, True)
+
+        # Не снимали — так и сказано, вместе с тем, что делать
+        empty = schema.fmt_snapshot({}, "Кемерово")
+        check("несняток объяснён", "ещё не снята" in empty, True)
+        check("сказано, кто может снять", "администраторам" in empty, True)
+    finally:
+        schema.sql_execute = original
+
+
+def schema_storage(client) -> None:
+    """Снимок переживает перезапуск и отдаётся через API."""
+    from agent.services import schema
+
+    snapshot = {"taken_at": "2026-09-11T05:00:00",
+                "databases": [{"db": "billing", "tables": 2, "size_mb": 10,
+                               "rows_est": 100}],
+                "tables": {"billing.orders": {
+                    "db": "billing", "table": "orders", "engine": "InnoDB",
+                    "rows_est": 100, "size_mb": 10, "idx_mb": 2, "note": "",
+                    "columns": [{"col": "id", "type": "int", "nullable": "NO",
+                                 "ckey": "PRI", "extra": "", "note": ""}],
+                    "indexes": []}},
+                "cut": []}
+
+    asyncio.run(schema.save("kemerovo", snapshot))
+    back = asyncio.run(schema.load("kemerovo"))
+    check("снимок сохранился и прочитался",
+          list(back["tables"].keys()), ["billing.orders"])
+
+    r = client.get("/api/schema/kemerovo")
+    check("схема отдаётся", r.status_code, 200)
+    check("в ответе видно, когда снято",
+          r.json()["taken_at"].startswith("2026-09-11"), True)
+    check("и сколько таблиц", r.json()["tables"], 1)
+
+    one = client.get("/api/schema/kemerovo?table=orders").json()
+    check("описание таблицы отдаётся", "orders" in one["text"], True)
+
+    hit = client.get("/api/schema/kemerovo?search=ord").json()
+    check("поиск по схеме отдаётся", "orders" in hit["text"], True)
+
+    from agent.services.assistant import tool_specs
+    names = [t["function"]["name"] for t in tool_specs()]
+    check("модель умеет читать схему", "get_schema" in names, True)
+
+    app = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
+    check("пересъёмка спрашивает подтверждение",
+          "Снять схему заново?" in app, True)
+    check("и предупреждает про нагрузку",
+          "создаёт нагрузку" in app, True)
+
+
+def running_plans() -> None:
+    """Долго идущий запрос объясняется сам, без отдельной кнопки."""
+    from agent.services import explain
+
+    seen = []
+
+    async def fake_explain(cluster, sql="", connection_id=0, host=None,
+                           with_schema=True):
+        seen.append(connection_id)
+        check("схемы к горячему разбору не тянем", with_schema, False)
+        return {"findings": [{"level": "critical", "table": "agreements",
+                              "what": "таблица читается целиком",
+                              "why": "индекса нет", "do": "добавить индекс"}]}
+
+    original = explain.explain
+    explain.explain = fake_explain
+    try:
+        items = [
+            {"id": 11, "time_s": 42.0, "query": "SELECT * FROM agreements"},
+            {"id": 12, "time_s": 1.0,  "query": "SELECT 1"},
+            {"id": 13, "time_s": 88.0, "query": "SELECT * FROM payments"},
+            {"id": 14, "time_s": 9.0,  "query": "SELECT 2"},
+            {"id": 15, "time_s": 7.0,  "query": "SELECT 3"},
+        ]
+        plans = asyncio.run(explain.explain_running({"name": "k"}, items))
+        check("короткие запросы не объясняем", 12 in seen, False)
+        check("начинаем с самого долгого", seen[0], 13)
+        check("берём не больше трёх", len(plans), 3)
+
+        text = explain.fmt_running_plans(plans)
+        check("видно, сколько запрос уже идёт", "идёт 88 с" in text, True)
+        check("и что с ним делать", "добавить индекс" in text, True)
+    finally:
+        explain.explain = original
+
+    check("пустой список ничего не печатает", explain.fmt_running_plans([]), "")
+
+    import inspect
+
+    from agent.services import workload
+    check("профиль нагрузки зовёт планы сам",
+          "explain_running" in inspect.getsource(workload.workload_delta), True)
+
+
+def list_paging() -> None:
+    """Длинные списки листаются, а панели прокручиваются.
+
+    На ноутбуке подвал со счётчиком уезжал за нижний край: у панелей
+    «Журнал» и «Доступы» не было прокрутки вовсе.
+    """
+    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+    app = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
+
+    for tab in ("tab-access", "tab-audit"):
+        marker = '<section id="%s" class="tab-pane pad-pane"' % tab
+        if marker not in html:
+            check("панель %s прокручивается" % tab, False, True)
+    check("панели журнала и доступов прокручиваются", True, True)
+
+    check("счётчик журнала виден всегда",
+          "это всё за период" in app, True)
+    check("список доступов листается",
+          "ACCESS_PAGE" in app and "access-more" in app, True)
+    check("и фильтруется", 'id="access-filter"' in html, True)
+    check("фильтр сбрасывает показанное",
+          "state.accessShown = ACCESS_PAGE;" in app, True)
 
 
 def websocket(client) -> None:

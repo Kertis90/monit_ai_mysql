@@ -1788,3 +1788,16 @@ header h1 { font-size: var(--fs-lg); }
   font-size: var(--fs-sm);
 }
 .sql-live input:focus { border-color: var(--border-hl); outline: none; }
+
+/* Фильтр по списку доступов: искать глазами в трёх сотнях строк — не поиск */
+#access-filter {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  color: var(--text);
+  padding: 6px 10px;
+  font: inherit;
+  font-size: var(--fs-sm);
+  min-width: 240px;
+}
+#access-filter:focus { border-color: var(--border-hl); outline: none; }

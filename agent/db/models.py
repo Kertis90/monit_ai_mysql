@@ -263,6 +263,33 @@ class ClusterNote(Base):
     __table_args__ = (Index("idx_notes_cluster", "cluster"),)
 
 
+class SchemaSnapshot(Base):
+    """Снимок схемы базы, снятый по кнопке.
+
+    Обход information_schema на базе с тысячами таблиц заметен на боевом
+    сервере, а схема меняется раз в релиз, а не раз в минуту. Поэтому она
+    снимается однажды и хранится здесь: чат читает её отсюда мгновенно и
+    не трогая продуктив.
+
+    Один снимок на кластер: история схемы — отдельная задача, и сваливать
+    её сюда значит хранить мегабайты ради вопроса, которого никто не
+    задавал. Прежний снимок заменяется новым.
+
+    Целиком в JSON, а не по строке на столбец: снимок читается только
+    целиком, а таблица на сотню тысяч строк ради этого не нужна.
+    """
+    __tablename__ = "schema_snapshots"
+
+    id:        Mapped[int] = mapped_column(Integer, primary_key=True,
+                                           autoincrement=True)
+    cluster:   Mapped[str] = mapped_column(String(NAME_LEN), nullable=False,
+                                           unique=True)
+    taken_at:  Mapped[str] = mapped_column(String(TS_LEN), nullable=False)
+    databases: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    tables:    Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    payload:   Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+
+
 class ConfigSnapshot(Base):
     """Снимок переменной MySQL.
 
