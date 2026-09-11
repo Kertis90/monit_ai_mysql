@@ -162,6 +162,9 @@ class InsightRequest(BaseModel):
     cluster: str
     scope:   str = Field("all", pattern="^(one|all)$")
     question: str = Field("", max_length=500)
+    # Период, который человек видит на экране: историю агент добирает сам,
+    # и она должна быть про то же окно, а не про случайные три часа
+    hours:   float = Field(3.0, ge=0.05, le=24)
     blocks:  list[InsightBlock] = Field(default_factory=list, max_length=30)
 
 

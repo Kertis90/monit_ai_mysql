@@ -14,7 +14,7 @@ from agent.api.deps import (AdminUser, Audit, CurrentUser, DbSession,
 from agent.db.repositories.notes import NoteRepository
 from agent.services import (anomaly, audit, backups, config_audit,
                             config_history, forecast, growth, indexes,
-                            insight, readiness, tasks)
+                            insight, memory, readiness, tasks)
 from agent.schemas.api import (InsightOut, InsightRequest, SqlRequest,
                                SqlResult)
 from agent.services.analysis import (DIAG_QUERIES, collect_series_table,
@@ -412,7 +412,8 @@ async def analyze_blocks(req: InsightRequest, user: CurrentUser,
         # в интерфейсе вечно крутящееся кольцо, и человек не знает, ждать ему
         # или уже нет
         text = await asyncio.wait_for(
-            insight.analyze(cluster, blocks, req.scope, req.question),
+            insight.analyze(cluster, blocks, req.scope, req.question,
+                            req.hours),
             timeout=settings.llm.timeout + INSIGHT_GRACE_S)
     except asyncio.TimeoutError:
         ok = False
@@ -431,6 +432,21 @@ async def analyze_blocks(req: InsightRequest, user: CurrentUser,
                                 else "один блок", len(blocks)),
                       ip=audit.client_ip(request), ok=ok)
     return {"cluster": req.cluster, "text": text}
+
+
+@router.get("/api/memory/{name}", tags=["Диагностика"],
+            summary="Память, своп и следы OOM")
+async def memory_one(name: str, user: CurrentUser):
+    """Самый неприятный вид аварии базы — тот, где база ни при чём: ядру
+    не хватило памяти, и оно убило самый жирный процесс. Для сервера БД
+    это всегда mysqld."""
+    cluster = _need(name)
+
+    async def build():
+        data = await memory.collect(cluster)
+        data["text"] = memory.fmt_memory(data, cluster["label"])
+        return data
+    return await tasks.shared("memory:%s" % name, build, ttl=60)
 
 
 @router.get("/api/notes/{name}", tags=["Кластеры"],

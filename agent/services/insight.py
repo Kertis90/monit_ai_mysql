@@ -15,12 +15,17 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
-from agent.services.analysis import system_prompt
+from agent.services import memory
+from agent.services.analysis import (collect_baseline, explain_top_queries,
+                                     fmt_baseline, fmt_current, fmt_history,
+                                     system_prompt)
 from agent.services.assistant import cluster_notes, recent_alerts
 from agent.services.llm import llm_complete
-from agent.services.prometheus import collect_current
+from agent.services.mysql import cluster_db_creds
+from agent.services.prometheus import collect_current, collect_history
 
 logger = logging.getLogger("agent.insight")
 
@@ -49,10 +54,22 @@ ALL_TASK = """Собери всё это в один разбор кластер
   2. Связанные наблюдения: что из разных блоков складывается в одну причину.
      Это главное — ради этого разбор и делается.
   3. Что делать, по убыванию важности, с указанием, откуда вывод.
-  4. Чего не хватило, чтобы досказать.
+  4. Если данных действительно не хватило — назови, какой блок нужно снять
+     на странице кластера («Снять профиль», «Проверить репликацию»,
+     «Выполнить диагностику», «Посчитать запас», «Разобрать настройки»).
+
+Выше уже собрано всё, до чего агент дотягивается сам: текущие метрики всех
+серверов, история за период со сравнением с прошлой неделей, память со
+свопом и следами OOM, планы выполнения тяжёлых запросов. Не пиши, что этих
+данных нет, — посмотри в разделы выше. Если какого-то раздела там нет, в
+конце перечислено, почему именно он не собрался.
 
 Не перечисляй блоки по очереди и не повторяй их содержимое: человек их уже
 видел. Если всё в порядке, так и скажи — придумывать проблемы не нужно."""
+
+# Сколько ждём каждый досбор. Недоступный сервер не должен задерживать
+# разбор целиком: лучше отдать без одного раздела и сказать, без какого.
+PART_BUDGET_S = 25
 
 
 def _trim(text: str, limit: int) -> str:
@@ -121,24 +138,112 @@ async def cluster_context(cluster: dict) -> str:
     return "\n".join(lines)
 
 
+async def _part(name: str, coro):
+    """Один досбор с ограничением по времени. Возвращает (имя, текст, беда)."""
+    try:
+        return name, await asyncio.wait_for(coro, timeout=PART_BUDGET_S), ""
+    except asyncio.TimeoutError:
+        return name, "", "не успел за %d с" % PART_BUDGET_S
+    except Exception as exc:
+        logger.info("Досбор «%s» не удался: %s", name, exc)
+        return name, "", str(exc)[:200]
+
+
+async def gather_missing(cluster: dict, have: str, hours: float = 3.0) -> tuple:
+    """Дотянуться до того, чего на странице нет.
+
+    Разбор раньше видел только то, что человек успел раскрыть кнопками, и
+    честно писал «нет метрик памяти, нет истории, нет планов выполнения» —
+    хотя всё это агенту доступно, просто никто не нажал. Теперь недостающее
+    он добирает сам.
+
+    have — уже собранный текст: по нему видно, что повторять не нужно.
+    Второй раз снимать профиль нагрузки или планы выполнения незачем, это
+    минуты работы сервера ради тех же строк.
+    """
+    wanted = []
+
+    if "Текущие метрики" not in have:
+        wanted.append(("текущие метрики всех серверов", _current(cluster)))
+    if "История кластера" not in have:
+        wanted.append(("история за период и сравнение с прошлой неделей",
+                       _history(cluster, hours)))
+    if "Память, своп и OOM" not in have:
+        wanted.append(("память, своп и следы OOM", _memory(cluster)))
+    if "План выполнения" not in have and "EXPLAIN" not in have.upper():
+        wanted.append(("планы выполнения тяжёлых запросов", _plans(cluster)))
+
+    if not wanted:
+        return "", []
+
+    done = await asyncio.gather(*[_part(n, c) for n, c in wanted])
+    parts, failed = [], []
+    for name, text, problem in done:
+        if problem:
+            failed.append("%s — %s" % (name, problem))
+        elif text and text.strip():
+            parts.append(text.strip())
+        else:
+            failed.append("%s — данных нет" % name)
+    return "\n\n".join(parts), failed
+
+
+async def _current(cluster: dict) -> str:
+    return fmt_current(await collect_current(cluster))
+
+
+async def _history(cluster: dict, hours: float) -> str:
+    hist = await collect_history(cluster, hours)
+    out = [fmt_history(hist, cluster["label"])]
+    try:
+        base = await collect_baseline(cluster, hours)
+        compared = fmt_baseline(hist, base, cluster["label"])
+        if compared:
+            out.append(compared)
+    except Exception as exc:
+        logger.info("База для сравнения не собрана: %s", exc)
+    return "\n\n".join(out)
+
+
+async def _memory(cluster: dict) -> str:
+    return memory.fmt_memory(await memory.collect(cluster), cluster["label"])
+
+
+async def _plans(cluster: dict) -> str:
+    if not cluster_db_creds(cluster):
+        return ""
+    return await explain_top_queries(cluster, cluster["primary_ip"])
+
+
 async def analyze(cluster: dict, blocks: list, scope: str = "all",
-                  question: str = "") -> str:
+                  question: str = "", hours: float = 3.0) -> str:
     """Разобрать собранное. scope=one — один блок, all — всё вместе."""
     body = _blocks_text(blocks)
-    if not body.strip():
+
+    extra, failed = "", []
+    if scope != "one":
+        # Разбор «всего» обязан быть полным: то, чего нет на экране, агент
+        # добирает сам, иначе вывод строится на половине картины
+        extra, failed = await gather_missing(cluster, body, hours)
+
+    if not body.strip() and not extra.strip():
         return ("Разбирать нечего: соберите хотя бы один блок на странице "
                 "кластера, тогда появится что объяснять.")
 
     task = ONE_TASK if scope == "one" else ALL_TASK
     if question.strip():
         task += "\n\nОтдельно ответь на вопрос: " + question.strip()[:500]
+    if failed:
+        task += ("\n\nЧего собрать не удалось (об этом можно сказать в конце):"
+                 "\n  - " + "\n  - ".join(failed))
 
     context = await cluster_context(cluster)
+    collected = "\n\n".join(p for p in (body, extra) if p.strip())
     messages = [
         {"role": "system", "content": system_prompt()},
         {"role": "user",
          "content": "%s\n\n# Собранные данные\n\n%s\n\n# Задача\n\n%s"
-                    % (context, body, task)},
+                    % (context, collected, task)},
     ]
     answer = await llm_complete(messages)
     return (answer or "").strip() or "Модель вернула пустой ответ."

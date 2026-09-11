@@ -281,6 +281,9 @@ def application() -> None:
         tick_dates()
         design_system()
         motion()
+        memory_report()
+        insight_reaches()
+        memory_route(c)
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -994,7 +997,8 @@ def insight_endpoint(client) -> None:
     """
     from agent.api.routes import clusters as cluster_routes
 
-    async def fake_analyze(cluster, blocks, scope="all", question=""):
+    async def fake_analyze(cluster, blocks, scope="all", question="",
+                           hours=3.0):
         return "Вывод: %d блоков, режим %s" % (len(blocks), scope)
 
     original = cluster_routes.insight.analyze
@@ -1016,7 +1020,7 @@ def insight_endpoint(client) -> None:
         cluster_routes.insight.analyze = original
 
     # Молчащая модель не должна оставлять запрос висеть
-    async def never(cluster, blocks, scope="all", question=""):
+    async def never(cluster, blocks, scope="all", question="", hours=3.0):
         await asyncio.sleep(30)
         return "поздно"
 
@@ -1604,6 +1608,128 @@ def motion() -> None:
     # Ничего не ждёт прокрутки: всё, что должно быть прочитано, видно сразу
     check("нет появления по прокрутке",
           "IntersectionObserver" in app, False)
+
+
+def memory_report() -> None:
+    """Память, своп и OOM: то, чего у агента не было вовсе."""
+    from agent.services import memory
+
+    text = memory.fmt_memory({"items": [
+        {"host": "10.1.0.1", "role": "primary", "total_gb": 32.0,
+         "available_gb": 1.2, "used_pct": 96.0,
+         "swap_total_gb": 4.0, "swap_used_pct": 87.0,
+         "swap_in_s": 240.0, "swap_out_s": 310.0, "oom_kills_24h": 2,
+         "oom_log": {"killed": ["mysqld"],
+                     "lines": ["Aug 12 03:11:02 db1 kernel: Out of memory: "
+                               "Killed process 2431 (mysqld) total-vm:38G"]}},
+        {"host": "10.1.0.2", "role": "replica", "total_gb": 32.0,
+         "available_gb": 20.0, "used_pct": 37.0,
+         "swap_total_gb": 0.0, "swap_used_pct": None,
+         "swap_in_s": 0.0, "swap_out_s": 0.0, "oom_kills_24h": 0,
+         "oom_log": {"killed": [], "lines": []}},
+    ]}, "Кемерово")
+
+    check("видно, кого убило ядро", "mysqld" in text, True)
+    check("сказано, что убийства были", "ЯДРО УБИВАЛО ПРОЦЕССЫ" in text, True)
+    check("активная подкачка названа прямо",
+          "ПОДКАЧКА ИДЁТ ПРЯМО СЕЙЧАС" in text, True)
+    check("строка журнала ядра приведена",
+          "Killed process 2431" in text, True)
+    check("отсутствие свопа объяснено, а не пропущено",
+          "Свопа нет" in text and "сразу убивает процесс" in text, True)
+    check("чистый сервер тоже получает ответ",
+          "Следов OOM в журнале ядра нет" in text, True)
+
+    # Ищем именно движение страниц, а не занятость свопа: занятый своп сам
+    # по себе ничего не значит
+    import inspect
+    src = inspect.getsource(memory)
+    check("смотрим скорость подкачки", "node_vmstat_pswpin" in src, True)
+    check("и счётчик убийств ядром", "node_vmstat_oom_kill" in src, True)
+    check("журнал ядра читается несколькими способами",
+          len(memory.OOM_COMMANDS) >= 3, True)
+    check("dmesg не единственный путь",
+          "journalctl -k" in src and "/var/log/messages" in src, True)
+
+
+def insight_reaches() -> None:
+    """Разбор «всего» добирает то, чего нет на экране.
+
+    Раньше он видел только раскрытые блоки и писал «нет метрик памяти, нет
+    истории, нет планов выполнения» — хотя всё это агенту доступно, просто
+    никто не нажал кнопку.
+    """
+    from agent.services import insight
+
+    async def scenario():
+        calls = []
+
+        async def fake(name, value):
+            calls.append(name)
+            return value
+
+        original = (insight._current, insight._history,
+                    insight._memory, insight._plans)
+        insight._current = lambda c: fake("current", "## Текущие метрики: X")
+        insight._history = lambda c, h: fake("history", "## История кластера X")
+        insight._memory = lambda c: fake("memory", "## Память, своп и OOM — X")
+        insight._plans = lambda c: fake("plans", "## План выполнения")
+        try:
+            # Пустая страница: добираем всё
+            extra, failed = await insight.gather_missing({"name": "k"}, "")
+            check("добрано всё четыре раздела", len(calls), 4)
+            check("ничего не потерялось", failed, [])
+            for mark in ("Текущие метрики", "История кластера",
+                         "Память, своп и OOM", "План выполнения"):
+                if mark not in extra:
+                    check("в разборе есть «%s»" % mark, False, True)
+            check("разделы склеены в один текст", True, True)
+
+            # Уже собранное второй раз не снимаем: это минуты работы сервера
+            calls.clear()
+            await insight.gather_missing(
+                {"name": "k"}, "## Память, своп и OOM — X\n## История кластера X")
+            check("повторно не собираем", sorted(calls), ["current", "plans"])
+        finally:
+            (insight._current, insight._history,
+             insight._memory, insight._plans) = original
+
+        # Недоступный сервер не роняет разбор целиком
+        async def dead(*a):
+            raise RuntimeError("сервер не отвечает")
+
+        insight._current = dead
+        insight._history = lambda c, h: dead()
+        insight._memory = dead
+        insight._plans = dead
+        try:
+            extra, failed = await insight.gather_missing({"name": "k"}, "")
+            check("разбор пережил недоступность", extra, "")
+            check("и назвал, чего не хватает", len(failed), 4)
+            check("с причиной", "не отвечает" in failed[0], True)
+        finally:
+            (insight._current, insight._history,
+             insight._memory, insight._plans) = original
+
+    asyncio.run(scenario())
+
+    check("модели сказано, что данные уже собраны",
+          "Не пиши, что этих" in insight.ALL_TASK, True)
+    check("названы кнопки, а не абстрактные «данные»",
+          "Снять профиль" in insight.ALL_TASK, True)
+
+
+def memory_route(client) -> None:
+    """Память доступна и отдельной кнопкой, а не только внутри разбора."""
+    r = client.get("/api/memory/kemerovo")
+    check("блок памяти отвечает", r.status_code, 200)
+    check("в ответе есть текст", "text" in r.json(), True)
+
+    app = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
+    check("кнопка есть на странице кластера",
+          "cluster-memory" in app and "loadMemory" in app, True)
+    check("разбор получает период с экрана",
+          "hours: state.range" in app, True)
 
 
 def websocket(client) -> None:

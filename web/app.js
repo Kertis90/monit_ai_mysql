@@ -1901,6 +1901,13 @@ const App = (() => {
         about: 'Тяжёлые запросы, полные сканирования, ожидания блокировок и ' +
                'планы выполнения — по каждому серверу кластера отдельно.',
         actions: [{ label: 'Выполнить', fn: 'loadDiag' }] },
+      { id: 'memory', out: 'cluster-memory', name: 'Память, своп и OOM',
+        short: 'не убивало ли ядро процессы',
+        about: 'Занятая память и своп по каждому серверу, активность подкачки ' +
+               'и следы OOM в журнале ядра. Самая неприятная авария базы — та, ' +
+               'где база ни при чём: ядру не хватило памяти, и оно убило ' +
+               'mysqld как самый жирный процесс.',
+        actions: [{ label: 'Проверить', fn: 'loadMemory' }] },
       { id: 'anomaly', out: 'cluster-anomaly', name: 'Аномалии',
         short: 'отклонения от обычного состояния',
         about: 'Половина поломок не пересекает ни одного порога: запросов ' +
@@ -2224,9 +2231,12 @@ const App = (() => {
               '<button class="accent-btn" onclick="App.explainAll(this)">' +
               'Разобрать всё собранное</button></div>' +
               '<div id="cluster-insight" class="muted small">' +
-              'Модель посмотрит разом на всё, что собрано на этой странице: ' +
-              'самое важное обычно видно не внутри одного блока, а на их ' +
-              'пересечении. Чем больше блоков раскрыто, тем полнее разбор.' +
+              'Модель посмотрит разом на всё, что собрано на этой странице, ' +
+              'и сама доберёт то, чего здесь нет: текущие метрики всех ' +
+              'серверов, историю за выбранный период со сравнением с прошлой ' +
+              'неделей, память со свопом и следами OOM, планы выполнения ' +
+              'тяжёлых запросов. Самое важное обычно видно не внутри одного ' +
+              'блока, а на их пересечении.' +
               '</div></section>';
 
       // ── Графики
@@ -2292,7 +2302,12 @@ const App = (() => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ cluster: state.clusterName, scope: scope,
-                             question: question || '', blocks: blocks }),
+                             question: question || '', blocks: blocks,
+                             // Историю агент добирает сам — пусть про то же
+                             // окно, которое человек видит на экране
+                             hours: state.range
+                               ? (state.range.until - state.range.since) / 3600
+                               : clusterHours() }),
     });
   }
 
@@ -2477,6 +2492,10 @@ const App = (() => {
   const loadGrowth = (btn) => lazyBlock('cluster-growth',
     'api/growth/' + encodeURIComponent(state.clusterName) + '?days=30',
     'Сравниваю снимки…', btn);
+
+  const loadMemory = (btn) => lazyBlock('cluster-memory',
+    'api/memory/' + encodeURIComponent(state.clusterName),
+    'Смотрю память и журнал ядра…', btn);
 
   const loadAnomalies = (btn) => lazyBlock('cluster-anomaly',
     'api/anomalies/' + encodeURIComponent(state.clusterName),
@@ -2841,7 +2860,7 @@ const App = (() => {
            similarIncidents, loadLogs, runSql, useTemplate, runSearch,
            loadForecast, loadConfigAudit, loadGrowth, loadAnomalies,
            loadReadiness, loadHealth, loadIndexes, loadConfigChanges,
-           loadBackups, addNote, toggleNote, deleteNote,
+           loadBackups, loadMemory, addNote, toggleNote, deleteNote,
            grantManual, revokeAccess, deleteAlert, deleteAlertsByName,
            resolveAlert,
            stopGeneration };
