@@ -215,12 +215,24 @@
           <select id="sql-template" onchange="App.useTemplate(this.value)">
             <option value="">готовые запросы…</option>
           </select>
+          <button class="ghost-btn" onclick="App.explainSql(this)"
+                  title="Показать план выполнения и разобрать его">План</button>
           <button class="ghost-btn" onclick="App.runSql(this)">Выполнить</button>
         </div>
       </div>
       <p class="muted small">Только чтение: SELECT, SHOW, EXPLAIN, DESCRIBE.
-         Запрет проверяется до отправки, каждый запрос попадает в журнал действий.</p>
+         Запрет проверяется до отправки, каждый запрос попадает в журнал действий.
+         «План» показывает, как MySQL собирается выполнять запрос, и разбирает
+         план словами — сам запрос при этом не выполняется.</p>
       <textarea id="sql-text" rows="5" placeholder="SELECT ..."></textarea>
+      <div class="sql-live">
+        <label for="sql-conn">или объяснить запрос, который идёт прямо сейчас:</label>
+        <input id="sql-conn" type="number" min="1" inputmode="numeric"
+               placeholder="id соединения">
+        <button class="ghost-btn" onclick="App.explainLive(this)">План соединения</button>
+        <span class="muted small">id берётся из «Что нагружает базу» на
+          странице кластера — там он стоит перед адресом.</span>
+      </div>
       <div id="sql-history" class="sql-history"></div>
       <div id="sql-out"></div>
     </section>

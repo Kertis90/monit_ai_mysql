@@ -117,6 +117,22 @@ def tool_specs() -> list:
                                  "description": "шаг разбивки, по умолчанию 300"}},
                 "required": ["cluster", "hours"]}}},
         {"type": "function", "function": {
+            "name": "explain_query",
+            "description": "План выполнения запроса (EXPLAIN) с разбором: "
+                           "полные сканирования, сортировки без индекса, "
+                           "соединения без индекса, зависимые подзапросы. "
+                           "Вместо sql можно указать connection_id — тогда "
+                           "объясняется запрос, идущий в этом соединении "
+                           "прямо сейчас.",
+            "parameters": {"type": "object", "properties": {
+                "cluster": cl,
+                "sql": {"type": "string",
+                        "description": "читающий запрос целиком"},
+                "connection_id": {"type": "integer",
+                                  "description": "id соединения из "
+                                                 "SHOW PROCESSLIST"}},
+                "required": ["cluster"]}}},
+        {"type": "function", "function": {
             "name": "run_diagnostics",
             "description": "Диагностика Performance Schema: тяжёлые запросы, "
                            "полные сканирования, блокировки, ожидания, "
@@ -176,12 +192,19 @@ async def run_tool(name: str, args: dict) -> str:
     hours   = min(float(args.get("hours") or 6), MAX_METRICS_HOURS)
 
     if name in ("get_current_metrics", "get_history", "get_breakdown",
-                "run_diagnostics", "run_sql", "read_logs",
+                "run_diagnostics", "run_sql", "read_logs", "explain_query",
                 "get_workload", "get_replication") and not cluster:
         return f"Кластер «{cname}» не найден. Доступные: " + \
                ", ".join(c["name"] for c in enabled_clusters())
 
     try:
+        if name == "explain_query":
+            from agent.services import explain as explain_service
+            data = await explain_service.explain(
+                cluster, str(args.get("sql") or ""),
+                int(args.get("connection_id") or 0))
+            return explain_service.fmt_explain(data)
+
         if name == "get_current_metrics":
             return fmt_current(await collect_current(cluster))
 

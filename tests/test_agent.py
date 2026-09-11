@@ -284,6 +284,10 @@ def application() -> None:
         memory_report()
         insight_reaches()
         memory_route(c)
+        explain_findings()
+        explain_text()
+        explain_rights()
+        explain_endpoint(c)
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -1730,6 +1734,154 @@ def memory_route(client) -> None:
           "cluster-memory" in app and "loadMemory" in app, True)
     check("разбор получает период с экрана",
           "hours: state.range" in app, True)
+
+
+# План выполнения в том виде, в каком его отдаёт MySQL: те же столбцы,
+# те же сокращения. По ним и разбираем.
+PLAN_COLUMNS = ["id", "select_type", "table", "type", "possible_keys",
+                "key", "key_len", "ref", "rows", "filtered", "Extra"]
+
+
+def explain_findings() -> None:
+    """План разбирается словами, а не показывается как есть.
+
+    `type=ALL` и `Using filesort` не говорят ничего тому, кто пришёл
+    разбираться в аварии, а не изучать оптимизатор.
+    """
+    from agent.services.explain import estimated_rows, findings, plan_tables
+
+    # Полное чтение при существующем индексе — самый ценный случай:
+    # чинится ANALYZE TABLE, а не выдумыванием нового индекса
+    plan = {"columns": PLAN_COLUMNS, "rows": [
+        [1, "SIMPLE", "agreements", "ALL", "idx_archive", None, None, None,
+         420000, 10.0, "Using where; Using filesort"]]}
+    found = findings(plan)
+    kinds = [f["what"] for f in found]
+    check("полное чтение замечено",
+          any("целиком" in k for k in kinds), True)
+    check("сказано, что индекс есть, но не взят",
+          any("хотя подходящий индекс есть" in k for k in kinds), True)
+    check("предложен ANALYZE TABLE",
+          any("ANALYZE TABLE" in f["do"] for f in found), True)
+    check("сортировка без индекса замечена",
+          any("сортировка идёт без индекса" in k for k in kinds), True)
+
+    # Соединение без индекса — стоимость растёт произведением
+    join = {"columns": PLAN_COLUMNS, "rows": [
+        [1, "SIMPLE", "a", "ALL", None, None, None, None, 1000, 100.0, ""],
+        [1, "SIMPLE", "b", "ALL", None, None, None, None, 5000, 100.0,
+         "Using join buffer (hash join)"]]}
+    found = findings(join)
+    check("соединение без индекса названо",
+          any("join buffer" in f["what"] for f in found), True)
+    check("оценки строк перемножаются", estimated_rows(join), 5000000)
+
+    # Зависимый подзапрос выполняется для каждой строки
+    dep = {"columns": PLAN_COLUMNS, "rows": [
+        [2, "DEPENDENT SUBQUERY", "payments", "ref", "idx_uid", "idx_uid",
+         "4", "func", 3, 100.0, ""]]}
+    check("зависимый подзапрос замечен",
+          any("для каждой строки" in f["what"] for f in findings(dep)), True)
+
+    # Хороший план не должен обрастать выдуманными замечаниями
+    good = {"columns": PLAN_COLUMNS, "rows": [
+        [1, "SIMPLE", "agreements", "ref", "idx_uid", "idx_uid", "4",
+         "const", 2, 100.0, "Using index"]]}
+    check("на хорошем плане замечаний нет", findings(good), [])
+
+    check("производные таблицы в схему не просятся",
+          plan_tables({"columns": PLAN_COLUMNS, "rows": [
+              [1, "PRIMARY", "<derived2>", "ALL", None, None, None, None,
+               10, 100.0, ""]]}), [])
+
+
+def explain_text() -> None:
+    """Отчёт начинается с выводов, а не с таблицы."""
+    from agent.services.explain import fmt_explain
+
+    text = fmt_explain({
+        "host": "10.1.0.1", "statement": "EXPLAIN SELECT 1",
+        "rows_estimate": 420000,
+        "plan": {"host": "10.1.0.1", "query": "EXPLAIN SELECT 1",
+                 "columns": ["table", "type"], "rows": [["agreements", "ALL"]]},
+        "findings": [{"level": "critical", "table": "agreements",
+                      "what": "таблица читается целиком",
+                      "why": "индекса нет", "do": "добавить индекс"}],
+        "schemas": [{"table": "agreements",
+                     "ddl": "CREATE TABLE `agreements` (\n  `uid` int\n)"}],
+    })
+    check("выводы идут раньше плана",
+          text.index("Что не так") < text.index("Сам план"), True)
+    check("объяснено, почему строки перемножаются",
+          "перемножаются" in text, True)
+    check("схема таблицы приложена", "CREATE TABLE" in text, True)
+
+    clean = fmt_explain({"host": "x", "statement": "EXPLAIN SELECT 1",
+                         "rows_estimate": 2, "findings": [], "schemas": [],
+                         "plan": {"host": "x", "query": "q",
+                                  "columns": ["type"], "rows": [["ref"]]}})
+    check("хороший план так и назван",
+          "Ничего тревожного" in clean, True)
+
+
+def explain_rights() -> None:
+    """Отказ по правам объясняется тем правом, которого не хватает.
+
+    Сообщение сервера про «lacking privileges for underlying table» звучит
+    как нехватка SELECT, хотя не хватает SHOW VIEW.
+    """
+    from agent.services.explain import _explain_hint
+
+    view = _explain_hint(
+        "EXPLAIN/SHOW can not be issued; lacking privileges for underlying table",
+        False)
+    check("про представление сказано про SHOW VIEW", "SHOW VIEW" in view, True)
+    check("и дана готовая команда", "GRANT SHOW VIEW" in view, True)
+
+    conn = _explain_hint("Access denied; you need the PROCESS privilege", True)
+    check("про чужое соединение сказано про PROCESS",
+          "GRANT PROCESS" in conn, True)
+
+    gone = _explain_hint("Unknown thread id: 4211", True)
+    check("исчезнувшее соединение объяснено",
+          "уже завершилось" in gone, True)
+
+    check("обычная ошибка не обрастает советами",
+          _explain_hint("Table 'x' doesn't exist", False),
+          "Table 'x' doesn't exist")
+
+
+def explain_endpoint(client) -> None:
+    """План доступен и человеку кнопкой, и модели инструментом."""
+    r = client.post("/api/explain", json={"cluster": "kemerovo",
+                                          "sql": "SELECT 1"})
+    check("эндпоинт отвечает", r.status_code, 200)
+    check("без учётки сказано, чего не хватает",
+          "db_user" in (r.json().get("error") or ""), True)
+
+    r = client.post("/api/explain", json={"cluster": "kemerovo", "sql": ""})
+    check("пустой запрос отклонён",
+          "db_user" in r.json()["error"] or "пуст" in r.json()["error"], True)
+
+    r = client.post("/api/explain", json={"cluster": "нет-такого",
+                                          "sql": "SELECT 1"})
+    check("несуществующий кластер отвергнут", r.status_code, 404)
+
+    journal = client.get("/api/audit?days=1&limit=50&action=EXPLAIN").json()
+    check("обращения попадают в журнал", journal["total"] >= 1, True)
+
+    from agent.services.assistant import tool_specs
+    names = [t["function"]["name"] for t in tool_specs()]
+    check("модель тоже умеет строить план", "explain_query" in names, True)
+
+    spec = next(t["function"] for t in tool_specs()
+                if t["function"]["name"] == "explain_query")
+    check("и объяснять идущее соединение",
+          "connection_id" in spec["parameters"]["properties"], True)
+
+    app = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
+    check("кнопки есть в интерфейсе",
+          "explainSql" in app and "explainLive" in app, True)
 
 
 def websocket(client) -> None:

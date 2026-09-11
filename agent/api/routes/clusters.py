@@ -14,9 +14,10 @@ from agent.api.deps import (AdminUser, Audit, CurrentUser, DbSession,
 from agent.db.repositories.notes import NoteRepository
 from agent.services import (anomaly, audit, backups, config_audit,
                             config_history, forecast, growth, indexes,
-                            insight, memory, readiness, tasks)
-from agent.schemas.api import (InsightOut, InsightRequest, SqlRequest,
-                               SqlResult)
+                            explain, insight, memory, readiness,
+                            tasks)
+from agent.schemas.api import (ExplainRequest, InsightOut,
+                               InsightRequest, SqlRequest, SqlResult)
 from agent.services.analysis import (DIAG_QUERIES, collect_series_table,
                                      explain_top_queries, fmt_diagnostics,
                                      run_diagnostics)
@@ -432,6 +433,29 @@ async def analyze_blocks(req: InsightRequest, user: CurrentUser,
                                 else "один блок", len(blocks)),
                       ip=audit.client_ip(request), ok=ok)
     return {"cluster": req.cluster, "text": text}
+
+
+@router.post("/api/explain", tags=["Диагностика"],
+             summary="План выполнения запроса")
+async def explain_query(req: ExplainRequest, user: CurrentUser,
+                        journal: Audit, request: Request):
+    """EXPLAIN для написанного запроса или для идущего соединения.
+
+    Прав сверх SELECT не требует: EXPLAIN проверяет те же права, что и сам
+    запрос. Исключения два — представления (нужен SHOW VIEW) и чужое
+    соединение (нужен PROCESS); о них агент скажет отдельно, если упрётся.
+    """
+    cluster = _need(req.cluster)
+    data = await explain.explain(cluster, req.sql, req.connection_id,
+                                 req.host or None)
+    data["text"] = explain.fmt_explain(data)
+    await journal.add(action="EXPLAIN", username=user.get("username", ""),
+                      target=req.cluster,
+                      detail=(("соединение %d" % req.connection_id)
+                              if req.connection_id else req.sql[:1000]),
+                      ip=audit.client_ip(request),
+                      ok=not data.get("error"))
+    return data
 
 
 @router.get("/api/memory/{name}", tags=["Диагностика"],

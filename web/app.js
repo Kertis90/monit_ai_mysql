@@ -2657,6 +2657,42 @@ const App = (() => {
     if (t) { $('sql-text').value = t.sql; $('sql-template').value = ''; }
   }
 
+  // ── План выполнения ─────────────────────────────────────────────
+  // Отвечает на вопрос, на который метрики не отвечают: почему этот
+  // запрос медленный. Сам запрос при этом не выполняется — EXPLAIN только
+  // спрашивает оптимизатор, как он собирается его выполнять.
+
+  async function askExplain(body, btn) {
+    const out = $('sql-out');
+    setBusy(out, 'Спрашиваю план выполнения…');
+    await withBusy(btn, async () => {
+      try {
+        const d = await getJson('api/explain', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        out.innerHTML = '<pre class="output">' +
+                        esc(d.text || d.error || 'Плана нет.') + '</pre>';
+      } catch (e) {
+        out.innerHTML = '<div class="muted">Не удалось получить план: ' +
+                        esc(e.message || e) + '</div>';
+      }
+    });
+  }
+
+  async function explainSql(btn) {
+    const sql = $('sql-text').value.trim();
+    if (!sql) { $('sql-text').focus(); return; }
+    await askExplain({ cluster: $('sql-cluster').value, sql: sql }, btn);
+  }
+
+  async function explainLive(btn) {
+    const id = parseInt($('sql-conn').value, 10);
+    if (!id) { $('sql-conn').focus(); return; }
+    await askExplain({ cluster: $('sql-cluster').value, connection_id: id }, btn);
+  }
+
   async function runSql(btn) {
     if (btn) return withBusy(btn, () => runSql());
     const out  = $('sql-out');
@@ -2857,7 +2893,8 @@ const App = (() => {
            newThread, deleteThread, switchThread, toggleSidebar,
            toggleClusters, openCluster, loadClusterPage, loadWorkload,
            loadReplication, loadDiag, askAboutCluster, analyzeAlert,
-           similarIncidents, loadLogs, runSql, useTemplate, runSearch,
+           similarIncidents, loadLogs, runSql, explainSql, explainLive,
+           useTemplate, runSearch,
            loadForecast, loadConfigAudit, loadGrowth, loadAnomalies,
            loadReadiness, loadHealth, loadIndexes, loadConfigChanges,
            loadBackups, loadMemory, addNote, toggleNote, deleteNote,

@@ -114,6 +114,18 @@ class SqlRequest(BaseModel):
     host:    str = Field("", description="Пусто — primary кластера")
 
 
+class ExplainRequest(BaseModel):
+    """Что объяснять: написанный запрос или идущее соединение.
+
+    Второе ценнее в аварии: запрос виден в списке процессов, но
+    воспроизвести его негде — а план получить можно.
+    """
+    cluster: str
+    sql:     str = Field("", max_length=20000)
+    connection_id: int = Field(0, ge=0)
+    host:    str = ""
+
+
 class SqlResult(BaseModel):
     host:      str = ""
     query:     str = ""

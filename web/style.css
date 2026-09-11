@@ -1766,3 +1766,25 @@ header h1 { font-size: var(--fs-lg); }
   }
   .conn-dot.connecting { opacity: .7; }
 }
+
+/* Строка «объяснить идущий запрос»: id соединения берут из списка
+   процессов, поэтому подсказка стоит рядом, а не в документации */
+.sql-live {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+  margin-top: var(--sp-2);
+}
+.sql-live label { font-size: var(--fs-sm); color: var(--muted); }
+.sql-live input {
+  width: 130px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  color: var(--text);
+  padding: 5px 8px;
+  font: inherit;
+  font-size: var(--fs-sm);
+}
+.sql-live input:focus { border-color: var(--border-hl); outline: none; }
