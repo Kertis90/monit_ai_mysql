@@ -1385,3 +1385,205 @@ button[disabled] { opacity: .65; cursor: progress; }
   font-size: 12px;
   margin-left: 4px;
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+   ЕДИНАЯ СИСТЕМА
+
+   Интерфейс рос по частям, и это было видно: одни и те же по смыслу
+   вещи — отступы, скругления, размеры подписей — в каждом разделе
+   оказывались чуть разными. Здесь они сведены в один набор величин, и
+   дальше разделы берут их отсюда, а не подбирают на глаз.
+
+   Отдельно про шрифты: агент живёт в закрытом контуре, внешние
+   шрифтовые сервисы там недоступны. Поэтому характер набора задаётся
+   не гарнитурой, а работой с ней — шкалой размеров, весом и разрядкой
+   подписей, и вторым, моноширинным семейством для данных: числа и
+   вывод команд должны стоять в колонку.
+   ═══════════════════════════════════════════════════════════════════ */
+
+:root {
+  /* Отступы: шаг в 4 пиксела, как и вся сетка */
+  --sp-1: 4px;
+  --sp-2: 6px;
+  --sp-3: 10px;
+  --sp-4: 14px;
+  --sp-5: 18px;
+  --sp-6: 24px;
+
+  /* Скругления по роли, а не по вкусу: чем крупнее объект, тем мягче */
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-pill: 999px;
+
+  /* Шкала размеров. Между соседними ступенями заметная разница —
+     иначе иерархия не читается, а «почти одинаковое» выглядит ошибкой */
+  --fs-micro: 10px;   /* плашки состояния */
+  --fs-xs:    11px;   /* подписи, метаданные */
+  --fs-sm:    12px;   /* второстепенный текст, таблицы */
+  --fs-md:    13px;   /* основной размер интерфейса */
+  --fs-lg:    14px;   /* заголовки карточек, текст ответа */
+  --fs-xl:    16px;   /* заголовок раздела */
+  --fs-2xl:   22px;   /* значения на плитках */
+
+  --ui: 'Segoe UI', system-ui, -apple-system, 'Helvetica Neue', sans-serif;
+}
+
+/* Подпись-рубрика: прописные с разрядкой. Один класс на весь интерфейс,
+   чтобы «КЛАСТЕРЫ» в боковой панели и «ЧТО ПРОИСХОДИТ СЕЙЧАС» на
+   странице кластера выглядели одинаково выбранными, а не похожими */
+.eyebrow,
+.side-title-text,
+.group-title,
+.stat-label {
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: .07em;
+  color: var(--muted);
+}
+
+/* ── Фокус с клавиатуры ─────────────────────────────────────────────
+   Видимый фокус — не украшение: без него интерфейсом нельзя
+   пользоваться без мыши. Обводка одна на все элементы управления. */
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--r-sm);
+}
+.tab:focus-visible { outline-offset: -2px; }
+
+/* ── Плашки ─────────────────────────────────────────────────────────
+   Были четыре почти одинаковых вида: в шапке, на карточке кластера, в
+   метаданных ответа и на плитке. Теперь общая форма, а различаются они
+   только смыслом. */
+
+.hbadge, .mini-badge, .ctx-chip, .pill {
+  font-size: var(--fs-micro);
+  line-height: 1.6;
+  padding: 1px var(--sp-2);
+  border-radius: var(--r-pill);
+  border: 1px solid transparent;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.hbadge, .ctx-chip {
+  background: var(--surface2);
+  border-color: var(--border);
+  color: var(--muted);
+}
+.ctx-chip { font-size: var(--fs-xs); }
+
+/* ── Вкладки ────────────────────────────────────────────────────────
+   Значки нарисованы, а не набраны эмодзи: шрифт на рабочей машине может
+   не знать нужного символа, и вкладка остаётся без значка. Свои —
+   одной толщины линии и в цвете текста, поэтому подсвечиваются вместе
+   с активной вкладкой. */
+
+.sprite {
+  position: absolute;
+  width: 0; height: 0;
+  overflow: hidden;
+}
+
+.ico {
+  width: 15px;
+  height: 15px;
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.tabs {
+  gap: 2px;
+  padding: 0 var(--sp-3);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.tabs::-webkit-scrollbar { display: none; }
+
+.tab {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  font: inherit;
+  font-size: var(--fs-md);
+  padding: var(--sp-3) var(--sp-4);
+  gap: var(--sp-2);
+  white-space: nowrap;
+}
+.tab:hover { color: var(--text); }
+.tab.active .ico { stroke-width: 1.7; }
+
+/* ── Шапка ──────────────────────────────────────────────────────────
+   Слева — кто мы и живо ли соединение, справа — кто вошёл. Между ними
+   пусто: это не место для подсказок, они уместнее там, где нужны. */
+
+header { padding: var(--sp-3) var(--sp-5); gap: var(--sp-3); }
+header h1 { font-size: var(--fs-lg); }
+
+/* ── Заголовок раздела ──────────────────────────────────────────────
+   Один ритм на все вкладки: название слева, действия справа, тонкая
+   черта снизу. Раньше каждый раздел отбивал его по-своему. */
+
+.pane-head {
+  gap: var(--sp-3);
+  padding-bottom: var(--sp-3);
+  margin-bottom: var(--sp-4);
+  border-bottom: 1px solid var(--border);
+}
+.pane-head h3 { font-size: var(--fs-xl); letter-spacing: -.01em; }
+.pane-actions { gap: var(--sp-2); }
+
+/* ── Кнопки ─────────────────────────────────────────────────────────
+   То, что можно нажать, должно выглядеть нажимаемым, и одинаково во
+   всех разделах. */
+
+.ghost-btn {
+  font-size: var(--fs-sm);
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--r-sm);
+  transition: border-color .12s, color .12s, background .12s;
+}
+.ghost-btn:hover { color: var(--text-hl); background: var(--surface2); }
+.ghost-btn:active { transform: translateY(1px); }
+
+@media (prefers-reduced-motion: reduce) {
+  .ghost-btn, .ghost-btn:active { transition: none; transform: none; }
+}
+
+/* ── Пустое состояние ───────────────────────────────────────────────
+   «Нажмите кнопку» не объясняет ничего. Человек, открывший раздел
+   впервые, должен узнать, что здесь бывает и почему оно не появилось
+   само. */
+
+.empty {
+  max-width: 62ch;
+  padding: var(--sp-4) 0 var(--sp-5);
+  font-family: var(--ui);
+  white-space: normal;
+}
+.empty-title {
+  font-size: var(--fs-lg);
+  color: var(--text-hl);
+  margin-bottom: var(--sp-2);
+}
+.empty p {
+  margin: 0;
+  font-size: var(--fs-sm);
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+/* ── Подсказка у поля ввода ─────────────────────────────────────────
+   Переехала из шапки: там она висела на всех вкладках, включая те, где
+   ничего не вводят. */
+
+.input-hint {
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  margin-top: var(--sp-1);
+}

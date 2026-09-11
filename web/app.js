@@ -31,6 +31,7 @@ const App = (() => {
     pendingCharts: null,   // графики, ждущие конца ответа
     awaitingReply: false,
     replyTimer:    null,
+    attachedTo:    null,   // к какому разговору уже просились подключиться
     pingTimer:     null,
   };
 
@@ -371,14 +372,12 @@ const App = (() => {
   async function switchThread(id) {
     if (!id || id === state.threadId) return;
     state.threadId = id;
+    state.attachedTo = null;
     $('messages').innerHTML = '';
     await restoreHistory();
     renderThreads();
     // В этом разговоре ответ может считаться прямо сейчас
-    if (state.wsReady) {
-      state.ws.send(JSON.stringify({ type: 'attach', thread_id: id,
-                                     client_id: state.clientId }));
-    }
+    attachToThread();
   }
 
   async function newThread() {
@@ -495,12 +494,8 @@ const App = (() => {
       state.wsReady     = true;
       state.reconnectMs = 1000;
       setConnState('online');
-      // Ответ мог считаться, пока страница перезагружалась: просим сервер
-      // подключить нас обратно к нему
-      if (state.threadId) {
-        ws.send(JSON.stringify({ type: 'attach', thread_id: state.threadId,
-                                 client_id: state.clientId }));
-      }
+      // Ответ мог считаться, пока страница перезагружалась
+      attachToThread();
       // keepalive ping каждые 25с
       clearInterval(state.pingTimer);
       state.pingTimer = setInterval(() => {
@@ -518,6 +513,7 @@ const App = (() => {
 
     ws.onclose = (ev) => {
       state.wsReady = false;
+      state.attachedTo = null;      // переподключимся — попросим снова
       setConnState('offline');
       clearInterval(state.pingTimer);
       // Если ждали ответ — закрыть стриминг с ошибкой
@@ -547,6 +543,23 @@ const App = (() => {
                         'попробуйте ещё раз]');
       }
     }, REPLY_SILENCE_MS);
+  }
+
+  // Подключиться обратно к ответу, который считается прямо сейчас.
+  //
+  // Вызывается из трёх мест, и это не перестраховка: обе половины
+  // становятся известны в разное время. Сокет открывается за миллисекунды,
+  // а какой разговор текущий — только когда придёт ответ на запрос
+  // истории. Раньше подключение делалось в одном месте, при открытии
+  // сокета, и на быстрой сети оно почти всегда случалось раньше, чем
+  // становился известен разговор: после перезагрузки человек смотрел на
+  // пустой экран, хотя ответ в это время дописывался.
+  function attachToThread() {
+    if (!state.wsReady || !state.threadId) return;
+    if (state.attachedTo === state.threadId) return;
+    state.attachedTo = state.threadId;
+    state.ws.send(JSON.stringify({ type: 'attach', thread_id: state.threadId,
+                                   client_id: state.clientId }));
   }
 
   function handleWsMessage(msg) {
@@ -728,6 +741,7 @@ const App = (() => {
     // Заготовка под ответ со стримингом
     state.streamBuf = '';
     state.lastQuestion = text;
+    state.attachedTo = state.threadId;
     const el = addMsg('assistant', '', 'AI Agent');
     el.innerHTML = '<span class="thinking"><i></i><i></i><i></i></span>';
     state.streamingEl   = el;
@@ -1555,14 +1569,18 @@ const App = (() => {
   }
 
   // Для длинных периодов одного времени мало — нужна дата
-  function fmtTick(ts, spanSec) {
+  // Подпись отметки. Дату добавляем не по длине периода, а когда она
+  // меняется: за сутки отметки читались как «03:00, 09:00, 15:00, 21:00,
+  // 03:00» — и какое из двух трёх часов ночи какое, понять было нельзя.
+  // Дата ставится у первой отметки и у каждой, что начинает новый день:
+  // на всех подряд она бы только загромождала ось.
+  function fmtTick(ts, spanSec, withDate) {
     const d = new Date(ts * 1000);
     const hm = String(d.getHours()).padStart(2, '0') + ':' +
                String(d.getMinutes()).padStart(2, '0');
-    if (spanSec > 36 * 3600) {
-      return String(d.getDate()).padStart(2, '0') + '.' +
-             String(d.getMonth() + 1).padStart(2, '0') + ' ' + hm;
-    }
+    const date = String(d.getDate()).padStart(2, '0') + '.' +
+                 String(d.getMonth() + 1).padStart(2, '0');
+    if (withDate) return date + ' ' + hm;
     if (spanSec < 600) {   // меньше 10 минут — показываем секунды
       return hm + ':' + String(d.getSeconds()).padStart(2, '0');
     }
@@ -1602,13 +1620,19 @@ const App = (() => {
     // Четыре отметки вместо двух: по двум крайним нельзя понять масштаб,
     // а на коротком периоде они ещё и совпадали (обе показывали 7:41).
     const span = x1 - x0;
-    let tAxis = '';
+    const crosses = new Date(x0 * 1000).toDateString() !==
+                    new Date(x1 * 1000).toDateString();
+    let tAxis = '', lastDay = '';
     for (let k = 0; k <= 3; k++) {
       const ts = x0 + span * (k / 3);
       const x  = px(ts);
+      const day = new Date(ts * 1000).toDateString();
+      // Первая отметка и каждая, что начинает новый день — с датой
+      const withDate = crosses && (k === 0 || day !== lastDay);
+      lastDay = day;
       const anchor = k === 0 ? 'start' : k === 3 ? 'end' : 'middle';
       tAxis += `<text x="${x.toFixed(1)}" y="${h - 5}" class="cg-lbl"
-                      text-anchor="${anchor}">${esc(fmtTick(ts, span))}</text>`;
+                      text-anchor="${anchor}">${esc(fmtTick(ts, span, withDate))}</text>`;
     }
 
     // preserveAspectRatio="none" растягивал и текст подписей — убрано.
@@ -2445,9 +2469,19 @@ const App = (() => {
     '?action=' + encodeURIComponent(action || 'restart'),
     'Проверяю…', btn);
 
+  // Первый запуск убирает пояснение и открывает блок вывода: дальше в
+  // разделе живут результаты, а не рассказ о том, что здесь бывает
+  function openOutput(id) {
+    const box = $(id);
+    const hint = $(id.replace('-out', '-empty'));
+    if (hint) hint.remove();
+    if (box) box.hidden = false;
+    return box;
+  }
+
   async function loadHealth(btn) {
     if (btn) return withBusy(btn, () => loadHealth());
-    const out = $('health-out');
+    const out = openOutput('health-out');
     setBusy(out, 'Проверяю Prometheus, модель, SSH до серверов, учётки баз…',
             'обход всех серверов занимает до минуты');
     try {
@@ -2527,7 +2561,7 @@ const App = (() => {
 
   async function loadLogs(btn) {
     if (btn) return withBusy(btn, () => loadLogs());
-    const out = $('logs-out');
+    const out = openOutput('logs-out');
     const name = $('logs-cluster').value;
     if (!name) { out.textContent = 'Кластеры ещё не загружены.'; return; }
     setBusy(out, 'Читаю логи по SSH…',
@@ -2731,7 +2765,9 @@ const App = (() => {
     loadUser();
 
     // Сначала история (она же скажет, какой чат текущий), затем список
-    restoreHistory().then(loadThreads);
+    // История говорит, какой разговор текущий: только после неё можно
+    // проситься обратно к идущему в нём ответу
+    restoreHistory().then(() => { attachToThread(); return loadThreads(); });
     connect();
     refreshClusters();
     setInterval(refreshClusters, 60000);

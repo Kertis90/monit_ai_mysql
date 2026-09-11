@@ -277,6 +277,9 @@ def application() -> None:
         range_request()
         charts_range_route(c)
         range_ui()
+        attach_after_reload()
+        tick_dates()
+        design_system()
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -1481,6 +1484,75 @@ def range_ui() -> None:
     report = (ROOT / "web" / "report.html").read_text(encoding="utf-8")
     check("отчёт умеет подписать интервал",
           "since && until" in report, True)
+
+
+def attach_after_reload() -> None:
+    """Возврат к идущему ответу не зависит от того, что успело раньше.
+
+    Сокет открывается за миллисекунды, а какой разговор текущий — только
+    когда придёт ответ на запрос истории. Подключение делалось при
+    открытии сокета, то есть почти всегда раньше, чем разговор становился
+    известен: после перезагрузки человек смотрел на пустой экран, хотя
+    ответ в это время дописывался.
+    """
+    app = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
+
+    check("подключение вынесено в отдельное место",
+          "function attachToThread()" in app, True)
+    # Три источника события: сокет открылся, история пришла, сменили разговор
+    check("просимся при открытии сокета",
+          "// Ответ мог считаться, пока страница перезагружалась" in app and
+          app.count("attachToThread();") >= 3, True)
+    check("и после того, как узнали разговор",
+          "restoreHistory().then(() => { attachToThread(); return loadThreads(); });"
+          in app, True)
+    check("повторно не просимся",
+          "if (state.attachedTo === state.threadId) return;" in app, True)
+    check("после обрыва просимся заново",
+          "state.attachedTo = null;      // переподключимся" in app, True)
+
+
+def tick_dates() -> None:
+    """На сутках подписи оси обязаны различать дни."""
+    for name in ("app.js", "report.html"):
+        src = (ROOT / "web" / name).read_text(encoding="utf-8")
+        ok = ("const crosses = new Date(x0 * 1000).toDateString() !==" in src
+              and "const withDate = crosses && (k === 0 || day !== lastDay);" in src)
+        if not ok:
+            check("даты на оси в %s" % name, False, True)
+    check("дата ставится там, где меняется день", True, True)
+
+    app = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
+    check("порог «36 часов» убран — он и прятал даты за сутки",
+          "36 * 3600" in app, False)
+
+
+def design_system() -> None:
+    """Интерфейс собран из одного набора величин, а не подобран на глаз."""
+    css = (ROOT / "web" / "style.css").read_text(encoding="utf-8")
+    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+
+    for token in ("--sp-3:", "--r-md:", "--fs-md:", "--ui:"):
+        if token not in css:
+            check("есть величина %s" % token, False, True)
+    check("шкалы отступов, скруглений и размеров заданы", True, True)
+
+    check("фокус с клавиатуры виден", ":focus-visible {" in css, True)
+    check("движение можно отключить",
+          css.count("prefers-reduced-motion") >= 2, True)
+
+    # Значки вкладок рисованные: эмодзи берутся из шрифта системы, и
+    # одного из них на рабочих машинах не оказалось вовсе
+    check("значки вкладок нарисованы", html.count('<use href="#i-') , 10)
+    check("эмодзи из вкладок убраны",
+          any(ch in html for ch in "💬📊🔔🖥📄🗄🔍🔧🔑📋"), False)
+    check("вкладки — кнопки, а не div",
+          '<button class="tab' in html, True)
+
+    check("подсказка про Enter переехала к полю ввода",
+          'class="input-hint"' in html, True)
+    check("пустые состояния объясняют, а не командуют",
+          html.count('class="empty"') >= 2 and "empty-title" in html, True)
 
 
 def websocket(client) -> None:

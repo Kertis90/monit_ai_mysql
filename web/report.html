@@ -99,14 +99,15 @@
            String(d.getMinutes()).padStart(2, '0');
   }
 
-  function fmtTick(ts, spanSec) {
+  function fmtTick(ts, spanSec, withDate) {
+    // Дату ставим там, где она меняется: на печати особенно, потому что
+    // спросить «а это какой день» у листа бумаги не получится
     const d = new Date(ts * 1000);
     const hm = String(d.getHours()).padStart(2, '0') + ':' +
                String(d.getMinutes()).padStart(2, '0');
-    if (spanSec > 36 * 3600) {
-      return String(d.getDate()).padStart(2, '0') + '.' +
-             String(d.getMonth() + 1).padStart(2, '0') + ' ' + hm;
-    }
+    const date = String(d.getDate()).padStart(2, '0') + '.' +
+                 String(d.getMonth() + 1).padStart(2, '0');
+    if (withDate) return date + ' ' + hm;
     if (spanSec < 600) return hm + ':' + String(d.getSeconds()).padStart(2, '0');
     return hm;
   }
@@ -145,13 +146,18 @@
 
     // preserveAspectRatio="none" растягивал подписи — убрано
     const span = x1 - x0;
-    let ticks = '';
+    const crosses = new Date(x0 * 1000).toDateString() !==
+                    new Date(x1 * 1000).toDateString();
+    let ticks = '', lastDay = '';
     for (let k = 0; k <= 3; k++) {
       const ts = x0 + span * (k / 3), tx = px(ts);
+      const day = new Date(ts * 1000).toDateString();
+      const withDate = crosses && (k === 0 || day !== lastDay);
+      lastDay = day;
       const anchor = k === 0 ? 'start' : k === 3 ? 'end' : 'middle';
       ticks += '<text x="' + tx.toFixed(1) + '" y="' + (h - 5) +
                '" class="lbl" text-anchor="' + anchor + '">' +
-               esc(fmtTick(ts, span)) + '</text>';
+               esc(fmtTick(ts, span, withDate)) + '</text>';
     }
 
     return '<svg viewBox="0 0 ' + w + ' ' + h + '" ' +

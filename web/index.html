@@ -11,13 +11,27 @@
 </head>
 <body>
 
+<svg class="sprite" aria-hidden="true" focusable="false">
+  <defs>
+    <g id="i-chat"><path d="M14 9a2 2 0 0 1-2 2H6l-3 2.5V11H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2z"/></g>
+    <g id="i-status"><path d="M2 14h12"/><path d="M4.5 14V8.5M8 14V3M11.5 14V6.5"/></g>
+    <g id="i-alerts"><path d="M12 6.5a4 4 0 1 0-8 0c0 3-1.5 4.5-1.5 4.5h11S12 9.5 12 6.5z"/><path d="M6.6 13a1.6 1.6 0 0 0 2.8 0"/></g>
+    <g id="i-cluster"><rect x="2" y="2.5" width="12" height="4.5" rx="1.2"/><rect x="2" y="9" width="12" height="4.5" rx="1.2"/><path d="M4.6 4.75h.01M4.6 11.25h.01"/></g>
+    <g id="i-logs"><path d="M4 1.8h5l3.2 3.2V14.2H4z"/><path d="M9 1.8V5h3.2M6.2 8.4h4M6.2 11h3"/></g>
+    <g id="i-sql"><ellipse cx="8" cy="3.8" rx="5.3" ry="2"/><path d="M2.7 3.8v8.4c0 1.1 2.4 2 5.3 2s5.3-.9 5.3-2V3.8"/><path d="M2.7 8c0 1.1 2.4 2 5.3 2s5.3-.9 5.3-2"/></g>
+    <g id="i-search"><circle cx="7" cy="7" r="4.4"/><path d="M10.4 10.4 14 14"/></g>
+    <g id="i-health"><path d="M1.6 8h3l2-4.2L9.7 12l2-4h2.7"/></g>
+    <g id="i-access"><circle cx="5" cy="8" r="3"/><path d="M8 8h6M12 8v2.6M14.2 8v2"/></g>
+    <g id="i-audit"><rect x="3.2" y="2.8" width="9.6" height="11" rx="1.4"/><path d="M6.2 2.8V1.8h3.6v1M6.2 7h3.6M6.2 10h2.6"/></g>
+  </defs>
+</svg>
+
 <header>
   <div class="conn-dot" id="conn-dot" title="Состояние WebSocket"></div>
   <h1>MySQL AI Agent</h1>
   <span class="hbadge" id="clusters-badge">…</span>
   <span class="hbadge" id="ws-badge">подключение…</span>
   <div class="spacer"></div>
-  <span class="hint">Enter — отправить · Shift+Enter — новая строка</span>
   <span class="hbadge" id="user-badge" style="display:none"></span>
   <span class="hbadge" id="logout-btn" title="Выйти"
         style="cursor:pointer;display:none" onclick="App.logout()">Выйти</span>
@@ -43,19 +57,28 @@
   <!-- ═══ Основная область ═══ -->
   <main class="main">
     <nav class="tabs">
-      <div class="tab active" data-tab="chat"   onclick="App.showTab('chat')">💬 Чат</div>
-      <div class="tab"        data-tab="status" onclick="App.showTab('status')">📊 Статус</div>
-      <div class="tab"        data-tab="alerts" onclick="App.showTab('alerts')">🔔 Алерты <span class="alert-count" id="alert-count"></span></div>
-      <div class="tab"        data-tab="cluster" id="tab-btn-cluster"
-           onclick="App.showTab('cluster')">🖥 Кластер</div>
-      <div class="tab"        data-tab="logs"   onclick="App.showTab('logs')">📄 Логи</div>
-      <div class="tab"        data-tab="sql"    onclick="App.showTab('sql')">🗄 SQL</div>
-      <div class="tab"        data-tab="search" onclick="App.showTab('search')">🔍 Поиск</div>
-      <div class="tab"        data-tab="health" onclick="App.showTab('health')">🔧 Здоровье</div>
-      <div class="tab" data-tab="access" id="tab-btn-access" style="display:none"
-           onclick="App.showTab('access')">🔑 Доступы</div>
-      <div class="tab" data-tab="audit" id="tab-btn-audit" style="display:none"
-           onclick="App.showTab('audit')">📋 Журнал</div>
+      <button class="tab active" type="button" data-tab="chat"
+              onclick="App.showTab('chat')"><svg class="ico" aria-hidden="true"><use href="#i-chat"/></svg><span>Чат</span></button>
+      <button class="tab" type="button" data-tab="status"
+              onclick="App.showTab('status')"><svg class="ico" aria-hidden="true"><use href="#i-status"/></svg><span>Статус</span></button>
+      <button class="tab" type="button" data-tab="alerts"
+              onclick="App.showTab('alerts')"><svg class="ico" aria-hidden="true"><use href="#i-alerts"/></svg><span>Алерты</span><span class="alert-count" id="alert-count"></span></button>
+      <button class="tab" type="button" data-tab="cluster" id="tab-btn-cluster"
+              onclick="App.showTab('cluster')"><svg class="ico" aria-hidden="true"><use href="#i-cluster"/></svg><span>Кластер</span></button>
+      <button class="tab" type="button" data-tab="logs"
+              onclick="App.showTab('logs')"><svg class="ico" aria-hidden="true"><use href="#i-logs"/></svg><span>Логи</span></button>
+      <button class="tab" type="button" data-tab="sql"
+              onclick="App.showTab('sql')"><svg class="ico" aria-hidden="true"><use href="#i-sql"/></svg><span>SQL</span></button>
+      <button class="tab" type="button" data-tab="search"
+              onclick="App.showTab('search')"><svg class="ico" aria-hidden="true"><use href="#i-search"/></svg><span>Поиск</span></button>
+      <button class="tab" type="button" data-tab="health"
+              onclick="App.showTab('health')"><svg class="ico" aria-hidden="true"><use href="#i-health"/></svg><span>Здоровье</span></button>
+      <button class="tab" type="button" data-tab="access" id="tab-btn-access"
+              style="display:none"
+              onclick="App.showTab('access')"><svg class="ico" aria-hidden="true"><use href="#i-access"/></svg><span>Доступы</span></button>
+      <button class="tab" type="button" data-tab="audit" id="tab-btn-audit"
+              style="display:none"
+              onclick="App.showTab('audit')"><svg class="ico" aria-hidden="true"><use href="#i-audit"/></svg><span>Журнал</span></button>
     </nav>
 
     <!-- ── ЧАТ ── -->
@@ -100,13 +123,14 @@
           <button class="stop-btn" id="stop-btn" style="display:none"
                   title="Прервать генерацию ответа">■</button>
         </div>
+        <div class="input-hint">Enter — отправить · Shift+Enter — новая строка</div>
       </div>
       </div>
     </section>
 
     <!-- ── СТАТУС ── -->
     <section id="tab-status" class="tab-pane status-pane" hidden>
-      <div id="status-content"><div class="muted">Загрузка…</div></div>
+      <div id="status-content"></div>
       <button class="ghost-btn" onclick="App.loadStatus(this)">↻ Обновить</button>
     </section>
 
@@ -173,7 +197,13 @@
       </div>
       <p class="muted small">Файлы выбираются по времени изменения, архивы читаются
          на месте через zgrep — целиком лог никогда не выкачивается.</p>
-      <pre id="logs-out" class="output">Выберите кластер и период.</pre>
+      <div class="empty" id="logs-empty">
+        <div class="empty-title">Логи не читались</div>
+        <p>Выберите кластер и период, при необходимости — строку поиска.
+           Файлы подбираются по времени изменения, большие читаются делением,
+           а не целиком.</p>
+      </div>
+      <pre id="logs-out" class="output" hidden></pre>
     </section>
 
     <!-- ── SQL ── -->
@@ -220,7 +250,12 @@
       <p class="muted small">Prometheus, модель, SSH до каждого сервера, учётки
          баз, каталог. Проверяется и по расписанию: протухший ключ приходит
          событием, а не всплывает в разгар аварии.</p>
-      <pre id="health-out" class="output">Нажмите «Проверить сейчас».</pre>
+      <div class="empty" id="health-empty">
+        <div class="empty-title">Проверка не запускалась</div>
+        <p>Обход всех серверов по SSH и пробный запрос к модели занимают до
+           минуты, поэтому она не начинается сама при открытии вкладки.</p>
+      </div>
+      <pre id="health-out" class="output" hidden></pre>
     </section>
 
     <section id="tab-access" class="tab-pane" hidden>
