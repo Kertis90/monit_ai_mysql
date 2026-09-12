@@ -22,6 +22,9 @@
     <g id="i-search"><circle cx="7" cy="7" r="4.4"/><path d="M10.4 10.4 14 14"/></g>
     <g id="i-health"><path d="M1.6 8h3l2-4.2L9.7 12l2-4h2.7"/></g>
     <g id="i-access"><circle cx="5" cy="8" r="3"/><path d="M8 8h6M12 8v2.6M14.2 8v2"/></g>
+    <g id="i-theme-system"><rect x="2" y="3" width="12" height="8.5" rx="1.4"/><path d="M6 13.5h4"/></g>
+    <g id="i-theme-light"><circle cx="8" cy="8" r="3"/><path d="M8 1.6v1.6M8 12.8v1.6M1.6 8h1.6M12.8 8h1.6M3.5 3.5l1.1 1.1M11.4 11.4l1.1 1.1M12.5 3.5l-1.1 1.1M4.6 11.4l-1.1 1.1"/></g>
+    <g id="i-theme-dark"><path d="M13 9.6A5.6 5.6 0 0 1 6.4 3a5.6 5.6 0 1 0 6.6 6.6z"/></g>
     <g id="i-audit"><rect x="3.2" y="2.8" width="9.6" height="11" rx="1.4"/><path d="M6.2 2.8V1.8h3.6v1M6.2 7h3.6M6.2 10h2.6"/></g>
   </defs>
 </svg>
@@ -32,6 +35,11 @@
   <span class="hbadge" id="clusters-badge">…</span>
   <span class="hbadge" id="ws-badge">подключение…</span>
   <div class="spacer"></div>
+  <button class="theme-btn" id="theme-btn" type="button" onclick="App.nextTheme()"
+          title="Тема оформления">
+    <svg class="ico" aria-hidden="true"><use href="#i-theme-system" id="theme-ico"/></svg>
+    <span id="theme-name">система</span>
+  </button>
   <span class="hbadge" id="user-badge" style="display:none"></span>
   <span class="hbadge" id="logout-btn" title="Выйти"
         style="cursor:pointer;display:none" onclick="App.logout()">Выйти</span>

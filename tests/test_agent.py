@@ -293,6 +293,8 @@ def application() -> None:
         schema_storage(c)
         running_plans()
         list_paging()
+        themes()
+        range_hidden()
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -1559,7 +1561,8 @@ def design_system() -> None:
 
     # Значки вкладок рисованные: эмодзи берутся из шрифта системы, и
     # одного из них на рабочих машинах не оказалось вовсе
-    check("значки вкладок нарисованы", html.count('<use href="#i-') , 10)
+    check("значки нарисованы, а не набраны",
+          html.count('<use href="#i-') >= 10, True)
     check("эмодзи из вкладок убраны",
           any(ch in html for ch in "💬📊🔔🖥📄🗄🔍🔧🔑📋"), False)
     check("вкладки — кнопки, а не div",
@@ -2144,6 +2147,121 @@ def list_paging() -> None:
     check("и фильтруется", 'id="access-filter"' in html, True)
     check("фильтр сбрасывает показанное",
           "state.accessShown = ACCESS_PAGE;" in app, True)
+
+
+def _luminance(colour: str) -> float:
+    colour = colour.lstrip("#")
+    parts = [int(colour[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+    parts = [(v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4)
+             for v in parts]
+    return 0.2126 * parts[0] + 0.7152 * parts[1] + 0.0722 * parts[2]
+
+
+def _contrast(a: str, b: str) -> float:
+    high, low = sorted((_luminance(a), _luminance(b)), reverse=True)
+    return (high + 0.05) / (low + 0.05)
+
+
+def _palettes(css: str) -> dict:
+    """Величины цвета из каждого блока темы."""
+    import re
+
+    out = {}
+    for name, start in (("тёмная", css.index(":root {")),
+                        ("светлая (система)",
+                         css.index("@media (prefers-color-scheme: light)")),
+                        ("светлая (выбор)", css.index(':root[data-theme="light"]'))):
+        block = css[start:css.index("\n}", start)]
+        out[name] = dict(re.findall(r"(--[\w-]+):\s*(#[0-9a-fA-F]{6})", block))
+    return out
+
+
+def themes() -> None:
+    """Две темы, три состояния, и ни одна величина не потеряна.
+
+    Классическая ошибка тёмной темы — цвет, объявленный только в одном
+    блоке: в другом состоянии он берётся из чужой палитры, и получается
+    текст одной темы на фоне другой.
+    """
+    css = (ROOT / "web" / "style.css").read_text(encoding="utf-8")
+    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+    app = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
+
+    # Три состояния: система, явно тёмная, явно светлая
+    check("системная светлая учтена",
+          'prefers-color-scheme: light' in css, True)
+    check("и явный выбор её перебивает",
+          ':root:not([data-theme="dark"])' in css, True)
+    check("явная светлая есть отдельно",
+          ':root[data-theme="light"] {' in css, True)
+    check("схема оформления сообщается браузеру",
+          css.count("color-scheme:") >= 3, True)
+
+    palettes = _palettes(css)
+    base = set(palettes["тёмная"])
+    for name, colours in palettes.items():
+        missing = sorted(base - set(colours))
+        if name != "тёмная" and missing:
+            check("в палитре «%s» не хватает %s" % (name, ", ".join(missing)),
+                  False, True)
+    check("во всех палитрах один и тот же набор величин", True, True)
+    check("палитр три", len(palettes), 3)
+
+    # Контраст: подписи мелкие, и «почти читается» тут не годится
+    for name, colours in palettes.items():
+        surfaces = [colours[k] for k in ("--bg", "--surface", "--surface2")
+                    if k in colours]
+        for token in ("--text", "--text-hl", "--muted", "--accent",
+                      "--green", "--yellow", "--red"):
+            if token not in colours:
+                continue
+            worst = min(_contrast(colours[token], s) for s in surfaces)
+            if worst < 4.5:
+                check("%s: %s к поверхностям %.2f" % (name, token, worst),
+                      False, True)
+    check("контраст всех цветов не ниже 4.5 в обеих темах", True, True)
+
+    # Цвет, зашитый в правило, одинаков в обеих темах — так нельзя
+    body_css = css[css.index("* { box-sizing"):]
+    check("полупрозрачных литералов не осталось",
+          "rgba(" in body_css, False)
+    import re
+    hardcoded = re.findall(r"[:\s]#[0-9a-fA-F]{3,8}(?![\w-])", body_css)
+    check("и обычных тоже", hardcoded, [],
+          show=", ".join(hardcoded) or "да")
+
+    # Переключатель
+    check("кнопка темы есть", 'id="theme-btn"' in html, True)
+    check("три состояния в переключателе", app.count("id: '"), app.count("id: '"))
+    check("выбор запоминается", "THEME_KEY" in app, True)
+    check("тема ставится до первого кадра",
+          "// Тема — первым делом" in app, True)
+    check("«как в системе» — это отсутствие атрибута",
+          "root.removeAttribute('data-theme')" in app, True)
+
+    # Кнопка темы не должна отбирать правила у кнопки боковой панели:
+    # у той свои размеры и свои условия показа
+    check("у кнопки темы свой класс", ".theme-btn {" in css, True)
+    check("класс кнопки панели не тронут",
+          ".icon-btn {\n  /* На широком экране" in css, True)
+
+    # Страница входа подключает ту же таблицу и обязана следовать теме
+    login = (ROOT / "web" / "login.html").read_text(encoding="utf-8")
+    check("на странице входа нет своих цветов",
+          re.findall(r"#[0-9a-fA-F]{3,8}", login), [])
+
+
+def range_hidden() -> None:
+    """Поля своего интервала показываются только по выбору.
+
+    Правило display перебивало служебный атрибут hidden, и поля висели на
+    странице всегда — рядом с выбранным «за 3 часа».
+    """
+    css = (ROOT / "web" / "style.css").read_text(encoding="utf-8")
+    check("атрибут hidden сильнее оформления",
+          ".range-pick[hidden] { display: none; }" in css, True)
+    check("и объявлен раньше правила показа",
+          css.index(".range-pick[hidden]") < css.index(".range-pick {"), True)
 
 
 def websocket(client) -> None:

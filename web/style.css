@@ -3,20 +3,127 @@
    ═════════════════════════════════════════════════════════════════ */
 
 :root {
+  /* ── Тёмная тема ──────────────────────────────────────────────────
+     Она основная: агент открыт в дежурке весь день, часто рядом с
+     графиками Grafana, и светлый экран в этом ряду бьёт по глазам.
+     Светлая — равноправная, но вторая; переключатель в шапке.
+
+     Нейтральные тона уведены в синеву, к акценту, а не взяты чистым
+     серым: чистый серый выглядит не выбранным, а доставшимся.
+
+     Цвета состояния (зелёный, янтарный, красный) живут отдельно от
+     акцента и никогда не используются как «ещё один синий»: за ними
+     закреплён смысл. */
+  color-scheme: dark;
+
   --bg:        #0b0e14;
   --surface:   #12161f;
   --surface2:  #191e2a;
+  --surface3:  #232834;
   --border:    #262d3d;
   --border-hl: #35405a;
   --accent:    #4c8dff;
-  --accent-dim: rgba(76,141,255,.14);
+  --accent-dim: rgb(var(--accent-rgb) / .14);
   --green:     #38c172;
   --yellow:    #e3a008;
   --red:       #ef5350;
   --text:      #cdd6e4;
   --text-hl:   #eef2f8;
-  --muted:     #6b7689;
+  /* Приглушённый текст поднят с #6b7689: тот давал 3.6 к поверхности, а
+     это подписи, которые и так мелкие */
+  --muted:     #7a869b;
+  --on-accent: #ffffff;
+
+  /* Составляющие для полупрозрачных — чтобы плашки и заливки менялись
+     вместе с темой, а не оставались синевой от тёмной на светлом фоне */
+  --accent-rgb:   76 141 255;
+  --green-rgb:    56 193 114;
+  --yellow-rgb:  227 160 8;
+  --red-rgb:     239 83 80;
+  --muted-rgb:   122 134 155;
+  --bg-rgb:       11 14 20;
+  --surface3-rgb: 35 40 52;
+  --shadow-rgb:    0 0 0;
+  --shadow-strong: .45;
+  --shadow-soft:   .40;
+  --spark: rgb(var(--accent-rgb) / .55);
+
   --mono:      'SFMono-Regular', 'JetBrains Mono', Consolas, monospace;
+}
+
+/* ── Светлая тема ────────────────────────────────────────────────────
+   Не осветлённая тёмная: акцент и цвета состояния взяты темнее, иначе
+   на белом они не читаются. Каждый проверен на контраст к поверхностям —
+   ниже 4.5 не опускается ни один, кроме заведомо крупных значений.
+
+   Три состояния, а не два. Явный выбор ставит на корень data-theme и
+   побеждает систему в обе стороны; без выбора работает системная
+   настройка. Поэтому правил тоже два, и они не противоречат друг другу. */
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    color-scheme: light;
+
+    --bg:        #f3f5fa;
+    --surface:   #ffffff;
+    --surface2:  #edf0f7;
+    --surface3:  #e3e8f2;
+    --border:    #dde3ee;
+    --border-hl: #aeb9cd;
+    --accent:    #1f63d6;
+    --green:     #12763d;
+    --yellow:    #8a6100;
+    --red:       #c02726;
+    --text:      #2a3446;
+    --text-hl:   #0f1726;
+    --muted:     #5f6b80;
+    --on-accent: #ffffff;
+
+    --accent-rgb:   31 99 214;
+    --green-rgb:    18 118 61;
+    --yellow-rgb:  138 97 0;
+    --red-rgb:     192 39 38;
+    --muted-rgb:    95 107 128;
+    --bg-rgb:      243 245 250;
+    --surface3-rgb: 227 232 242;
+    /* На светлом фоне чёрная тень выглядит грязью: берём синеву фона и
+       сильно меньшую плотность */
+    --shadow-rgb:   15 23 38;
+    --shadow-strong: .16;
+    --shadow-soft:   .12;
+  --spark: rgb(var(--accent-rgb) / .5);
+  }
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --bg:        #f3f5fa;
+  --surface:   #ffffff;
+  --surface2:  #edf0f7;
+  --surface3:  #e3e8f2;
+  --border:    #dde3ee;
+  --border-hl: #aeb9cd;
+  --accent:    #1f63d6;
+  --green:     #12763d;
+  --yellow:    #8a6100;
+  --red:       #c02726;
+  --text:      #2a3446;
+  --text-hl:   #0f1726;
+  --muted:     #5f6b80;
+  --on-accent: #ffffff;
+
+  --accent-rgb:   31 99 214;
+  --green-rgb:    18 118 61;
+  --yellow-rgb:  138 97 0;
+  --red-rgb:     192 39 38;
+  --muted-rgb:    95 107 128;
+  --bg-rgb:      243 245 250;
+  --surface3-rgb: 227 232 242;
+  --shadow-rgb:   15 23 38;
+  --shadow-strong: .16;
+  --shadow-soft:   .12;
+  --spark: rgb(var(--accent-rgb) / .5);
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -59,7 +166,7 @@ header h1 {
   background: var(--muted);
   transition: background .3s;
 }
-.conn-dot.online  { background: var(--green); box-shadow: 0 0 6px rgba(56,193,114,.6); }
+.conn-dot.online  { background: var(--green); box-shadow: 0 0 6px rgb(var(--green-rgb) / .6); }
 .conn-dot.offline { background: var(--red); }
 
 .hbadge {
@@ -68,7 +175,7 @@ header h1 {
   border-radius: 11px;
   background: var(--accent-dim);
   color: var(--accent);
-  border: 1px solid rgba(76,141,255,.3);
+  border: 1px solid rgb(var(--accent-rgb) / .3);
   white-space: nowrap;
 }
 
@@ -114,7 +221,7 @@ header h1 {
   transition: background .12s, border-color .12s;
 }
 .cluster-card:hover  { background: var(--surface2); border-color: var(--border); }
-.cluster-card.active { background: var(--accent-dim); border-color: rgba(76,141,255,.45); }
+.cluster-card.active { background: var(--accent-dim); border-color: rgb(var(--accent-rgb) / .45); }
 
 .cluster-card .cname { font-weight: 600; font-size: 13px; color: var(--text-hl); }
 .cluster-card .cmeta { font-size: 11px; color: var(--muted); font-family: var(--mono); }
@@ -126,13 +233,13 @@ header h1 {
   padding: 1px 7px;
   border-radius: 9px;
   font-family: var(--mono);
-  background: rgba(107,118,137,.12);
+  background: rgb(var(--muted-rgb) / .12);
   color: var(--muted);
   border: 1px solid var(--border);
 }
-.mini-badge.ok   { background: rgba(56,193,114,.12);  color: var(--green);  border-color: rgba(56,193,114,.3); }
-.mini-badge.warn { background: rgba(227,160,8,.12);   color: var(--yellow); border-color: rgba(227,160,8,.3); }
-.mini-badge.crit { background: rgba(239,83,80,.12);   color: var(--red);    border-color: rgba(239,83,80,.35); }
+.mini-badge.ok   { background: rgb(var(--green-rgb) / .12);  color: var(--green);  border-color: rgb(var(--green-rgb) / .3); }
+.mini-badge.warn { background: rgb(var(--yellow-rgb) / .12);   color: var(--yellow); border-color: rgb(var(--yellow-rgb) / .3); }
+.mini-badge.crit { background: rgb(var(--red-rgb) / .12);   color: var(--red);    border-color: rgb(var(--red-rgb) / .35); }
 
 .side-footer { padding: 10px 14px; border-top: 1px solid var(--border); }
 
@@ -168,7 +275,7 @@ header h1 {
   text-align: center;
   padding: 1px 5px;
   border-radius: 8px;
-  background: rgba(239,83,80,.18);
+  background: rgb(var(--red-rgb) / .18);
   color: var(--red);
   display: none;
 }
@@ -201,7 +308,7 @@ header h1 {
 .msg.user {
   align-self: flex-end;
   background: var(--accent-dim);
-  border: 1px solid rgba(76,141,255,.32);
+  border: 1px solid rgb(var(--accent-rgb) / .32);
   border-bottom-right-radius: 4px;
 }
 
@@ -231,7 +338,7 @@ header h1 {
   font-size: 10px;
   padding: 1px 7px;
   border-radius: 8px;
-  background: rgba(76,141,255,.12);
+  background: rgb(var(--accent-rgb) / .12);
   color: var(--accent);
   font-family: var(--mono);
 }
@@ -317,7 +424,7 @@ textarea#input:disabled { opacity: .55; }
   width: 44px; height: 44px;
   border-radius: 10px;
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   border: none;
   cursor: pointer;
   display: flex;
@@ -448,46 +555,46 @@ textarea#input:disabled { opacity: .55; }
    Встроены в сообщение ответа, по умолчанию свёрнуты: раньше десять
    картинок вываливались отдельной стеной и мешали читать ответ. */
 .cg-block        { margin: 10px 0 0; padding-top: 8px;
-                   border-top: 1px solid var(--border, #2b313c); }
+                   border-top: 1px solid var(--border); }
 .cg-bar          { display: flex; align-items: center; gap: 14px; }
 .cg-link         { background: none; border: 0; padding: 0; cursor: pointer;
-                   font: inherit; font-size: 12px; color: var(--muted, #8b95a5);
+                   font: inherit; font-size: 12px; color: var(--muted);
                    text-decoration: none; }
-.cg-link:hover   { color: var(--accent, #4c8dff); }
-.cg-link.accent  { color: var(--accent, #4c8dff); font-weight: 600; }
+.cg-link:hover   { color: var(--accent); }
+.cg-link.accent  { color: var(--accent); font-weight: 600; }
 
 .cg-body         { display: none; margin-top: 10px; }
 .cg-body.open    { display: block; }
 .cg-grid         { display: grid; gap: 8px;
                    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
 
-.cg-card         { background: var(--bg, #12151b);
-                   border: 1px solid var(--border, #2b313c);
+.cg-card         { background: var(--bg);
+                   border: 1px solid var(--border);
                    border-radius: 8px; padding: 8px 10px; }
 .cg-head         { display: flex; align-items: baseline; gap: 8px;
                    flex-wrap: wrap; margin-bottom: 2px; }
 .cg-title        { font-size: 12px; font-weight: 600; }
-.cg-stats        { font-size: 10px; color: var(--muted, #8b95a5); margin-left: auto; }
+.cg-stats        { font-size: 10px; color: var(--muted); margin-left: auto; }
 
 .cg-svg          { width: 100%; height: 96px; display: block; }
-.cg-gridline    { stroke: var(--border, #2b313c); stroke-width: 1; }
-.cg-lbl          { fill: var(--muted, #8b95a5); font-size: 9px; font-family: inherit; }
-.cg-line         { fill: none; stroke: var(--accent, #4c8dff); stroke-width: 1.6;
+.cg-gridline    { stroke: var(--border); stroke-width: 1; }
+.cg-lbl          { fill: var(--muted); font-size: 9px; font-family: inherit; }
+.cg-line         { fill: none; stroke: var(--accent); stroke-width: 1.6;
                    vector-effect: non-scaling-stroke; }
-.cg-area         { fill: var(--accent, #4c8dff); opacity: .12; stroke: none; }
+.cg-area         { fill: var(--accent); opacity: .12; stroke: none; }
 
 /* Источник алерта: Prometheus / Zabbix / API */
 .src-badge { font-size: 10px; padding: 1px 7px; border-radius: 9px;
-             border: 1px solid var(--border, #2b313c);
-             color: var(--muted, #8b95a5); text-transform: uppercase;
+             border: 1px solid var(--border);
+             color: var(--muted); text-transform: uppercase;
              letter-spacing: .3px; }
 
 /* Кнопка остановки генерации — на месте отправки, пока идёт ответ */
 .stop-btn { width: 38px; height: 38px; flex: 0 0 38px; border-radius: 9px;
-            border: 1px solid var(--border, #2b313c);
-            background: var(--panel, #1b1f27); color: var(--muted, #8b95a5);
+            border: 1px solid var(--border);
+            background: var(--surface2); color: var(--muted);
             cursor: pointer; font-size: 13px; line-height: 1; }
-.stop-btn:hover { border-color: #e05a5a; color: #e05a5a; }
+.stop-btn:hover { border-color: var(--red); color: var(--red); }
 
 /* ═══ Разметка ответа ИИ ═══════════════════════════════════════════ */
 .msg-body p          { margin: 0 0 8px; }
@@ -496,49 +603,49 @@ textarea#input:disabled { opacity: .55; }
 .md-h:first-child    { margin-top: 0; }
 .md-list             { margin: 4px 0 8px; padding-left: 22px; }
 .md-list li          { margin: 2px 0; }
-.md-hr               { border: 0; border-top: 1px solid var(--border, #2b313c);
+.md-hr               { border: 0; border-top: 1px solid var(--border);
                        margin: 12px 0; }
 
-.msg-body code       { background: rgba(127,140,160,.16); padding: 1px 5px;
+.msg-body code       { background: rgb(var(--muted-rgb) / .16); padding: 1px 5px;
                        border-radius: 4px; font-size: 12px;
                        font-family: ui-monospace, Consolas, monospace; }
 
 .md-code             { position: relative; margin: 8px 0;
-                       border: 1px solid var(--border, #2b313c);
-                       border-radius: 8px; background: var(--bg, #12151b); }
+                       border: 1px solid var(--border);
+                       border-radius: 8px; background: var(--bg); }
 .md-code pre         { margin: 0; padding: 10px 12px; overflow-x: auto; }
 .md-code code        { background: none; padding: 0; font-size: 12px;
                        line-height: 1.45; white-space: pre; }
 .md-lang             { position: absolute; top: 6px; right: 88px; font-size: 10px;
-                       color: var(--muted, #8b95a5); text-transform: uppercase; }
+                       color: var(--muted); text-transform: uppercase; }
 .md-copy             { position: absolute; top: 4px; right: 6px; font: inherit;
                        font-size: 11px; padding: 2px 8px; cursor: pointer;
-                       color: var(--muted, #8b95a5); background: var(--panel, #1b1f27);
-                       border: 1px solid var(--border, #2b313c); border-radius: 5px; }
-.md-copy:hover       { color: var(--accent, #4c8dff); border-color: var(--accent, #4c8dff); }
+                       color: var(--muted); background: var(--surface2);
+                       border: 1px solid var(--border); border-radius: 5px; }
+.md-copy:hover       { color: var(--accent); border-color: var(--accent); }
 
 /* Таблицы: широкие прокручиваются внутри себя, страницу не растягивают */
 .md-tablewrap        { overflow-x: auto; margin: 8px 0; }
 .md-table            { border-collapse: collapse; width: 100%; font-size: 12px; }
 .md-table th,
 .md-table td         { padding: 5px 9px; text-align: left; white-space: nowrap;
-                       border-bottom: 1px solid var(--border, #2b313c); }
-.md-table th         { background: rgba(127,140,160,.10); font-weight: 600; }
-.md-table tbody tr:hover { background: rgba(127,140,160,.06); }
+                       border-bottom: 1px solid var(--border); }
+.md-table th         { background: rgb(var(--muted-rgb) / .10); font-weight: 600; }
+.md-table tbody tr:hover { background: rgb(var(--muted-rgb) / .06); }
 .md-table .num       { text-align: right; font-variant-numeric: tabular-nums; }
 
 /* Оценка ответа */
 .fb-bar  { margin-top: 8px; display: flex; align-items: center; gap: 8px;
-           font-size: 11px; color: var(--muted, #8b95a5); }
+           font-size: 11px; color: var(--muted); }
 .fb-btn  { font: inherit; font-size: 11px; padding: 2px 10px; cursor: pointer;
            color: inherit; background: none; border-radius: 5px;
-           border: 1px solid var(--border, #2b313c); }
-.fb-btn:hover { color: var(--accent, #4c8dff); border-color: var(--accent, #4c8dff); }
+           border: 1px solid var(--border); }
+.fb-btn:hover { color: var(--accent); border-color: var(--accent); }
 
 /* Записанное решение инцидента */
 .resolution { margin-top: 6px; padding: 6px 10px; font-size: 12px;
-              border-left: 3px solid var(--accent, #4c8dff);
-              background: rgba(76,141,255,.07); border-radius: 0 6px 6px 0; }
+              border-left: 3px solid var(--accent);
+              background: rgb(var(--accent-rgb) / .07); border-radius: 0 6px 6px 0; }
 
 /* ── Чаты: боковая панель ───────────────────────────────────────────
    Список вместо выпадающего меню: при пяти разговорах в select уже не
@@ -588,7 +695,7 @@ textarea#input:disabled { opacity: .55; }
 .thread-item:hover { background: var(--surface2); }
 .thread-item.active {
   background: var(--accent-dim);
-  border-color: rgba(76,141,255,.32);
+  border-color: rgb(var(--accent-rgb) / .32);
 }
 
 .thread-name {
@@ -627,7 +734,7 @@ textarea#input:disabled { opacity: .55; }
   line-height: 22px;
 }
 .thread-actions button:hover { background: var(--border); color: var(--text-hl); }
-.thread-actions button.danger:hover { background: rgba(239,83,80,.18); color: var(--red); }
+.thread-actions button.danger:hover { background: rgb(var(--red-rgb) / .18); color: var(--red); }
 
 .thread-rename {
   width: 100%;
@@ -700,7 +807,7 @@ textarea#input:disabled { opacity: .55; }
     position: absolute;
     z-index: 20;
     top: 0; bottom: 0; left: 0;
-    box-shadow: 0 0 24px rgba(0,0,0,.45);
+    box-shadow: 0 0 24px rgb(var(--shadow-rgb) / var(--shadow-strong));
   }
   .chat-pane { position: relative; }
 }
@@ -904,7 +1011,7 @@ textarea#input:disabled { opacity: .55; }
   max-width: 340px;
   font-size: 12.5px;
   cursor: pointer;
-  box-shadow: 0 6px 20px rgba(0,0,0,.4);
+  box-shadow: 0 6px 20px rgb(var(--shadow-rgb) / var(--shadow-soft));
 }
 .toast.critical { border-left-color: var(--red); }
 .toast.warning  { border-left-color: var(--yellow); }
@@ -1152,9 +1259,9 @@ button[disabled] { opacity: .65; cursor: progress; }
   white-space: nowrap;
   border: 1px solid transparent;
 }
-.pill.ok   { color: var(--green);  border-color: rgba(56,193,114,.35); }
-.pill.warn { color: var(--yellow); border-color: rgba(227,160,8,.4); }
-.pill.bad  { color: var(--red);    border-color: rgba(239,83,80,.45); }
+.pill.ok   { color: var(--green);  border-color: rgb(var(--green-rgb) / .35); }
+.pill.warn { color: var(--yellow); border-color: rgb(var(--yellow-rgb) / .4); }
+.pill.bad  { color: var(--red);    border-color: rgb(var(--red-rgb) / .45); }
 
 .meter {
   height: 3px;
@@ -1173,9 +1280,9 @@ button[disabled] { opacity: .65; cursor: progress; }
 .stat.bad  .meter i { background: var(--red); }
 .stat.ok   .meter i { background: var(--green); }
 
-.stat-spark { margin-top: 7px; color: var(--border-hl); height: 22px; }
-.stat.warn .stat-spark { color: rgba(227,160,8,.65); }
-.stat.bad  .stat-spark { color: rgba(239,83,80,.7); }
+.stat-spark { margin-top: 7px; color: var(--spark); height: 22px; }
+.stat.warn .stat-spark { color: rgb(var(--yellow-rgb) / .8); }
+.stat.bad  .stat-spark { color: rgb(var(--red-rgb) / .85); }
 .spark { width: 100%; height: 22px; display: block; }
 
 /* ── Карточки: разбор, графики, события ────────────────────────────── */
@@ -1202,7 +1309,7 @@ button[disabled] { opacity: .65; cursor: progress; }
 
 .accent-btn {
   background: var(--accent-dim);
-  border: 1px solid rgba(76,141,255,.45);
+  border: 1px solid rgb(var(--accent-rgb) / .45);
   color: var(--accent);
   border-radius: 7px;
   padding: 6px 12px;
@@ -1210,7 +1317,7 @@ button[disabled] { opacity: .65; cursor: progress; }
   cursor: pointer;
   font-family: inherit;
 }
-.accent-btn:hover { background: rgba(76,141,255,.22); }
+.accent-btn:hover { background: rgb(var(--accent-rgb) / .22); }
 .accent-btn[disabled] { opacity: .65; cursor: progress; }
 
 /* ── Блоки диагностики ─────────────────────────────────────────────── */
@@ -1319,7 +1426,7 @@ button[disabled] { opacity: .65; cursor: progress; }
 .expired {
   position: fixed;
   inset: 0;
-  background: rgba(11,14,20,.82);
+  background: rgb(var(--bg-rgb) / .82);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1363,6 +1470,7 @@ button[disabled] { opacity: .65; cursor: progress; }
 .card-fold .muted { font-weight: normal; }
 
 /* Свой интервал времени на странице кластера */
+.range-pick[hidden] { display: none; }
 .range-pick {
   display: inline-flex;
   align-items: center;
@@ -1377,7 +1485,6 @@ button[disabled] { opacity: .65; cursor: progress; }
   padding: 5px 8px;
   font-family: inherit;
   font-size: 12px;
-  color-scheme: dark;
 }
 .range-pick input:focus { border-color: var(--border-hl); outline: none; }
 .range-problem {
@@ -1734,8 +1841,8 @@ header h1 { font-size: var(--fs-lg); }
    случае ждать имеет смысл. Пульсация как раз и означает ожидание. */
 
 @keyframes dot-pulse {
-  0%, 100% { opacity: 1;  box-shadow: 0 0 0 0 rgba(227,160,8,.5); }
-  50%      { opacity: .5; box-shadow: 0 0 0 4px rgba(227,160,8,0); }
+  0%, 100% { opacity: 1;  box-shadow: 0 0 0 0 rgb(var(--yellow-rgb) / .5); }
+  50%      { opacity: .5; box-shadow: 0 0 0 4px rgb(var(--yellow-rgb) / 0); }
 }
 .conn-dot.connecting {
   background: var(--yellow);
@@ -1801,3 +1908,27 @@ header h1 { font-size: var(--fs-lg); }
   min-width: 240px;
 }
 #access-filter:focus { border-color: var(--border-hl); outline: none; }
+
+/* Кнопка темы: тем же весом, что и остальные пометки в шапке, — это не
+   главное действие на экране, а настройка, к которой возвращаются редко */
+/* Имя своё, а не .icon-btn: тот уже занят кнопкой боковой панели, и
+   общий класс отобрал бы у неё и ширину, и правила показа. */
+.theme-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex: none;
+  white-space: nowrap;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: var(--r-pill);
+  color: var(--muted);
+  font: inherit;
+  font-size: var(--fs-xs);
+  padding: 3px var(--sp-3) 3px var(--sp-2);
+  cursor: pointer;
+  transition: color var(--dur-fast) var(--ease),
+              border-color var(--dur-fast) var(--ease);
+}
+.theme-btn:hover { color: var(--text-hl); border-color: var(--border); }
+.theme-btn .ico { width: 13px; height: 13px; }

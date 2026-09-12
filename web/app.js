@@ -35,6 +35,7 @@ const App = (() => {
     replyTimer:    null,
     attachedTo:    null,   // к какому разговору уже просились подключиться
     restoring:     false,  // идёт восстановление ленты — не анимируем её
+    theme:         'system',
     pingTimer:     null,
   };
 
@@ -76,6 +77,51 @@ const App = (() => {
     }
     return res;
   };
+
+  // ═══ ТЕМА ═══════════════════════════════════════════════════════
+  // Три состояния, а не два. «Как в системе» — не отсутствие выбора, а
+  // самостоятельный режим: человек, у которого система переключается по
+  // расписанию, хочет того же и здесь. Явный выбор побеждает систему в
+  // обе стороны, поэтому он и ставится атрибутом на корень.
+
+  const THEME_KEY = 'mysql-ai-agent.theme';
+  const THEMES = [
+    { id: 'system', name: 'система', full: 'как в системе',
+      icon: 'i-theme-system' },
+    { id: 'dark',   name: 'тёмная',  full: 'тёмная',  icon: 'i-theme-dark' },
+    { id: 'light',  name: 'светлая', full: 'светлая', icon: 'i-theme-light' },
+  ];
+
+  function readTheme() {
+    try {
+      const saved = localStorage.getItem(THEME_KEY);
+      if (THEMES.some(t => t.id === saved)) return saved;
+    } catch (e) { /* приватный режим */ }
+    return 'system';
+  }
+
+  function applyTheme(id) {
+    const theme = THEMES.find(t => t.id === id) || THEMES[0];
+    const root = document.documentElement;
+    if (theme.id === 'system') root.removeAttribute('data-theme');
+    else root.setAttribute('data-theme', theme.id);
+
+    const icon = $('theme-ico');
+    if (icon) icon.setAttribute('href', '#' + theme.icon);
+    const name = $('theme-name');
+    if (name) name.textContent = theme.name;
+    const btn = $('theme-btn');
+    if (btn) btn.title = 'Тема: ' + theme.full + '. Нажмите, чтобы сменить';
+
+    try { localStorage.setItem(THEME_KEY, theme.id); }
+    catch (e) { /* приватный режим */ }
+    state.theme = theme.id;
+  }
+
+  function nextTheme() {
+    const at = THEMES.findIndex(t => t.id === state.theme);
+    applyTheme(THEMES[(at + 1) % THEMES.length].id);
+  }
 
   // ═══ ИДЕНТИФИКАЦИЯ БРАУЗЕРА ════════════════════════════
 
@@ -2916,6 +2962,9 @@ const App = (() => {
   // ═══ ИНИЦИАЛИЗАЦИЯ ══════════════════════════════════════════════
 
   function init() {
+    // Тема — первым делом: иначе первый кадр успевает мигнуть чужим фоном
+    applyTheme(readTheme());
+
     // Опознаём браузер до всего остального: от clientId зависит история
     state.clientId    = loadClientId();
     state.fingerprint = browserFingerprint();
@@ -2969,6 +3018,7 @@ const App = (() => {
 
   // Публичный API для onclick в HTML
   return { showTab, pickCluster, useSuggestion, toggleAnalysis, explainAll,
+           nextTheme,
            periodChanged, applyRange,
            loadStatus, loadAlerts, refreshClusters, logout,
            loadAccess, loadAudit, filterAccess, searchDirectory, grantAgain,
