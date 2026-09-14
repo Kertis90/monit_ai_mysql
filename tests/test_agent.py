@@ -243,6 +243,7 @@ def application() -> None:
 
         extras(c)
         websocket(c)
+        chat_finishes_thought(c)
         threads(c)
         gui_endpoints(c)
         foresight(c)
@@ -309,6 +310,9 @@ def application() -> None:
         sql_limit_over_ssh()
         thinking_hidden()
         answer_not_a_plan()
+        native_tool_calls()
+        preamble_is_not_an_answer()
+        rounds_end_with_answer()
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -642,7 +646,7 @@ def background_answer(client) -> None:
     async def fake_ctx(text, progress=None):
         return "", None, 0
 
-    async def fake_stream(messages):
+    async def fake_stream(messages, tool_sink=None):
         # Первый кусок сразу, остальное — после «перезагрузки страницы»
         yield "начало "
         for _ in range(50):
@@ -3112,6 +3116,177 @@ def answer_not_a_plan() -> None:
           "агент выполнит его сам" in prompt, True)
 
 
+def native_tool_calls() -> None:
+    """Вызовы штатным полем не теряются в потоке.
+
+    Модель умеет звать инструменты не текстом, а полем tool_calls. В
+    стриме они приходят кусками: имя в первом, аргументы по символам в
+    следующих. Раньше поток брал только content — и человек получал
+    вступление «сейчас посмотрю» вместо ответа, а вызов пропадал молча.
+    """
+    from agent.services import llm
+
+    parts = {}
+    llm._collect_tool_deltas(parts, [
+        {"index": 0, "id": "c1",
+         "function": {"name": "run_sql", "arguments": '{"clus'}}])
+    llm._collect_tool_deltas(parts, [
+        {"index": 0, "function": {"arguments": 'ter": "kemerovo", "sql": '}}])
+    llm._collect_tool_deltas(parts, [
+        {"index": 0, "function": {"arguments": '"SELECT 1"}'}}])
+    calls = llm._finish_tool_calls(parts)
+    check("вызов собран из кусков", len(calls), 1)
+    check("имя взято из первого куска", calls[0]["name"], "run_sql")
+    check("аргументы склеены и разобраны",
+          calls[0]["args"], {"cluster": "kemerovo", "sql": "SELECT 1"})
+
+    # Два вызова в одном ответе различаются по номеру, а не по приходу
+    pair = {}
+    llm._collect_tool_deltas(pair, [
+        {"index": 0, "function": {"name": "get_schema", "arguments": "{}"}},
+        {"index": 1, "function": {"name": "get_history", "arguments": '{"h'}}])
+    llm._collect_tool_deltas(pair, [
+        {"index": 1, "function": {"arguments": 'ours": 6}'}}])
+    both = llm._finish_tool_calls(pair)
+    check("оба вызова собраны", [c["name"] for c in both],
+          ["get_schema", "get_history"])
+    check("аргументы не перепутаны", both[1]["args"], {"hours": 6})
+
+    # Битые аргументы не должны ронять ответ целиком
+    broken = llm._finish_tool_calls({0: {"name": "run_sql", "args": "{не json"}})
+    check("битые аргументы не роняют разбор", broken[0]["args"], {})
+    check("вызов без имени отброшен",
+          llm._finish_tool_calls({0: {"name": "", "args": "{}"}}), [])
+
+
+def preamble_is_not_an_answer() -> None:
+    """«Сейчас получу то и это:» — это не ответ."""
+    from agent.services.assistant import FINISH_NOTE, looks_unfinished
+
+    check("вступление опознано",
+          looks_unfinished("Получаю количество договоров без движения:"), True)
+    check("многоточие тоже",
+          looks_unfinished("Сейчас посмотрю таблицы платежей..."), True)
+    check("пустой ответ — тем более", looks_unfinished("   "), True)
+    check("ответ по существу не трогаем",
+          looks_unfinished("Договоров без движения — 412, из них 87 с "
+                           "нулевым балансом."), False)
+    check("длинный текст с двоеточием в конце — всё-таки ответ",
+          looks_unfinished("Разбор по кластерам. " * 30 + "итого:"), False)
+
+    check("модели сказано, что сбор окончен",
+          "инструменты закончились" in FINISH_NOTE.lower(), True)
+    check("и что описывать намерения не надо",
+          "не описывай" in FINISH_NOTE, True)
+
+
+def rounds_end_with_answer() -> None:
+    """Когда раунды инструментов кончились, модели говорят: отвечай.
+
+    Без этого она продолжает в том же духе — объявляет следующий шаг и
+    замолкает. Именно так получались пустые ответы с рядом значков
+    инструментов и вступлением вместо текста.
+    """
+    from agent.services import assistant
+
+    rounds = {"n": 0}
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            rounds["n"] += 1
+            # Модель зовёт инструмент столько раз, сколько ей позволят
+            return {"choices": [{"message": {
+                "role": "assistant", "content": "Сейчас посмотрю:",
+                "tool_calls": [{"id": "c%d" % rounds["n"], "function": {
+                    "name": "get_schema",
+                    "arguments": '{"cluster": "kemerovo"}'}}]}}]}
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, *a, **kw):
+            return FakeResponse()
+
+    async def fake_tool(name, args):
+        return "## %s\n\n  данные" % name
+
+    originals = (assistant.httpx.AsyncClient, assistant.run_tool)
+    assistant.httpx.AsyncClient = FakeClient
+    assistant.run_tool = fake_tool
+    try:
+        convo, used = asyncio.run(assistant.llm_with_tools(
+            [{"role": "user", "content": "изучи структуру базы"}]))
+    finally:
+        assistant.httpx.AsyncClient, assistant.run_tool = originals
+
+    check("раунды ограничены", len(used), assistant.LLM_TOOL_ROUNDS)
+    check("последним идёт указание отвечать",
+          convo[-1]["content"], assistant.FINISH_NOTE)
+    check("и оно от лица человека, а не инструмента",
+          convo[-1]["role"], "user")
+
+
+def chat_finishes_thought(client) -> None:
+    """Ответ-вступление агент просит договорить, а показанное стирает."""
+    from agent.api.routes import chat as chat_routes
+
+    turns = {"n": 0}
+
+    async def fake_context(text, progress=None):
+        return "## Метрики", None, 0
+
+    async def fake_stream(messages, tool_sink=None):
+        turns["n"] += 1
+        if turns["n"] == 1:
+            for piece in ("Получаю ", "количество ", "договоров:"):
+                yield piece
+        else:
+            for piece in ("Договоров ", "без движения — 412."):
+                yield piece
+
+    async def no_tools():
+        return False
+
+    original = (chat_routes.build_chat_context, chat_routes.llm_stream,
+                chat_routes.llm_probe_tools)
+    chat_routes.build_chat_context = fake_context
+    chat_routes.llm_stream = fake_stream
+    chat_routes.llm_probe_tools = no_tools
+    try:
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({"type": "message", "text": "сколько пустых договоров",
+                          "client_id": "web-9", "session_id": "s9"})
+            seen, answer = [], ""
+            for _ in range(40):
+                msg = ws.receive_json()
+                seen.append(msg.get("type"))
+                if msg.get("type") == "reset":
+                    answer = ""
+                if msg.get("type") == "token":
+                    answer += msg.get("text", "")
+                if msg.get("type") == "done":
+                    break
+        check("агент попросил договорить", turns["n"], 2)
+        check("клиенту сказано стереть вступление", "reset" in seen, True)
+        check("человек видит ответ, а не вступление",
+              answer, "Договоров без движения — 412.")
+    finally:
+        (chat_routes.build_chat_context, chat_routes.llm_stream,
+         chat_routes.llm_probe_tools) = original
+
+
 def websocket(client) -> None:
     """Разговор по WebSocket от начала до конца.
 
@@ -3124,7 +3299,7 @@ def websocket(client) -> None:
     async def fake_context(text, progress=None):
         return "## Метрики\n  всё в порядке", None, 0
 
-    async def fake_stream(messages):
+    async def fake_stream(messages, tool_sink=None):
         for piece in ("Всё ", "в ", "порядке."):
             yield piece
 

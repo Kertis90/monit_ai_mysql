@@ -22,7 +22,8 @@ from agent.db.repositories.users import normalize
 from agent.schemas.api import ChatRequest, FeedbackRequest
 from agent.services import access, jobs
 from agent.services.analysis import system_prompt
-from agent.services.assistant import (build_chat_context, llm_with_tools,
+from agent.services.assistant import (UNFINISHED_NOTE, build_chat_context,
+                                      llm_with_tools, looks_unfinished,
                                       run_tool, sql_from_answer)
 from agent.services.toolcalls import StreamFilter
 from agent.services.intents import detect_chart_intent, detect_export_intent
@@ -148,7 +149,10 @@ async def stream_answer(messages: list, job) -> tuple:
     ни при каком исходе: даже нераспознанный вызов показывать незачем.
     """
     flt = StreamFilter()
-    async for token in llm_stream(messages):
+    # Вызовы штатным полем: раньше они пропадали молча, и в чат попадало
+    # вступление «сейчас посмотрю» без самого ответа
+    native: list = []
+    async for token in llm_stream(messages, native):
         if job.stop_event.is_set():
             break
         visible, reset = flt.feed(token)
@@ -163,7 +167,8 @@ async def stream_answer(messages: list, job) -> tuple:
         await job.emit({"type": "reset"})
     if tail:
         await job.emit({"type": "token", "text": tail})
-    return flt.clean, flt.calls
+    # Разметкой в тексте или штатным полем — для нас это одно и то же
+    return flt.clean, flt.calls + native
 
 
 async def generate(owner: str, thread_id: str, thread_title: str, text: str,
@@ -295,6 +300,26 @@ async def generate(owner: str, thread_id: str, thread_title: str, text: str,
         if not calls:
             calls = sql_from_answer(more, cluster)
             planned = bool(calls)
+    # Ответ мог кончиться вступлением: «сейчас получу то и это:» — и всё.
+    # Просим договорить: данные уже собраны, спрашивать больше нечего.
+    if not job.stop_event.is_set() and looks_unfinished(answer):
+        logger.info("Ответ выглядит вступлением, прошу договорить: %s",
+                    answer[:120])
+        await say("Прошу модель договорить")
+        again = messages + [
+            {"role": "assistant", "content": answer or "(пусто)"},
+            {"role": "user", "content": UNFINISHED_NOTE}]
+        await job.emit({"type": "reset"})
+        shown, answer = answer, ""
+        more, _ = await stream_answer(again, job)
+        if more.strip():
+            answer = more
+        else:
+            # Договорить не вышло — возвращаем то, что было: пустой экран
+            # хуже вступления
+            answer = shown
+            await job.emit({"type": "token", "text": shown})
+
     if job.stop_event.is_set():
         # Прерванный ответ всё равно сохраняем: пользователь его видел и в
         # следующем вопросе может на него сослаться

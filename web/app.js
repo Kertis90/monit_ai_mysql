@@ -3007,6 +3007,9 @@ const App = (() => {
     run_sql:             'SQL-запрос',
     read_logs:           'логи серверов',
     get_alerts:          'история событий',
+    get_schema:          'схема базы',
+    explain_query:       'план запроса',
+    analyse_app_log:     'логи Lanbilling',
   };
 
   function bumpAlertCount() {

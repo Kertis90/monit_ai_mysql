@@ -74,8 +74,51 @@ async def llm_probe_tools() -> bool:
     return TOOLS_SUPPORTED
 
 
-async def llm_stream(messages: list[dict]) -> AsyncGenerator[str, None]:
-    """Стриминг токенов из удалённой LLM (SSE)."""
+def _collect_tool_deltas(parts: dict, deltas: list) -> None:
+    """Собрать вызов инструмента из кусков потока.
+
+    Имя приходит в первом куске, аргументы — по символам в следующих,
+    поэтому склеиваем по номеру вызова, а не по приходу.
+    """
+    for item in deltas or []:
+        try:
+            slot = parts.setdefault(int(item.get("index") or 0),
+                                    {"name": "", "args": ""})
+        except (TypeError, ValueError):
+            continue
+        fn = item.get("function") or {}
+        if fn.get("name"):
+            slot["name"] = str(fn["name"])
+        if fn.get("arguments"):
+            slot["args"] += str(fn["arguments"])
+
+
+def _finish_tool_calls(parts: dict) -> list:
+    """Собранные куски — в вызовы того же вида, что и в разметке."""
+    calls = []
+    for _, slot in sorted(parts.items()):
+        if not slot["name"]:
+            continue
+        try:
+            args = json.loads(slot["args"] or "{}")
+        except ValueError:
+            logger.warning("Аргументы инструмента %s не разобраны: %s",
+                           slot["name"], slot["args"][:200])
+            args = {}
+        calls.append({"name": slot["name"],
+                      "args": args if isinstance(args, dict) else {}})
+    return calls
+
+
+async def llm_stream(messages: list[dict],
+                     tool_sink: Optional[list] = None) -> AsyncGenerator[str, None]:
+    """Стриминг токенов из удалённой LLM (SSE).
+
+    tool_sink — куда сложить вызовы инструментов, если модель попросила их
+    штатным полем, а не текстом. Без этого они пропадали молча: в потоке
+    шёл только `content`, и человек получал вступление «сейчас посмотрю»
+    без самого ответа.
+    """
     headers = {"Content-Type": "application/json", "Authorization": AUTH_HEADER}
     payload = {
         "model":       LLM_MODEL,
@@ -84,6 +127,7 @@ async def llm_stream(messages: list[dict]) -> AsyncGenerator[str, None]:
         "messages":    messages,
         "stream":      True,
     }
+    parts: dict = {}
     try:
         async with httpx.AsyncClient() as client:
             async with client.stream(
@@ -104,6 +148,8 @@ async def llm_stream(messages: list[dict]) -> AsyncGenerator[str, None]:
                     try:
                         chunk = json.loads(data)
                         delta = chunk["choices"][0].get("delta", {})
+                        if delta.get("tool_calls"):
+                            _collect_tool_deltas(parts, delta["tool_calls"])
                         token = delta.get("content", "")
                         if token:
                             yield token
@@ -113,6 +159,11 @@ async def llm_stream(messages: list[dict]) -> AsyncGenerator[str, None]:
         yield f"[Ошибка: не удалось подключиться к LLM {LLM_BASE_URL}]"
     except Exception as e:
         yield f"[Ошибка LLM: {e}]"
+    finally:
+        # finally, а не конец тела: поток могли прервать кнопкой «Остановить»,
+        # но уже собранные вызовы отдать надо
+        if tool_sink is not None:
+            tool_sink.extend(_finish_tool_calls(parts))
 
 
 async def llm_complete(messages: list[dict]) -> str:
