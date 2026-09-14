@@ -59,6 +59,10 @@
     </div>
     <div class="side-footer">
       <button class="ghost-btn" onclick="App.refreshClusters()">↻ Обновить</button>
+      <!-- Версия видна намеренно: по ней сразу понятно, ту ли страницу
+           отдал браузер. Расхождение между сервером и кэшем интерфейса
+           иначе выглядит как необъяснимая поломка -->
+      <div class="side-version" title="Версия агента">{{VERSION}}</div>
     </div>
   </aside>
 

@@ -656,6 +656,11 @@ textarea#input:disabled { opacity: .55; }
 .ask-btn:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); }
 .ask-btn:disabled { opacity: .5; cursor: default; }
 .ask-primary { border-color: var(--accent); color: var(--accent); }
+.ask-hint { margin-top: 8px; font-size: 11px; color: var(--muted); }
+
+/* Версия агента в углу: по ней видно, ту ли страницу отдал браузер */
+.side-version { margin-top: 6px; text-align: center; font-size: 10px;
+                color: var(--muted); opacity: .7; letter-spacing: .02em; }
 
 @keyframes ask-in { from { opacity: 0; transform: translateY(6px); }
                     to   { opacity: 1; transform: none; } }

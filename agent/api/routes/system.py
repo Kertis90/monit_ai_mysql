@@ -215,12 +215,20 @@ def _page(name: str, request: Request,
     if left:
         logger.error("В %s остались незаполненные плейсхолдеры: %s — страница "
                      "работать не будет", name, ", ".join(sorted(set(left))))
-    return HTMLResponse(html)
+
+    # Страницу браузер обязан брать заново. Без этого заголовка он кэширует
+    # её по своему усмотрению — и после обновления агента открывает старую,
+    # со ссылками на старые скрипт и стили. Тогда никакие ухищрения с
+    # версией в адресе не помогают: их просто неоткуда взять.
+    return HTMLResponse(html, headers={
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+        "Pragma": "no-cache",
+        "X-Agent-Version": settings.version})
 
 
 @router.get("/", include_in_schema=False)
 async def index(request: Request):
-    return _page("index.html", request)
+    return _page("index.html", request, {"VERSION": settings.version})
 
 
 @router.get("/login", include_in_schema=False)

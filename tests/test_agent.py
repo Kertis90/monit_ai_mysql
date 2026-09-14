@@ -246,6 +246,7 @@ def application() -> None:
         chat_finishes_thought(c)
         threads(c)
         gui_endpoints(c)
+        page_is_never_stale(c)
         foresight(c)
         knowledge(c)
         ssh_access(c)
@@ -322,6 +323,7 @@ def application() -> None:
         embed_model_discovery()
         tables_picked_by_model()
         settings_reach_the_agent()
+        ask_has_a_way_out()
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -3850,6 +3852,56 @@ def settings_reach_the_agent() -> None:
           'cat > "$AGENT_ENV"' in update, False)
     check("а правит нужные ключи", "set_env LLM_MODEL" in update, True)
     check("и делает копию перед правкой", "AGENT_ENV}.bak" in update, True)
+
+
+def page_is_never_stale(client) -> None:
+    """Браузер не должен показывать вчерашний интерфейс.
+
+    Кэш уже подводил: сервер спрашивал «продолжаем?», а в старом app.js
+    кнопок не было, и ответить было нечем. Версия в адресе скрипта не
+    спасает, если сама страница взята из кэша, — значит запрещать надо
+    прежде всего её.
+    """
+    r = client.get("/")
+    check("страница отдаётся", r.status_code, 200)
+    cache = r.headers.get("cache-control", "")
+    check("страницу кэшировать запрещено", "no-store" in cache, True)
+    check("и версия видна в заголовке ответа",
+          bool(r.headers.get("x-agent-version")), True)
+
+    body = r.text
+    check("в адресе скрипта стоит версия", "static/app.js?v=" in body, True)
+    check("и в адресе стилей тоже", "static/style.css?v=" in body, True)
+    check("версия показана человеку в интерфейсе",
+          "side-version" in body, True)
+    check("плейсхолдер заменён", "{{VERSION}}" not in body, True)
+
+    js = client.get("/static/app.js")
+    check("скрипт отдаётся", js.status_code, 200)
+    check("и его велено перепроверять",
+          "no-cache" in js.headers.get("cache-control", ""), True)
+
+
+def ask_has_a_way_out() -> None:
+    """На вопрос агента можно ответить, что бы ни случилось с кнопками."""
+    js = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
+
+    check("кнопки подставляются, даже если вариантов не пришло",
+          "msg.options && msg.options.length" in js
+          and "Продолжить сбор" in js, True)
+    check("пока висит вопрос, в чат писать можно",
+          "state.asking = true" in js and "$('input').disabled = false" in js,
+          True)
+    check("написанное в чат уходит ответом на вопрос",
+          "if (state.asking) {" in js and "answerAsk(text)" in js, True)
+    check("слова «да» и «продолжай» понимаются",
+          "продолж" in js and "type: 'answer'" in js, True)
+    check("сказано, что будет без ответа",
+          "агент закончит сам" in js, True)
+
+    css = (ROOT / "web" / "style.css").read_text(encoding="utf-8")
+    check("подсказка под вопросом оформлена", ".ask-hint" in css, True)
+    check("и сами кнопки тоже", ".ask-btn" in css, True)
 
 
 def websocket(client) -> None:

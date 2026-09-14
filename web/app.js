@@ -32,6 +32,7 @@ const App = (() => {
     lastQuestion:  '',     // вопрос — сохраняем вместе с оценкой
     pendingCharts: null,   // графики, ждущие конца ответа
     awaitingReply: false,
+    asking:        false,  // висит вопрос агента: написанное — ответ на него
     replyTimer:    null,
     attachedTo:    null,   // к какому разговору уже просились подключиться
     restoring:     false,  // идёт восстановление ленты — не анимируем её
@@ -336,8 +337,16 @@ const App = (() => {
       '<button class="ask-btn' + (i === 0 ? ' ask-primary' : '') +
       '" type="button" data-v="' + esc(o.value) + '">' +
       esc(o.label) + '</button>').join('');
+    // Срок ответа: если не ответить, агент закончит сам. Человек должен
+    // это видеть, иначе кажется, что чат завис навсегда
+    const wait = msg.timeout ? Math.round(msg.timeout / 60 * 10) / 10 : 0;
+    const hint = 'Можно ответить кнопкой или словом в чате: «да» — продолжить, ' +
+                 '«нет» — отвечать по собранному.' +
+                 (wait ? ' Без ответа агент закончит сам примерно через ' +
+                         wait + ' мин.' : '');
     box.innerHTML = '<div class="ask-q">' + esc(msg.question || '') + '</div>' +
-                    '<div class="ask-row">' + opts + '</div>';
+                    '<div class="ask-row">' + opts + '</div>' +
+                    '<div class="ask-hint">' + esc(hint) + '</div>';
 
     box.addEventListener('click', (e) => {
       const b = e.target.closest('.ask-btn');
@@ -352,10 +361,38 @@ const App = (() => {
     });
 
     $('messages').appendChild(box);
+    // Пока висит вопрос, писать в чат можно: это и есть способ ответить,
+    // а заодно выход, если кнопки почему-то не отрисовались
+    state.asking = true;
+    $('input').disabled = false;
+    $('input').focus();
     scrollToBottom(true);      // без ответа работа стоит — вопрос надо видеть
   }
 
+  function lockInputBack() {
+    // Ответ на вопрос дан — дальше идёт обычная генерация, и поле снова
+    // заблокировано до конца ответа
+    if (state.awaitingReply) $('input').disabled = true;
+  }
+
+  function answerAsk(text) {
+    // Ответ словами: «да», «продолжай», «ещё» — продолжаем, всё прочее —
+    // заканчиваем. Человек пишет как привык, а не как удобно программе
+    const low = String(text || '').trim().toLowerCase();
+    const yes = /^(да|ага|угу|давай|продолж|ещ[её]|дальше|конечно|ок|yes|y)/
+                .test(low);
+    if (state.wsReady) {
+      state.ws.send(JSON.stringify({ type: 'answer',
+                                     thread_id: state.threadId,
+                                     value: yes ? 'yes' : 'no' }));
+    }
+    state.asking = false;
+    inlineNote(yes ? 'Ответили: продолжаем' : 'Ответили: хватит собирать');
+  }
+
   function closeAsk(value) {
+    state.asking = false;
+    lockInputBack();
     const box = $('ask-box');
     if (!box) return;
     box.remove();
@@ -841,6 +878,7 @@ const App = (() => {
     clearSteps();
     clearTimeout(state.replyTimer);
     state.awaitingReply = false;
+    state.asking = false;
     $('input').disabled = false;
     $('send-btn').style.display = '';
     $('send-btn').disabled = false;
@@ -867,7 +905,18 @@ const App = (() => {
   function sendMessage() {
     const input = $('input');
     const text  = input.value.trim();
-    if (!text || state.awaitingReply) return;
+    if (!text) return;
+
+    // Висит вопрос агента — написанное и есть ответ на него, а не новый
+    // вопрос. Так можно ответить, даже если кнопки не отрисовались
+    if (state.asking) {
+      input.value = '';
+      autoResize(input);
+      answerAsk(text);
+      lockInputBack();
+      return;
+    }
+    if (state.awaitingReply) return;
 
     if (!state.wsReady) {
       addAssistantMsg('Нет соединения с сервером. Переподключаюсь…');
