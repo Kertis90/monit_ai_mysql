@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Optional
 
 from fastapi import (APIRouter, HTTPException, Request, WebSocket,
@@ -142,6 +143,22 @@ async def chat_compact(client_id: str, session_id: str,
 # Сколько раз подряд разбираем вызовы, написанные текстом. Больше двух —
 # признак того, что модель зациклилась на запросах вместо ответа.
 INLINE_TOOL_ROUNDS = 2
+
+
+# С чего начинается согласие. Человек пишет как привык — «да», «давай»,
+# «продолжай», — а не как удобно программе
+YES_RE = re.compile(
+    r"^\W*(да|ага|угу|давай|продолж|ещ[её]|дальше|конечно|верно|ок|ok|yes|y|\+)",
+    re.I)
+
+
+def means_yes(text: str) -> bool:
+    """Согласие ли это. Всё, что не согласие, — отказ.
+
+    Толковать сомнительное как «нет» безопаснее: отказ заканчивает сбор и
+    даёт ответ по собранному, а согласие тратит запросы к боевой базе.
+    """
+    return bool(YES_RE.match(str(text or "").strip()))
 
 
 async def stream_answer(messages: list, job) -> tuple:
@@ -533,6 +550,17 @@ async def websocket_chat(ws: WebSocket):
                 continue
 
             if not text:
+                continue
+
+            # Пока висит вопрос агента, написанное в чат — ответ на него, а
+            # не новый вопрос. Разбирается на сервере нарочно: тогда это
+            # работает с любым интерфейсом, даже со старым, взятым браузером
+            # из кэша, где кнопок под вопросом может не оказаться вовсе.
+            if jobs.waiting(thread_id):
+                said_yes = means_yes(text)
+                jobs.reply(thread_id, "yes" if said_yes else "no")
+                logger.info("Ответ на вопрос агента словами: «%s» -> %s",
+                            text[:40], "продолжаем" if said_yes else "хватит")
                 continue
 
             # В каком разговоре отвечаем. Клиент присылает выбранный; если не

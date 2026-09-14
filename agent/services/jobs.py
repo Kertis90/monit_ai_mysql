@@ -183,6 +183,12 @@ async def start(thread_id: str, question: str,
     return job
 
 
+def waiting(thread_id: str) -> bool:
+    """Висит ли в этом разговоре вопрос к человеку."""
+    job = running(thread_id)
+    return bool(job and job.pending is not None and not job.pending.done())
+
+
 def reply(thread_id: str, value: str) -> bool:
     """Передать ответ человека в идущую генерацию."""
     job = running(thread_id)

@@ -252,6 +252,7 @@ def application() -> None:
         ssh_access(c)
         background_answer(c)
         switching_threads(c)
+        typed_answer_reaches_the_job(c)
         mysql_hints()
         tool_calls_in_text()
         log_bisect()
@@ -324,6 +325,7 @@ def application() -> None:
         tables_picked_by_model()
         settings_reach_the_agent()
         ask_has_a_way_out()
+        answer_in_words()
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -3917,6 +3919,98 @@ def ask_has_a_way_out() -> None:
     check("и говорит об этом человеку",
           "stale-banner" in js and "Обновить страницу" in js, True)
     check("полоса о расхождении оформлена", ".stale-banner" in css, True)
+
+
+def answer_in_words() -> None:
+    """Согласие узнаётся так, как его пишут люди."""
+    from agent.api.routes.chat import means_yes
+
+    for word in ("да", "Да.", "ДАВАЙ", "продолжай", "ещё", "еще раз",
+                 "конечно", "ок", "ok", "yes", "+"):
+        check("«%s» — согласие" % word, means_yes(word), True)
+    for word in ("нет", "хватит", "стоп", "не надо",
+                 "отвечай по тому, что есть", "", "а что с диском?"):
+        check("«%s» — не согласие" % word, means_yes(word), False)
+
+
+def typed_answer_reaches_the_job(client) -> None:
+    """Написанное в чат, пока висит вопрос, отвечает на вопрос.
+
+    Разбирается на сервере нарочно: тогда это работает с любым
+    интерфейсом — в том числе со старым, который браузер взял из кэша и в
+    котором кнопок под вопросом может не оказаться вовсе.
+    """
+    from agent.api.routes import chat as chat_routes
+
+    async def fake_ctx(text, progress=None):
+        return "", None, 0
+
+    async def yes_tools():
+        return True
+
+    asked = {"answer": None}
+
+    async def fake_with_tools(messages, ask=None):
+        # Порция инструментов кончилась — спрашиваем человека и ждём
+        if ask is not None:
+            asked["answer"] = await ask(4, 4)
+        return messages, ["get_schema"]
+
+    async def fake_stream(messages, tool_sink=None):
+        yield "Готово: 412 договоров."
+
+    original = (chat_routes.build_chat_context, chat_routes.llm_stream,
+                chat_routes.llm_probe_tools, chat_routes.llm_with_tools)
+    chat_routes.build_chat_context = fake_ctx
+    chat_routes.llm_stream = fake_stream
+    chat_routes.llm_probe_tools = yes_tools
+    chat_routes.llm_with_tools = fake_with_tools
+    try:
+        thread = client.post("/chat/threads?title=Словами").json()["id"]
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({"type": "message", "text": "сколько договоров",
+                          "client_id": "web-8", "thread_id": thread})
+
+            # Дожидаемся вопроса агента
+            question = None
+            for _ in range(10):
+                msg = ws.receive_json()
+                if msg.get("type") == "ask":
+                    question = msg
+                    break
+            check("агент спросил, продолжать ли", bool(question), True)
+            check("в вопросе названо, сколько уже сделано",
+                  "4" in question.get("question", ""), True)
+            check("и предложены варианты", len(question.get("options") or []), 2)
+
+            # Отвечаем как обычным сообщением — так делает старый интерфейс
+            ws.send_json({"type": "message", "text": "да",
+                          "client_id": "web-8", "thread_id": thread})
+
+            seen, answer = [], ""
+            for _ in range(20):
+                msg = ws.receive_json()
+                seen.append(msg.get("type"))
+                if msg.get("type") == "token":
+                    answer += msg.get("text", "")
+                if msg.get("type") == "done":
+                    break
+            check("вопрос закрыт", "asked" in seen, True)
+            check("слово «да» понято как согласие", asked["answer"], True)
+            check("ответ всё-таки пришёл", "412" in answer, True)
+
+        # Слово-ответ не должно превратиться во второй вопрос в истории
+        for _ in range(20):
+            if client.get("/chat/history?thread=%s" % thread).json()["total"] >= 2:
+                break
+            time.sleep(0.1)
+        items = client.get("/chat/history?thread=%s" % thread).json()["items"]
+        check("в истории один вопрос и один ответ", len(items), 2)
+        check("«да» отдельным вопросом не записалось",
+              any(m["content"].strip() == "да" for m in items), False)
+    finally:
+        (chat_routes.build_chat_context, chat_routes.llm_stream,
+         chat_routes.llm_probe_tools, chat_routes.llm_with_tools) = original
 
 
 def websocket(client) -> None:
