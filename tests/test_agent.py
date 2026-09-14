@@ -312,6 +312,7 @@ def application() -> None:
         schema_comments_collected()
         schema_mentioned()
         schema_in_chat_context()
+        schema_without_a_city()
         schema_notes_via_show()
         sql_limit_over_ssh()
         thinking_hidden()
@@ -320,6 +321,7 @@ def application() -> None:
         preamble_is_not_an_answer()
         rounds_end_with_answer()
         tool_budget_is_a_question()
+        repeat_does_not_end_collection()
         job_asks_and_waits()
         vector_math()
         schema_links()
@@ -4189,6 +4191,131 @@ def css_names_are_unique() -> None:
           "opacity: 0" in block.replace("opacity: 0;", "").replace(
               "opacity: 0,", ""), False)
     check("и не скрываются вовсе", "display: none" in block, False)
+
+
+def repeat_does_not_end_collection() -> None:
+    """Повтор вызова не должен обрывать сбор.
+
+    Защита от хождения по кругу была слишком строгой: первый же
+    повторный вызов заканчивал сбор. Модель нередко перезапрашивает то
+    же самое, а следующим ходом просит новое — и оставалась с одним
+    инструментом, после чего отвечала наугад, то есть выдумывала.
+    """
+    from agent.services import assistant
+
+    plan = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            name, args = plan.pop(0) if plan else (None, None)
+            calls = ([{"id": "c", "function": {"name": name,
+                                               "arguments": args}}]
+                     if name else [])
+            return {"choices": [{"message": {"role": "assistant",
+                                             "content": "", "tool_calls": calls}}]}
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, *a, **kw):
+            return FakeResponse()
+
+    done = []
+
+    async def fake_tool(name, args):
+        done.append((name, args.get("table") or args.get("cluster")))
+        return "данные"
+
+    originals = (assistant.httpx.AsyncClient, assistant.run_tool,
+                 assistant.LLM_TOOL_ROUNDS)
+    assistant.httpx.AsyncClient = FakeClient
+    assistant.run_tool = fake_tool
+    assistant.LLM_TOOL_ROUNDS = 0          # предела нет, важен только повтор
+    try:
+        # Модель перезапросила то же самое, а потом попросила новое
+        plan[:] = [("get_schema", '{"cluster": "k"}'),
+                   ("get_schema", '{"cluster": "k"}'),
+                   ("get_schema", '{"cluster": "k", "table": "agreements"}'),
+                   (None, None)]
+        _convo, used = asyncio.run(assistant.llm_with_tools(
+            [{"role": "user", "content": "напиши запрос"}]))
+        check("повтор не оборвал сбор", len(used), 2)
+        check("после повтора модель дошла до нужной таблицы",
+              done[-1][1], "agreements")
+
+        # А вот топтание на месте закончиться должно
+        done.clear()
+        plan[:] = [("get_schema", '{"cluster": "k"}')] * 6 + [(None, None)]
+        _convo, used = asyncio.run(assistant.llm_with_tools(
+            [{"role": "user", "content": "напиши запрос"}]))
+        check("зацикливание остановлено", len(used), 1)
+        check("и базу дёргали ровно один раз", len(done), 1)
+    finally:
+        (assistant.httpx.AsyncClient, assistant.run_tool,
+         assistant.LLM_TOOL_ROUNDS) = originals
+
+
+def schema_without_a_city() -> None:
+    """Вопрос про данные без названия города всё равно получает схему.
+
+    «Напиши запрос по договорам» — вопрос к схеме, а не к кластеру. Города
+    в нём нет, и раньше в контекст уходили только описания найденных
+    таблиц, а общий список — нет. Не увидев ни одного настоящего имени,
+    модель сочиняла их.
+    """
+    from agent.services import assistant, schema
+
+    snapshot = {
+        "taken_at": "2026-09-14T06:00:00",
+        "databases": [{"db": "billing", "tables": 1, "size_mb": 10,
+                       "rows_est": 100}],
+        "tables": {"billing.agreements": {
+            "db": "billing", "table": "agreements", "size_mb": 10,
+            "note": "Договоры абонентов", "kind": "таблица",
+            "columns": [{"col": "uid", "type": "int(11)", "note": "Абонент"}],
+            "indexes": [], "links": []}},
+        "cut": [],
+    }
+
+    async def fake_load(name):
+        return snapshot
+
+    async def no_metrics(cluster):
+        # Метрик в проверке нет, важна только схема
+        return {"cluster_label": cluster["label"], "primary": {},
+                "replica": {}}
+
+    originals = (schema.load, assistant.collect_current)
+    schema.load = fake_load
+    assistant.collect_current = no_metrics
+    try:
+        text, cluster, _hours = asyncio.run(assistant.build_chat_context(
+            "напиши запрос по договорам"))
+    finally:
+        schema.load, assistant.collect_current = originals
+
+    check("город не назван — кластера нет", cluster is None, True)
+    check("общий список таблиц всё равно приложен",
+          "## Что есть в базе" in text, True)
+    check("и сказано, с какого кластера он снят",
+          "Схема ниже снята с кластера" in text, True)
+    check("настоящее имя таблицы в контексте есть",
+          "agreements" in text, True)
+    check("описание нужной таблицы тоже приложено",
+          "## billing.agreements" in text, True)
+    check("со столбцами, а не только с именем", "uid" in text, True)
 
 
 def websocket(client) -> None:
