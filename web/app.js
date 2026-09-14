@@ -326,7 +326,13 @@ const App = (() => {
     box.className = 'ask-box';
     box.id = 'ask-box';
 
-    const opts = (msg.options || []).map((o, i) =>
+    // Если вариантов не пришло, подставляем свои: вопрос без кнопок —
+    // тупик, человек не может ни ответить, ни писать в чат
+    const choices = (msg.options && msg.options.length) ? msg.options : [
+      { value: 'yes', label: 'Продолжить сбор' },
+      { value: 'no',  label: 'Ответить по тому, что есть' },
+    ];
+    const opts = choices.map((o, i) =>
       '<button class="ask-btn' + (i === 0 ? ' ask-primary' : '') +
       '" type="button" data-v="' + esc(o.value) + '">' +
       esc(o.label) + '</button>').join('');
@@ -346,7 +352,7 @@ const App = (() => {
     });
 
     $('messages').appendChild(box);
-    scrollToBottom();
+    scrollToBottom(true);      // без ответа работа стоит — вопрос надо видеть
   }
 
   function closeAsk(value) {
@@ -463,6 +469,12 @@ const App = (() => {
 
   async function switchThread(id) {
     if (!id || id === state.threadId) return;
+    // Состояние стрима принадлежит ПРЕЖНЕМУ разговору: его сообщение мы
+    // сейчас сотрём, а флаг ожидания остался бы поднятым — и тогда
+    // возврат обратно показывал бы пустоту (событие resume отбрасывается,
+    // когда агент думает, что ответ уже идёт), а поле ввода в новом чате
+    // осталось бы заблокированным.
+    forgetStream();
     state.threadId = id;
     state.attachedTo = null;
     $('messages').innerHTML = '';
@@ -470,6 +482,15 @@ const App = (() => {
     renderThreads();
     // В этом разговоре ответ может считаться прямо сейчас
     attachToThread();
+  }
+
+  function forgetStream() {
+    // Именно забыть, а не завершить: ответ в прежнем чате продолжает
+    // считаться на сервере, и вернувшись, человек увидит его целиком
+    state.streamingEl = null;
+    state.streamBuf   = '';
+    state.pendingCharts = null;
+    unlockInput();
   }
 
   async function newThread() {
@@ -526,7 +547,7 @@ const App = (() => {
       div.style.cssText = 'text-align:center;padding:8px 0;font-size:12px';
       div.textContent = '— продолжение сохранённой переписки —';
       $('messages').appendChild(div);
-      scrollToBottom();
+      scrollToBottom(true);
     } catch (e) {
       console.warn('История чата недоступна:', e);
     } finally {
@@ -903,14 +924,28 @@ const App = (() => {
       `<div class="msg-body"></div>`;
     div.querySelector('.msg-body').textContent = text;
     wrap.appendChild(div);
-    scrollToBottom();
+    // Свой вопрос доезжает всегда, чужой ответ — только если человек и так
+    // внизу: иначе прокрутка отбирается у того, кто читает написанное выше
+    scrollToBottom(role === 'user' && !state.restoring);
     return div.querySelector('.msg-body');
   }
 
   function addAssistantMsg(text) { return addMsg('assistant', text, 'AI Agent'); }
 
-  function scrollToBottom() {
+  // Насколько близко к низу человек должен быть, чтобы лента доезжала
+  // сама. Две-три строки: пролистал выше — значит читает, а не следит
+  const STICK_SLACK = 80;
+
+  function atBottom() {
     const wrap = $('messages');
+    return wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight <= STICK_SLACK;
+  }
+
+  function scrollToBottom(force) {
+    const wrap = $('messages');
+    // Без этого условия лента дёргала вниз на каждом токене, и прочитать
+    // написанное выше было нельзя: пока идёт ответ, прокрутка отбирается
+    if (!force && !atBottom()) return;
     wrap.scrollTop = wrap.scrollHeight;
   }
 

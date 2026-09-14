@@ -123,6 +123,26 @@ async def lifespan(app: FastAPI):
     logger.info("Агент остановлен")
 
 
+class FreshStatic(StaticFiles):
+    """Статика, которую браузер обязан перепроверять.
+
+    StaticFiles не ставит Cache-Control вовсе, а без него браузер вправе
+    кэшировать файл по своему усмотрению — обычно на часы. После обновления
+    агента это выглядит дико: сервер новый, интерфейс старый. Так и вышло:
+    агент спрашивал «продолжаем?», а кнопок в старом app.js не было, и
+    ответить было нечем.
+
+    no-cache не запрещает кэш, а требует спросить сервер: не изменилось —
+    придёт 304 в несколько байт. Для внутреннего инструмента это дёшево, а
+    расхождения между версиями исключает.
+    """
+
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return response
+
+
 def create_app() -> FastAPI:
     app = FastAPI(
         title="MySQL AI Monitoring Agent",
@@ -197,7 +217,8 @@ def create_app() -> FastAPI:
 
     static_dir = Path(settings.web_dir)
     if static_dir.exists():
-        app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+        app.mount("/static", FreshStatic(directory=str(static_dir)),
+                  name="static")
     else:
         logger.warning("Каталог интерфейса %s не найден", static_dir)
     return app

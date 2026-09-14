@@ -250,6 +250,7 @@ def application() -> None:
         knowledge(c)
         ssh_access(c)
         background_answer(c)
+        switching_threads(c)
         mysql_hints()
         tool_calls_in_text()
         log_bisect()
@@ -292,6 +293,7 @@ def application() -> None:
         log_window()
         schema_snapshot()
         schema_storage(c)
+        schema_semantic(c)
         running_plans()
         list_paging()
         themes()
@@ -315,6 +317,8 @@ def application() -> None:
         rounds_end_with_answer()
         tool_budget_is_a_question()
         job_asks_and_waits()
+        vector_math()
+        schema_links()
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -3450,6 +3454,255 @@ def job_asks_and_waits() -> None:
     check("ответ без вопроса отклонён", jobs.Job("t-4", "в").reply("yes"), False)
     check("ответ неизвестному разговору отклонён",
           jobs.reply("нет-такого", "yes"), False)
+
+
+def vector_math() -> None:
+    """Близость по смыслу: нормировка, скалярное произведение, порог."""
+    from agent.services import embed
+
+    unit = embed.normalize([3.0, 4.0])
+    check("вектор приведён к единичной длине", unit, [0.6, 0.8])
+    check("нулевой вектор отброшен", embed.normalize([0, 0]), [])
+    check("мусор вместо чисел не роняет", embed.normalize(["а", "б"]), [])
+
+    check("одинаковые векторы — близость единица",
+          round(embed.similarity([0.6, 0.8], [0.6, 0.8]), 3), 1.0)
+    check("перпендикулярные — ноль",
+          round(embed.similarity([1.0, 0.0], [0.0, 1.0]), 3), 0.0)
+    check("разная длина векторов — не сравниваем",
+          embed.similarity([1.0], [1.0, 0.0]), 0.0)
+
+    index = {"billing.vgroups": [1.0, 0.0],
+             "billing.payments": [0.0, 1.0],
+             "billing.logs": [0.7071, 0.7071]}
+    near = embed.nearest([1.0, 0.0], index, limit=2)
+    check("ближайшее идёт первым", near[0][0], "billing.vgroups")
+    check("и близость возвращается", near[0][1], 1.0)
+    check("предел соблюдён", len(near), 2)
+
+    # Порог обязателен: иначе на любой вопрос найдётся «самое похожее»
+    check("непохожее не возвращается",
+          embed.nearest([0.0, -1.0], index), [])
+    check("без вопроса ничего", embed.nearest([], index), [])
+    check("без индекса ничего", embed.nearest([1.0, 0.0], {}), [])
+
+
+def schema_links() -> None:
+    """Связи между таблицами: объявленные и предположенные."""
+    from agent.services import schema
+
+    # Внешние ключи есть — догадки не нужны
+    real = {"tables": {
+        "billing.payments": {"db": "billing", "table": "payments",
+                             "columns": [], "links": [
+                                 {"col": "uid", "ref": "billing.vgroups",
+                                  "ref_col": "uid", "kind": "внешний ключ"}]},
+        "billing.vgroups": {"db": "billing", "table": "vgroups",
+                            "columns": [], "links": []}}}
+    check("при живых ключах ничего не выдумываем", schema._guess_links(real), 0)
+    check("обратная связь видна",
+          schema.incoming(real, "billing.vgroups")[0]["from"],
+          "billing.payments")
+
+    # Ключей нет — предполагаем по именам столбцов
+    guess = {"tables": {
+        "billing.vgroups": {
+            "db": "billing", "table": "vgroups", "size_mb": 10, "links": [],
+            "columns": [{"col": "uid", "ckey": "PRI"},
+                        {"col": "login", "ckey": ""}]},
+        "billing.payments": {
+            "db": "billing", "table": "payments", "size_mb": 5, "links": [],
+            "columns": [{"col": "id", "ckey": "PRI"},
+                        {"col": "uid", "ckey": "MUL"}]},
+        "billing.notes": {
+            "db": "billing", "table": "notes", "size_mb": 1, "links": [],
+            "columns": [{"col": "id", "ckey": "PRI"},
+                        {"col": "text", "ckey": ""}]}}}
+    added = schema._guess_links(guess)
+    check("связь предположена", added, 1)
+    link = guess["tables"]["billing.payments"]["links"][0]
+    check("указано, на что ссылается", link["ref"], "billing.vgroups")
+    check("и честно помечено догадкой", link["kind"], "по имени столбца")
+    check("по столбцу id связей не выдумано",
+          guess["tables"]["billing.notes"]["links"], [])
+
+    # В описании таблицы обе стороны связи
+    text = schema.fmt_describe(schema.describe(guess, "billing.vgroups"))
+    check("сказано, кто ссылается на таблицу",
+          "billing.payments" in text and "На неё ссылаются" in text, True)
+    out = schema.fmt_describe(schema.describe(guess, "billing.payments"))
+    check("и на что ссылается сама",
+          "Ссылается на:" in out and "billing.vgroups" in out, True)
+
+
+def schema_semantic(client) -> None:
+    """Поиск по смыслу находит то, что не совпало ни одной буквой."""
+    from agent.services import embed, schema
+
+    snapshot = {"taken_at": "2026-09-14T06:00:00",
+                "databases": [{"db": "billing", "tables": 2, "size_mb": 10,
+                               "rows_est": 100}],
+                "tables": {
+                    "billing.vgroups": {
+                        "db": "billing", "table": "vgroups", "size_mb": 10,
+                        "note": "Абоненты", "columns": [
+                            {"col": "login", "type": "varchar(64)",
+                             "note": "Логин для входа"}],
+                        "indexes": [], "links": []},
+                    "billing.logs": {
+                        "db": "billing", "table": "logs", "size_mb": 1,
+                        "note": "Журнал событий", "columns": [],
+                        "indexes": [], "links": []}},
+                "cut": []}
+
+    # Документ для векторизации должен нести смысл, а не одно имя
+    doc = schema.doc_for(snapshot["tables"]["billing.vgroups"])
+    check("в документ попали имя, комментарий и столбцы",
+          "vgroups" in doc and "Абоненты" in doc and "Логин для входа" in doc,
+          True)
+
+    # Вместо эндпоинта — простая подстановка: «учётные записи» ближе к
+    # абонентам, чем к журналу
+    def fake_vector(text):
+        low = text.lower()
+        people = 1.0 if ("абонент" in low or "учётн" in low
+                         or "учетн" in low or "логин" in low) else 0.0
+        events = 1.0 if ("журнал" in low or "событ" in low) else 0.0
+        return embed.normalize([people, events]) or [0.0, 0.0]
+
+    async def fake_encode(texts):
+        return [fake_vector(t) for t in texts]
+
+    async def yes():
+        return True
+
+    originals = (embed.encode, embed.probe, schema.embed if hasattr(
+        schema, "embed") else None)
+    embed.encode, embed.probe = fake_encode, yes
+    try:
+        asyncio.run(schema.save("kemerovo", snapshot))
+        built = asyncio.run(schema.build_index("kemerovo", snapshot))
+        check("индекс построен на все таблицы", built["items"], 2)
+
+        stored = asyncio.run(schema.load_index("kemerovo"))
+        check("индекс прочитался", len(stored["index"]), 2)
+        check("и помнит модель", bool(stored["model"]), True)
+
+        near = asyncio.run(schema.search_semantic("kemerovo",
+                                                  "покажи учётные записи"))
+        check("«учётные записи» нашли таблицу «Абоненты»",
+              near[0][0], "billing.vgroups")
+        check("журнал не подмешался", len(near), 1)
+
+        check("вопрос не про данные ничего не находит",
+              asyncio.run(schema.search_semantic("kemerovo", "как дела")), [])
+        check("для кластера без индекса пусто",
+              asyncio.run(schema.search_semantic("novosibirsk", "абоненты")),
+              [])
+
+        # Найденное по смыслу подаётся с оговоркой: это догадка
+        text = schema.fmt_semantic(snapshot, "учётные записи", near)
+        check("сказано, что искали по смыслу",
+              "по смыслу" in text, True)
+        check("и предложено проверить",
+              "Проверь, та ли это таблица" in text, True)
+        check("близость показана", "близость 1.00" in text, True)
+    finally:
+        embed.encode, embed.probe = originals[0], originals[1]
+
+    # Эндпоинт векторов не отвечает — работаем без индекса, не падая
+    async def no_vectors():
+        return False
+
+    embed.probe = no_vectors
+    try:
+        check("без эндпоинта индекс не строится",
+              asyncio.run(schema.build_index("vladivostok", snapshot)), {})
+    finally:
+        embed.probe = originals[1]
+
+
+def switching_threads(client) -> None:
+    """Ушёл в другой чат и вернулся — ответ на месте.
+
+    Сокет раньше висел внутри пересказа одного разговора и не слышал
+    ничего: человек переключался на другой чат, возвращался, а его просьба
+    подключиться обратно всё ещё лежала в очереди — и вместо ответа он
+    видел пустоту.
+    """
+    from agent.api.routes import chat as chat_routes
+    from agent.services import jobs
+
+    go = {"on": False}
+
+    async def fake_ctx(text, progress=None):
+        return "", None, 0
+
+    async def fake_stream(messages, tool_sink=None):
+        yield "начало "
+        for _ in range(80):
+            if go["on"]:
+                break
+            await asyncio.sleep(0.05)
+        yield "и конец"
+
+    async def no_tools():
+        return False
+
+    original = (chat_routes.build_chat_context, chat_routes.llm_stream,
+                chat_routes.llm_probe_tools)
+    chat_routes.build_chat_context = fake_ctx
+    chat_routes.llm_stream = fake_stream
+    chat_routes.llm_probe_tools = no_tools
+    try:
+        first = client.post("/chat/threads?title=Первый").json()["id"]
+        second = client.post("/chat/threads?title=Второй").json()["id"]
+
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({"type": "message", "text": "долгий вопрос",
+                          "client_id": "web-7", "thread_id": first})
+            kinds = []
+            for _ in range(4):
+                kinds.append(ws.receive_json().get("type"))
+                if "token" in kinds:
+                    break
+            check("ответ в первом чате пошёл", "token" in kinds, True)
+
+            # Ушли в другой чат: там ничего не считается
+            ws.send_json({"type": "attach", "thread_id": second,
+                          "client_id": "web-7"})
+
+            # И сразу вернулись обратно. Раньше эта просьба лежала в
+            # очереди до конца ответа, и человек видел пустой чат
+            ws.send_json({"type": "attach", "thread_id": first,
+                          "client_id": "web-7"})
+
+            seen, answer = [], ""
+            go["on"] = True
+            for _ in range(20):
+                msg = ws.receive_json()
+                seen.append(msg.get("type"))
+                if msg.get("type") == "token":
+                    answer += msg.get("text", "")
+                if msg.get("type") == "done":
+                    break
+            check("возврат распознан", "resume" in seen, True)
+            check("накопленное отдано заново",
+                  answer.startswith("начало"), True)
+            check("и ответ дописан", answer.endswith("и конец"), True)
+
+        for _ in range(20):
+            if client.get("/chat/history?thread=%s" % first).json()["total"] >= 2:
+                break
+            time.sleep(0.1)
+        check("ответ сохранён в свой чат",
+              client.get("/chat/history?thread=%s" % first).json()["total"], 2)
+        check("в чужой чат ничего не попало",
+              client.get("/chat/history?thread=%s" % second).json()["total"], 0)
+        check("задача завершена", jobs.running(first) is None, True)
+    finally:
+        (chat_routes.build_chat_context, chat_routes.llm_stream,
+         chat_routes.llm_probe_tools) = original
 
 
 def websocket(client) -> None:

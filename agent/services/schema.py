@@ -27,7 +27,7 @@ from typing import Optional
 from agent.core.jsonsafe import name_of, sanitize
 from agent.core.words import count_of, plural
 from agent.db.base import session_scope
-from agent.db.models import SchemaSnapshot, to_iso
+from agent.db.models import SchemaSnapshot, SchemaVectors, to_iso
 from agent.services.mysql import cluster_db_creds, sql_execute
 from sqlalchemy import select
 
@@ -166,7 +166,7 @@ async def collect(cluster: dict, host: Optional[str] = None) -> dict:
         detailed += len(take)
         wanted = ", ".join(_quote(t["tbl"]) for t in take if t.get("tbl"))
 
-        columns, indexes = {}, {}
+        columns, indexes, links = {}, {}, {}
         if wanted:
             cols = await sql_execute(cluster, """
                 SELECT TABLE_NAME AS tbl, COLUMN_NAME AS col,
@@ -204,6 +204,25 @@ async def collect(cluster: dict, host: Optional[str] = None) -> dict:
                     {k: row[k] for k in ("idx", "cols", "non_unique",
                                          "cardinality") if k in row})
 
+            # Связи между таблицами: без них запрос с JOIN — гадание
+            keys = await sql_execute(cluster, """
+                SELECT TABLE_NAME AS tbl, COLUMN_NAME AS col,
+                       REFERENCED_TABLE_SCHEMA AS ref_db,
+                       REFERENCED_TABLE_NAME AS ref_tbl,
+                       REFERENCED_COLUMN_NAME AS ref_col
+                  FROM information_schema.KEY_COLUMN_USAGE
+                 WHERE TABLE_SCHEMA = %s AND TABLE_NAME IN (%s)
+                   AND REFERENCED_TABLE_NAME IS NOT NULL
+                 ORDER BY TABLE_NAME"""
+                % (_quote(name), wanted), host, 5000)
+            for row in _rows(keys):
+                links.setdefault(row["tbl"], []).append({
+                    "col": row.get("col"),
+                    "ref": "%s.%s" % (row.get("ref_db") or name,
+                                      row.get("ref_tbl")),
+                    "ref_col": row.get("ref_col"),
+                    "kind": "внешний ключ"})
+
         for t in rows:
             key = "%s.%s" % (name, t.get("tbl"))
             snapshot["tables"][key] = {
@@ -213,7 +232,17 @@ async def collect(cluster: dict, host: Optional[str] = None) -> dict:
                 "note": clean_comment(t.get("note")),
                 "columns": columns.get(t.get("tbl"), []),
                 "indexes": indexes.get(t.get("tbl"), []),
+                "links": links.get(t.get("tbl"), []),
             }
+
+    # Внешних ключей может не быть вовсе — на MyISAM их не бывает, да и на
+    # InnoDB их часто не заводят. Тогда связи предполагаем по именам, но
+    # честно помечаем: это догадка, а не то, что объявлено в базе
+    guessed = _guess_links(snapshot)
+    if guessed:
+        snapshot["cut"].append(
+            "внешних ключей в базе нет; %d связей предположены по именам "
+            "столбцов и помечены как догадка" % guessed)
 
     source = "information_schema"
     if snapshot["tables"] and not any(_count_notes(snapshot)):
@@ -235,6 +264,66 @@ async def collect(cluster: dict, host: Optional[str] = None) -> dict:
             "для остальных известны только имена и размеры" % detailed)
     snapshot["host"] = dbs.get("host", "")
     return snapshot
+
+
+# Столбец короче этого в догадках о связях бесполезен: «id» есть везде
+MEANINGFUL_KEY = 3
+
+
+def _guess_links(snapshot: dict) -> int:
+    """Связи по именам столбцов, когда внешних ключей в базе нет.
+
+    Правило простое: столбец называется так же, как первичный ключ другой
+    таблицы, — вероятно, он на неё и ссылается. Имена вроде «id» из
+    рассмотрения выкинуты: они есть везде и связали бы всё со всем.
+
+    Догадку помечаем отдельно от объявленной связи. Модель должна видеть
+    разницу: по внешнему ключу JOIN писать можно смело, по догадке —
+    проверив.
+    """
+    tables = snapshot.get("tables") or {}
+    if any(t.get("links") for t in tables.values()):
+        return 0          # настоящие ключи есть, догадки не нужны
+
+    # Чем является первичный ключ каждой таблицы
+    owners: dict = {}
+    for key, table in tables.items():
+        primary = [c.get("col") for c in (table.get("columns") or [])
+                   if str(c.get("ckey")) == "PRI"]
+        if len(primary) != 1:
+            continue      # составной ключ по имени столбца не угадать
+        name = str(primary[0] or "").lower()
+        if len(name) < MEANINGFUL_KEY or name in ("id", "pk", "num"):
+            continue
+        owners.setdefault(name, []).append(key)
+
+    added = 0
+    for key, table in tables.items():
+        for col in table.get("columns") or []:
+            name = str(col.get("col") or "").lower()
+            found = owners.get(name) or []
+            # Ссылается ровно на одну таблицу, и не сама на себя
+            if len(found) != 1 or found[0] == key:
+                continue
+            table.setdefault("links", []).append({
+                "col": col.get("col"), "ref": found[0],
+                "ref_col": col.get("col"), "kind": "по имени столбца"})
+            added += 1
+    return added
+
+
+def incoming(snapshot: dict, table_key: str) -> list:
+    """Кто ссылается на эту таблицу. Для JOIN нужно обе стороны."""
+    out = []
+    for key, table in (snapshot.get("tables") or {}).items():
+        if key == table_key:
+            continue
+        for link in table.get("links") or []:
+            if link.get("ref") == table_key:
+                out.append({"from": key, "col": link.get("col"),
+                            "ref_col": link.get("ref_col"),
+                            "kind": link.get("kind")})
+    return out
 
 
 def _count_notes(snapshot: dict) -> tuple:
@@ -349,6 +438,119 @@ async def load(cluster_name: str) -> dict:
     return data
 
 
+# ── Смысловой индекс ─────────────────────────────────────────────────────
+
+# Индекс читается редко, но целиком и весит мегабайты. Держим разобранным
+# в памяти процесса, ключ — время съёмки: пересняли схему, кэш протух сам
+_INDEX_CACHE: dict = {}
+
+
+def doc_for(table: dict) -> str:
+    """Текст таблицы для векторизации.
+
+    Кладём в один документ имя, комментарий и столбцы с их комментариями:
+    смысл таблицы складывается из всего сразу. «vgroups» не говорит ничего,
+    «vgroups, Абоненты, столбцы: login (логин), passwd (пароль)» говорит
+    достаточно, чтобы найтись по запросу «учётные записи».
+    """
+    parts = ["%s.%s" % (table.get("db"), table.get("table"))]
+    if table.get("note"):
+        parts.append(str(table["note"]))
+
+    fields = []
+    for col in (table.get("columns") or [])[:40]:
+        name = str(col.get("col") or "")
+        note = str(col.get("note") or "")
+        fields.append("%s (%s)" % (name, note) if note else name)
+    if fields:
+        parts.append("столбцы: " + ", ".join(fields))
+    return ". ".join(parts)[:2000]
+
+
+async def build_index(cluster_name: str, snapshot: dict) -> dict:
+    """Построить смысловой индекс по снимку и сохранить.
+
+    Зовётся один раз вместе со съёмкой схемы. Нет эндпоинта векторов —
+    возвращаем пусто и работаем по словам: это не ошибка, а другая
+    установка.
+    """
+    from agent.services import embed
+
+    tables = snapshot.get("tables") or {}
+    if not tables or not await embed.probe():
+        return {}
+
+    keys = list(tables)
+    vectors = await embed.encode([doc_for(tables[k]) for k in keys])
+    if not vectors:
+        logger.info("Смысловой индекс %s не построен: векторов нет",
+                    cluster_name)
+        return {}
+
+    index = {k: v for k, v in zip(keys, vectors) if v}
+    payload = json.dumps(index, ensure_ascii=False)
+    taken_at = snapshot.get("taken_at") or to_iso()
+    async with session_scope() as session:
+        row = (await session.execute(
+            select(SchemaVectors).where(
+                SchemaVectors.cluster == cluster_name))).scalar_one_or_none()
+        if row is None:
+            session.add(SchemaVectors(cluster=cluster_name, taken_at=taken_at,
+                                      model=embed.EMBED_MODEL,
+                                      items=len(index), payload=payload))
+        else:
+            row.taken_at, row.model = taken_at, embed.EMBED_MODEL
+            row.items, row.payload = len(index), payload
+
+    _INDEX_CACHE.pop(cluster_name, None)
+    logger.info("Смысловой индекс %s: %d таблиц, модель %s",
+                cluster_name, len(index), embed.EMBED_MODEL)
+    return {"items": len(index), "model": embed.EMBED_MODEL}
+
+
+async def load_index(cluster_name: str) -> dict:
+    """Индекс из хранилища. Пусто — не строили или строить было нечем."""
+    async with session_scope() as session:
+        row = (await session.execute(
+            select(SchemaVectors).where(
+                SchemaVectors.cluster == cluster_name))).scalar_one_or_none()
+    if row is None:
+        return {}
+
+    cached = _INDEX_CACHE.get(cluster_name)
+    if cached and cached.get("taken_at") == row.taken_at:
+        return cached
+    try:
+        index = json.loads(row.payload)
+    except ValueError:
+        logger.error("Смысловой индекс %s повреждён", cluster_name)
+        return {}
+    cached = {"taken_at": row.taken_at, "model": row.model, "index": index}
+    _INDEX_CACHE[cluster_name] = cached
+    return cached
+
+
+async def search_semantic(cluster_name: str, question: str,
+                          limit: int = 3) -> list:
+    """Таблицы, близкие вопросу по смыслу: [(ключ, близость), ...].
+
+    Нужно там, где буквы не совпадают: «учётные записи» и «Абоненты» не
+    имеют ни одной общей, но означают одно и то же.
+    """
+    from agent.services import embed
+
+    if not str(question or "").strip():
+        return []
+    stored = await load_index(cluster_name)
+    if not stored.get("index"):
+        return []
+
+    asked = await embed.encode([question])
+    if not asked:
+        return []
+    return embed.nearest(asked[0], stored["index"], limit)
+
+
 # ── Чтение снимка ────────────────────────────────────────────────────────
 
 def describe(snapshot: dict, table: str) -> dict:
@@ -362,16 +564,22 @@ def describe(snapshot: dict, table: str) -> dict:
         found = tables.get("%s.%s" % (db, tbl))
         if not found:
             return {"error": "Таблицы %s.%s нет в снимке" % (db, tbl)}
-        return found
+        return _with_incoming(snapshot, "%s.%s" % (db, tbl), found)
 
-    matches = [v for k, v in tables.items() if k.split(".", 1)[1] == tbl]
+    matches = [(k, v) for k, v in tables.items() if k.split(".", 1)[1] == tbl]
     if not matches:
         return {"error": "Таблицы %s нет в снимке схемы" % tbl}
     if len(matches) > 1:
         return {"error": "Таблица %s есть в нескольких базах: %s. "
                          "Укажите как база.таблица"
-                         % (tbl, ", ".join(m["db"] for m in matches))}
-    return matches[0]
+                         % (tbl, ", ".join(m[1]["db"] for m in matches))}
+    return _with_incoming(snapshot, matches[0][0], matches[0][1])
+
+
+def _with_incoming(snapshot: dict, key: str, table: dict) -> dict:
+    """Описание вместе с тем, кто ссылается на эту таблицу."""
+    found = incoming(snapshot, key)
+    return dict(table, incoming=found) if found else table
 
 
 def find(snapshot: dict, needle: str) -> dict:
@@ -534,6 +742,17 @@ def fmt_snapshot(snapshot: dict, label: str) -> str:
                           "у столбцов — ни в information_schema, ни через "
                           "SHOW. Значит, в базе их действительно нет."]
 
+        vectors = snapshot.get("vectors") or {}
+        if vectors.get("items"):
+            lines.append("  Смысловой поиск построен: %s, модель %s. Теперь "
+                         "«учётные записи» найдут таблицу, подписанную "
+                         "«Абоненты»."
+                         % (count_of(vectors["items"], "таблица", "таблицы",
+                                     "таблиц"), vectors.get("model", "")))
+        else:
+            lines.append("  Смыслового поиска нет: эндпоинт модели не отдаёт "
+                         "/embeddings. Поиск по схеме идёт по словам.")
+
         biggest = sorted(tables.values(),
                          key=lambda t: -(t.get("size_mb") or 0))[:20]
         lines += ["", "  Самые крупные таблицы:"]
@@ -579,6 +798,20 @@ def fmt_describe(data: dict) -> str:
         lines.append("    Столбцы в снимок не попали: таблица не вошла в число "
                      "тех, для которых снимались подробности.")
 
+    if data.get("links"):
+        lines += ["", "  Ссылается на:"]
+        for link in data["links"]:
+            lines.append("    %-26s -> %s.%s  (%s)"
+                         % (link.get("col"), link.get("ref"),
+                            link.get("ref_col"), link.get("kind")))
+
+    if data.get("incoming"):
+        lines += ["", "  На неё ссылаются:"]
+        for link in data["incoming"]:
+            lines.append("    %-26s по столбцу %s  (%s)"
+                         % (link.get("from"), link.get("col"),
+                            link.get("kind")))
+
     if data.get("indexes"):
         lines += ["", "  Индексы:"]
         for i in data["indexes"]:
@@ -605,6 +838,20 @@ def fmt_find(data: dict) -> str:
         lines.append("  %s (%s)%s" % (where, m.get("type"), note))
     if len(matches) >= MAX_MATCHES:
         lines.append("  (показаны первые %d)" % MAX_MATCHES)
+    return "\n".join(lines)
+
+
+def fmt_semantic(snapshot: dict, needle: str, near: list) -> str:
+    """Что нашлось по смыслу. Близость показываем: она и есть основание."""
+    tables = snapshot.get("tables") or {}
+    lines = ["## Что похоже по смыслу на «%s»" % needle, "",
+             "  По буквам ничего не совпало, поэтому искали по смыслу "
+             "комментариев. Проверь, та ли это таблица, прежде чем строить "
+             "по ней запрос.", ""]
+    for key, score in near:
+        table = tables.get(key) or {}
+        note = (" — " + str(table.get("note"))[:110]) if table.get("note") else ""
+        lines.append("  %-36s близость %.2f%s" % (key, score, note))
     return "\n".join(lines)
 
 

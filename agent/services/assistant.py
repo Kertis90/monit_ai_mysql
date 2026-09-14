@@ -146,7 +146,7 @@ def tool_specs() -> list:
                           "description": "имя таблицы или база.таблица — "
                                          "вернёт столбцы и индексы"},
                 "search": {"type": "string",
-                           "description": "кусок имени ИЛИ слово из "
+                           "description": "кусок имени, слово из "
                                           "комментария: имена в базе "
                                           "английские, а комментарии русские, "
                                           "поэтому «договор» найдёт таблицу "
@@ -340,8 +340,16 @@ async def run_tool(name: str, args: dict) -> str:
                 return schema_service.fmt_describe(
                     schema_service.describe(snapshot, str(args["table"])))
             if args.get("search"):
-                return schema_service.fmt_find(
-                    schema_service.find(snapshot, str(args["search"])))
+                needle = str(args["search"])
+                data = schema_service.find(snapshot, needle)
+                if not data.get("matches"):
+                    # По буквам не нашлось — пробуем по смыслу
+                    near = await schema_service.search_semantic(
+                        cluster["name"], needle, limit=5)
+                    if near:
+                        return schema_service.fmt_semantic(snapshot, needle,
+                                                           near)
+                return schema_service.fmt_find(data)
             return schema_service.fmt_snapshot(snapshot, cluster["label"])
 
         if name == "explain_query":
@@ -556,7 +564,19 @@ async def schema_blocks(cluster_name: str, user_message: str) -> list:
     if brief:
         out.append(brief)
 
-    for key in schema_service.mentioned(snapshot, user_message):
+    found = schema_service.mentioned(snapshot, user_message)
+    if not found:
+        # Буквы не совпали — ищем по смыслу. «Покажи учётные записи» не
+        # имеет ни одной общей буквы ни с vgroups, ни с «Абонентами»
+        try:
+            found = [key for key, _score in await schema_service.search_semantic(
+                cluster_name, user_message)]
+            if found:
+                logger.info("Таблицы найдены по смыслу: %s", ", ".join(found))
+        except Exception as exc:
+            logger.info("Смысловой поиск не сработал: %s", exc)
+
+    for key in found:
         out.append(schema_service.fmt_describe(
             schema_service.describe(snapshot, key)))
     return out

@@ -465,12 +465,43 @@ async def websocket_chat(ws: WebSocket):
 
     reader_task = asyncio.create_task(reader())
 
+    # Пересказ идёт отдельной задачей, а не прямо здесь. Иначе сокет висит
+    # внутри одного разговора до конца ответа и не слышит ничего: человек
+    # переключился на другой чат, вернулся — а его attach всё ещё в очереди,
+    # и вместо ответа он видит пустоту.
+    relay_task: Optional[asyncio.Task] = None
+
+    async def stop_relay() -> None:
+        nonlocal relay_task
+        if relay_task is None:
+            return
+        task, relay_task = relay_task, None
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    async def start_relay(job, resume: bool) -> None:
+        """Пересказывать этот разговор. Прежний пересказ прекращаем.
+
+        Два пересказа в один сокет писали бы вперемешку, а смотрит человек
+        всё равно в один чат — тот, что открыт.
+        """
+        nonlocal relay_task
+        await stop_relay()
+        relay_task = asyncio.create_task(relay(ws, job, resume))
+
     # Клиент мог вернуться к ответу, который считается прямо сейчас, —
-    # например, обновив страницу. Подхватываем его до первого вопроса.
+    # например, обновив страницу или переключив чат.
     async def resume_if_running(thread_id: str) -> None:
         job = jobs.running(thread_id)
         if job is not None:
-            await relay(ws, job, resume=True)
+            await start_relay(job, resume=True)
+        else:
+            # В этом разговоре ничего не считается: прекращаем пересказ
+            # прежнего, иначе его токены сыпались бы в чужой чат
+            await stop_relay()
 
     try:
         while True:
@@ -526,7 +557,7 @@ async def websocket_chat(ws: WebSocket):
                 thread_id, text,
                 lambda j: generate(owner, thread_id, thread_title, text,
                                    fp, sid, history, j))
-            await relay(ws, job, resume=job.question != text)
+            await start_relay(job, resume=job.question != text)
 
     except WebSocketDisconnect:
         logger.info(f"WS disconnected: {session_id}")
@@ -539,6 +570,7 @@ async def websocket_chat(ws: WebSocket):
             pass
     finally:
         ws_clients.discard(ws)
+        await stop_relay()
         # Без этого задача-читатель переживёт соединение и повиснет
         reader_task.cancel()
         try:

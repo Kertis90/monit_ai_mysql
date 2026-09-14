@@ -290,6 +290,29 @@ class SchemaSnapshot(Base):
     payload:   Mapped[str] = mapped_column(Text, nullable=False, default="{}")
 
 
+class SchemaVectors(Base):
+    """Смысловой индекс схемы: по вектору на таблицу.
+
+    Отдельной строкой, а не внутри снимка, сознательно. Снимок читается при
+    КАЖДОМ вопросе в чате, а индекс — только когда лексический поиск не
+    нашёл таблицу. Держать мегабайты чисел в том же JSON значило бы читать
+    и разбирать их постоянно ради редкого случая.
+
+    Один индекс на кластер, как и снимок: пересъёмка схемы заменяет оба.
+    """
+    __tablename__ = "schema_vectors"
+
+    id:       Mapped[int] = mapped_column(Integer, primary_key=True,
+                                          autoincrement=True)
+    cluster:  Mapped[str] = mapped_column(String(NAME_LEN), nullable=False,
+                                          unique=True)
+    taken_at: Mapped[str] = mapped_column(String(TS_LEN), nullable=False)
+    model:    Mapped[str] = mapped_column(String(NAME_LEN), nullable=False,
+                                          default="")
+    items:    Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    payload:  Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+
+
 class ConfigSnapshot(Base):
     """Снимок переменной MySQL.
 

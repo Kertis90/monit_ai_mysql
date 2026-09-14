@@ -40,6 +40,9 @@ find "${AGENT_DIR}/agent" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/nul
 # Парсер nslcd.conf: агент дозаполняет им пустые настройки LDAP на старте
 cp "${SCRIPT_DIR}/import_nslcd.py"        "${AGENT_DIR}/agent/import_nslcd.py"
 cp "${SCRIPT_DIR}/../clusters.json"       "${AGENT_DIR}/clusters.json"
+# Версия нужна работающему агенту: она попадает в адрес скрипта и стилей,
+# и без неё браузер после обновления держит старый интерфейс
+cp "${SCRIPT_DIR}/../VERSION"             "${AGENT_DIR}/VERSION" 2>/dev/null || true
 cp "${SCRIPT_DIR}/../web/index.html"      "${AGENT_DIR}/web/"
 cp "${SCRIPT_DIR}/../web/style.css"       "${AGENT_DIR}/web/"
 cp "${SCRIPT_DIR}/../web/app.js"          "${AGENT_DIR}/web/"

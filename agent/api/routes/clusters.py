@@ -497,6 +497,15 @@ async def schema_snapshot(name: str, admin: AdminUser, journal: Audit,
         data = await schema.collect(cluster)
         if not data.get("error"):
             await schema.save(name, data)
+            # Смысловой индекс строится тут же: он нужен, чтобы «учётные
+            # записи» находили таблицу, подписанную «Абоненты». Нет
+            # эндпоинта векторов — снимок просто останется без индекса
+            try:
+                built = await schema.build_index(name, data)
+                if built:
+                    data["vectors"] = built
+            except Exception as exc:
+                logger.error("Смысловой индекс не построен: %s", exc)
         return data
 
     await journal.add(

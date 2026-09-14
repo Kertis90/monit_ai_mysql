@@ -40,6 +40,12 @@ class LLMSettings(BaseModel):
     # Сколько ждать ответа человека на «продолжаем?». 0 — не спрашивать
     # вовсе: по исчерпании порции агент сразу отвечает по собранному.
     tool_ask_s:  float = 120.0
+    # Смысловой поиск по схеме: auto — проверить пробным запросом,
+    # on — считать доступным, off — искать только по словам
+    embed_mode:  str   = "auto"
+    embed_model: str   = "text-embedding-3-small"
+    # Векторизация снимка идёт сотнями документов и дольше обычного вызова
+    embed_timeout: float = 120.0
     # Сколько ждать ОЧЕРЕДНОЙ порции ответа, а не весь ответ целиком.
     # Локальная модель может думать над первым словом дольше облачной,
     # а длинный разбор идёт минутами — ограничивать его сверху нельзя.
@@ -176,10 +182,29 @@ def _database_url() -> str:
     return "sqlite+aiosqlite:///" + path.lstrip("/").join(("/", ""))
 
 
+def _version() -> str:
+    """Версия агента: из окружения, иначе из файла VERSION рядом с кодом.
+
+    Файл — источник правды при сборке релиза, и полагаться только на
+    переменную окружения нельзя: её никто не выставляет, а версия попадает
+    в адрес скрипта и стилей, чтобы браузер не держал старый интерфейс
+    после обновления.
+    """
+    from_env = _env("AGENT_VERSION", "")
+    if from_env:
+        return from_env
+    try:
+        import pathlib
+        path = pathlib.Path(__file__).resolve().parents[2] / "VERSION"
+        return path.read_text(encoding="utf-8").strip() or "dev"
+    except Exception:
+        return "dev"
+
+
 def load_settings() -> Settings:
     """Собрать настройки из окружения. Вызывается один раз при старте."""
     return Settings(
-        version       = _env("AGENT_VERSION", "dev"),
+        version       = _version(),
         port          = int(_env("AGENT_PORT", "5001")),
         root_path     = _env("ROOT_PATH"),
         registry_path = _env("REGISTRY_PATH", "/opt/ai-alert-agent/clusters.json"),
@@ -199,6 +224,9 @@ def load_settings() -> Settings:
             tools       = _env("LLM_TOOLS", "auto").strip().lower(),
             tool_rounds = max(0, int(_env("LLM_TOOL_ROUNDS", "4"))),
             tool_ask_s  = max(0.0, float(_env("LLM_TOOL_ASK_S", "120"))),
+            embed_mode  = _env("EMBED_MODE", "auto").strip().lower(),
+            embed_model = _env("EMBED_MODEL", "text-embedding-3-small"),
+            embed_timeout = float(_env("EMBED_TIMEOUT", "120")),
             timeout     = float(_env("LLM_TIMEOUT", "300")),
         ),
         prometheus=PrometheusSettings(
