@@ -1999,6 +1999,15 @@ const App = (() => {
                'где база ни при чём: ядру не хватило памяти, и оно убило ' +
                'mysqld как самый жирный процесс.',
         actions: [{ label: 'Проверить', fn: 'loadMemory' }] },
+      { id: 'lanbilling', out: 'cluster-lanbilling',
+        name: 'АСР Lanbilling',
+        short: 'что случилось в ядре системы',
+        about: 'Логи ядра за два часа — это десятки тысяч строк, где одна и ' +
+               'та же ошибка повторяется сотни раз. Здесь они свёрнуты в ' +
+               'образцы: что именно случилось, сколько раз и когда началось. ' +
+               'Всплеск по минуте — та точка, с которой начинают ' +
+               'сопоставление с метриками базы.',
+        actions: [{ label: 'Разобрать логи', fn: 'loadLanbilling' }] },
       { id: 'anomaly', out: 'cluster-anomaly', name: 'Аномалии',
         short: 'отклонения от обычного состояния',
         about: 'Половина поломок не пересекает ни одного порога: запросов ' +
@@ -2595,16 +2604,37 @@ const App = (() => {
     'api/growth/' + encodeURIComponent(state.clusterName) + '?days=30',
     'Сравниваю снимки…', btn);
 
-  const loadSchema = (btn) => lazyBlock('cluster-schema',
-    'api/schema/' + encodeURIComponent(state.clusterName),
-    'Читаю снимок схемы…', btn);
+  async function loadSchema(btn) {
+    if (btn) return withBusy(btn, () => loadSchema());
+    const box = $('cluster-schema');
+    const cluster = state.clusterName;
+    setBusy(box, 'Читаю снимок схемы…');
+    try {
+      const d = await getJson('api/schema/' + encodeURIComponent(cluster));
+      showSchema(box, d);
+      // Кто-то снимает прямо сейчас — дождёмся вместе с ним
+      if (d.collecting) waitForSchema(box, cluster);
+    } catch (e) {
+      box.innerHTML = '<div class="muted small">Не удалось прочитать: ' +
+                      esc(e.message || e) + '</div>';
+    }
+  }
 
   // Пересъёмка идёт на боевой сервер, поэтому спрашиваем подтверждение и
-  // говорим, чем это обернётся
+  // говорим, чем это обернётся.
+  //
+  // Съёмка выполняется в фоне: на большой базе обход длиннее любого
+  // разумного ожидания, и держать браузер открытым незачем. Пока она
+  // идёт, страница сама спрашивает, не закончилась ли — и показывает
+  // результат, когда тот появится.
+  const SCHEMA_POLL_MS = 5000;
+  const SCHEMA_POLL_LIMIT = 60;          // пять минут, дальше молча перестаём
+
   async function resnapSchema(btn) {
     if (!confirm('Снять схему заново?\n\nАгент обойдёт information_schema ' +
                  'на боевом сервере. На базе с тысячами таблиц это занимает ' +
-                 'несколько секунд и создаёт нагрузку.')) return;
+                 'до нескольких минут и создаёт нагрузку.\n\nЕсли съёмку уже ' +
+                 'запустил кто-то другой, вторая не начнётся.')) return;
     const box = $('cluster-schema');
     setBusy(box, 'Обхожу information_schema…', 'это может занять минуту');
     await withBusy(btn, async () => {
@@ -2612,14 +2642,45 @@ const App = (() => {
         const d = await getJson('api/schema/' +
                                 encodeURIComponent(state.clusterName) + '/snapshot',
                                 { method: 'POST' });
-        box.innerHTML = '<pre class="output">' +
-                        esc(d.text || d.error || 'Снимок пуст.') + '</pre>';
+        showSchema(box, d);
+        if (d.collecting) waitForSchema(box, state.clusterName);
       } catch (e) {
         box.innerHTML = '<div class="muted small">Не удалось снять: ' +
                         esc(e.message || e) + '</div>';
       }
     });
   }
+
+  function showSchema(box, d) {
+    box.innerHTML = (d.collecting ? busyHtml('Съёмка идёт в фоне',
+                                             'страница сама покажет результат')
+                                  : '') +
+                    '<pre class="output">' +
+                    esc(d.text || d.error || 'Снимок пуст.') + '</pre>';
+  }
+
+  // Опрос вместо ожидания ответа: соединение не висит, а вкладку можно
+  // закрыть — съёмка от этого не прервётся
+  function waitForSchema(box, cluster, tries) {
+    tries = tries || 0;
+    if (tries >= SCHEMA_POLL_LIMIT) return;
+    setTimeout(async () => {
+      // Ушли со страницы кластера или сменили кластер — опрос ни к чему
+      if (state.clusterName !== cluster || !document.body.contains(box)) return;
+      try {
+        const d = await getJson('api/schema/' + encodeURIComponent(cluster));
+        showSchema(box, d);
+        if (d.collecting) waitForSchema(box, cluster, tries + 1);
+      } catch (e) {
+        box.innerHTML = '<div class="muted small">Не удалось прочитать: ' +
+                        esc(e.message || e) + '</div>';
+      }
+    }, SCHEMA_POLL_MS);
+  }
+
+  const loadLanbilling = (btn) => lazyBlock('cluster-lanbilling',
+    'api/lanbilling/' + encodeURIComponent(state.clusterName) + '?hours=2',
+    'Читаю логи ядра и сворачиваю их в образцы…', btn);
 
   const loadMemory = (btn) => lazyBlock('cluster-memory',
     'api/memory/' + encodeURIComponent(state.clusterName),
@@ -3030,6 +3091,7 @@ const App = (() => {
            loadForecast, loadConfigAudit, loadGrowth, loadAnomalies,
            loadReadiness, loadHealth, loadIndexes, loadConfigChanges,
            loadBackups, loadMemory, loadSchema, resnapSchema,
+           loadLanbilling,
            addNote, toggleNote, deleteNote,
            grantManual, revokeAccess, deleteAlert, deleteAlertsByName,
            resolveAlert,

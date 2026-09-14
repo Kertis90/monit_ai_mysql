@@ -295,6 +295,10 @@ def application() -> None:
         list_paging()
         themes()
         range_hidden()
+        lanbilling_log()
+        lanbilling_wired(c)
+        schema_background(c)
+        select_only()
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -2262,6 +2266,210 @@ def range_hidden() -> None:
           ".range-pick[hidden] { display: none; }" in css, True)
     check("и объявлен раньше правила показа",
           css.index(".range-pick[hidden]") < css.index(".range-pick {"), True)
+
+
+LB_LOG = chr(10).join([
+    "07.09.2026 17:29:58.100000 INFO LWP410001 [core:main] запуск обработки",
+    "07.09.2026 17:30:01.123456 ERROR LWP410005 [db:connect] "
+    "can't connect to MySQL server on 10.0.0.5 (111)",
+    "07.09.2026 17:30:01.223456 ERROR LWP410005 [db:connect] "
+    "can't connect to MySQL server on 10.0.0.6 (111)",
+    "07.09.2026 17:30:02.000000 ERROR LWP410005 [db:connect] "
+    "can't connect to MySQL server on 10.0.0.5 (111)",
+    "07.09.2026 17:30:05.000000 WARN LWP410010 [pay:send] "
+    "no response from gateway 4712",
+    "07.09.2026 17:31:00.000000 ERROR LWP420100 [db:tx] "
+    "Deadlock found when trying to get lock",
+    "продолжение многострочной записи без даты",
+])
+
+
+def lanbilling_log() -> None:
+    """Логи АСР сворачиваются в образцы, а не пересказываются построчно.
+
+    За два часа набегают десятки тысяч строк, где одна и та же ошибка
+    повторяется сотни раз. Читать это глазами бесполезно.
+    """
+    from agent.services import lanbilling
+
+    data = lanbilling.analyse(LB_LOG)
+    check("строки разобраны", data["records"], 6)
+    check("чужая строка посчитана, а не выброшена", data["unparsed"], 1)
+    check("ошибки отделены от предупреждений",
+          (data["errors"], data["warnings"]), (4, 1))
+
+    # Три строки об одном и том же — один образец с числом повторов
+    top = data["patterns"][0]
+    check("повторы свёрнуты", top["count"], 3)
+    check("у образца есть код", top["code"], "LWP410005")
+    check("и время начала", top["first"].strftime("%H:%M"), "17:30")
+
+    check("всплеск найден", data["peak_count"], 4)
+    check("и его минута названа",
+          data["peak_minute"].strftime("%H:%M"), "17:30")
+
+    # Классы бед: не просто «ошибка», а какая именно
+    check("потеря соединения с базой распознана",
+          data["classes"].get("db_down"), 3)
+    check("дедлок распознан", data["classes"].get("deadlock"), 1)
+    check("внешняя система распознана", data["classes"].get("external"), 1)
+
+    text = lanbilling.fmt_report(dict(data, host="10.1.0.9", hours=2), "Кемерово")
+    check("в отчёте сказано, куда идти дальше",
+          "Память, своп и OOM" in text, True)
+    check("склонения человеческие", "3 строки" in text, True)
+    check("и повторы тоже", "3 раза" in text, True)
+
+    # Свёртка: разные адреса и номера — одна и та же беда
+    check("адреса свёрнуты",
+          lanbilling.template("connect to 10.0.0.5 failed after 42 tries"),
+          "connect to <адрес> failed after <N> tries")
+
+    # Тихий лог — тоже ответ
+    quiet = lanbilling.analyse(
+        "07.09.2026 10:00:00 INFO LWP1 [a:b] всё хорошо")
+    check("тихий лог не выдумывает бед", quiet["troubles"], 0)
+    quiet_text = lanbilling.fmt_report(dict(quiet, hours=2), "Кемерово")
+    check("и говорит, что причина не в ядре",
+          "причина не в ядре" in quiet_text, True)
+
+    # Чужой формат объясняется, а не молчит
+    alien = lanbilling.fmt_report(lanbilling.analyse("что-то совсем другое"),
+                                  "Кемерово")
+    check("чужой формат объяснён", "формат другой" in alien, True)
+
+
+def lanbilling_wired(client) -> None:
+    """Разбор доступен кнопкой, инструментом и в общем разборе."""
+    r = client.get("/api/lanbilling/kemerovo?hours=2")
+    check("эндпоинт отвечает", r.status_code, 200)
+    check("без настроенных логов сказано, чего не хватает",
+          "app_log_dirs" in r.json().get("error", "")
+          or "app_ip" in r.json().get("error", ""), True)
+    check("сырой лог наружу не отдаётся", "raw" in r.json(), False)
+
+    from agent.services.assistant import tool_specs
+    names = [t["function"]["name"] for t in tool_specs()]
+    check("модель умеет разбирать логи АСР", "analyse_app_log" in names, True)
+
+    import inspect
+
+    from agent.services import insight
+    src = inspect.getsource(insight.gather_missing)
+    check("общий разбор берёт логи АСР", "_app_log" in src, True)
+    check("но только если они настроены", "app_log_dirs" in src, True)
+
+    app = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
+    check("блок есть на странице кластера",
+          "cluster-lanbilling" in app and "loadLanbilling" in app, True)
+
+
+def schema_background(client) -> None:
+    """Схема снимается в фоне и один раз на всех.
+
+    Двое нажали — обход всё равно один: второй подключается к идущему.
+    """
+    from agent.api.routes import clusters as routes
+    from agent.services import schema, tasks
+
+    started = {"n": 0}
+
+    async def slow_collect(cluster, host=None):
+        started["n"] += 1
+        await asyncio.sleep(0.4)
+        return {"taken_at": "2026-09-14T10:00:00", "databases": [],
+                "tables": {}, "cut": []}
+
+    async def scenario():
+        original = schema.collect
+        schema.collect = slow_collect
+        was = routes.SCHEMA_BUDGET_S
+        routes.SCHEMA_BUDGET_S = 0.05
+        try:
+            key = routes.schema_key("kemerovo")
+            tasks.drop(key)
+
+            async def build():
+                data = await schema.collect({"name": "kemerovo"})
+                await schema.save("kemerovo", data)
+                return data
+
+            # Два нажатия подряд — одна работа
+            first = await tasks.shared_within(key, build, budget=0.05, ttl=0)
+            second = await tasks.shared_within(key, build, budget=0.05, ttl=0)
+            check("первый не дождался", first[1], False)
+            check("второй тоже", second[1], False)
+            check("но съёмка одна", started["n"], 1)
+            check("и она видна как идущая", tasks.running(key), True)
+
+            await asyncio.sleep(0.7)
+            check("съёмка дошла до конца", started["n"], 1)
+            check("и больше не идёт", tasks.running(key), False)
+            await tasks.shutdown()
+        finally:
+            schema.collect = original
+            routes.SCHEMA_BUDGET_S = was
+
+    asyncio.run(scenario())
+
+    # Чтение говорит, идёт ли съёмка прямо сейчас
+    body = client.get("/api/schema/kemerovo").json()
+    check("состояние съёмки видно в ответе", "collecting" in body, True)
+
+    app = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
+    check("страница дожидается фоновой съёмки",
+          "waitForSchema" in app, True)
+    check("опрос прекращается при уходе со страницы",
+          "state.clusterName !== cluster" in app, True)
+
+
+def select_only() -> None:
+    """Из чата можно только читать. Проверяем не обещанием, а валидатором."""
+    from agent.services.assistant import tool_specs
+    from agent.services.mysql import sql_validate
+
+    allowed = ("SELECT uid FROM agreements WHERE balance < 0",
+               "SELECT COUNT(*) FROM payments",
+               "SHOW GLOBAL STATUS",
+               "EXPLAIN SELECT 1",
+               "DESCRIBE agreements")
+    for sql in allowed:
+        ok, why = sql_validate(sql)
+        if not ok:
+            check("читающий запрос разрешён: %s" % sql, why, "")
+    check("читающие запросы проходят", True, True)
+
+    forbidden = (
+        "UPDATE agreements SET balance = 0",
+        "DELETE FROM payments",
+        "INSERT INTO agreements VALUES (1)",
+        "DROP TABLE agreements",
+        "TRUNCATE payments",
+        "GRANT ALL ON *.* TO 'x'@'%'",
+        "SELECT 1; DROP TABLE agreements",
+        "SELECT /*! DROP TABLE agreements */ 1",
+        "SELECT * INTO OUTFILE '/tmp/x' FROM agreements",
+        "SET GLOBAL max_connections = 10",
+        "CALL some_proc()",
+        "KILL 42",
+    )
+    for sql in forbidden:
+        ok, _ = sql_validate(sql)
+        if ok:
+            check("ПРОПУЩЕН ЗАПИСЫВАЮЩИЙ ЗАПРОС: %s" % sql, True, False)
+    check("ни один пишущий запрос не прошёл", True, True)
+
+    spec = next(t["function"] for t in tool_specs()
+                if t["function"]["name"] == "run_sql")
+    check("модели сказано, что записи не будет",
+          "любая запись отклоняется" in spec["description"], True)
+
+    from agent.services.analysis import system_prompt
+    prompt = system_prompt()
+    check("и что на вопросы про данные отвечают запросом",
+          "ВОПРОСЫ ПРО ДАННЫЕ" in prompt, True)
+    check("а не текстом запроса вместо ответа",
+          "не показывай текст запроса вместо ответа" in prompt, True)
 
 
 def websocket(client) -> None:

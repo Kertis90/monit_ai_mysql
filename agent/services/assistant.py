@@ -117,6 +117,19 @@ def tool_specs() -> list:
                                  "description": "шаг разбивки, по умолчанию 300"}},
                 "required": ["cluster", "hours"]}}},
         {"type": "function", "function": {
+            "name": "analyse_app_log",
+            "description": "Разбор логов АСР Lanbilling за период: ошибки, "
+                           "свёрнутые в образцы с числом повторов, всплески "
+                           "по минутам и классы бед (база недоступна, "
+                           "дедлок, таймаут, нет места). Отвечает на вопрос "
+                           "«что случилось в АСР», а не «что написано в "
+                           "логе». Для чтения самих строк есть read_logs.",
+            "parameters": {"type": "object", "properties": {
+                "cluster": cl, "hours": hrs,
+                "filter": {"type": "string",
+                           "description": "строка, по которой сузить поиск"}},
+                "required": ["cluster"]}}},
+        {"type": "function", "function": {
             "name": "get_schema",
             "description": "Схема базы из снимка агента: список таблиц, "
                            "столбцы и индексы конкретной таблицы, поиск "
@@ -178,11 +191,20 @@ def tool_specs() -> list:
                            "required": ["cluster"]}}},
         {"type": "function", "function": {
             "name": "run_sql",
-            "description": "Читающий SQL-запрос к кластеру. Разрешены только "
-                           "SELECT, SHOW, EXPLAIN, DESCRIBE.",
+            "description": "Выполнить читающий запрос к базе и получить "
+                           "строки. Этим и отвечают на вопросы про данные: "
+                           "«сколько договоров с долгом», «когда последний "
+                           "платёж», «есть ли дубли по логину». Имена таблиц "
+                           "и столбцов бери из get_schema, не угадывай. "
+                           "Разрешены только SELECT, SHOW, EXPLAIN, DESCRIBE; "
+                           "любая запись отклоняется до отправки в базу, "
+                           "поэтому не пытайся менять данные — это не "
+                           "получится и потратит ход.",
             "parameters": {"type": "object", "properties": {
                 "cluster": cl,
-                "sql": {"type": "string", "description": "текст запроса"}},
+                "sql": {"type": "string",
+                        "description": "один запрос, без ';' внутри; "
+                                       "LIMIT допишется сам"}},
                 "required": ["cluster", "sql"]}}},
         {"type": "function", "function": {
             "name": "read_logs",
@@ -210,11 +232,18 @@ async def run_tool(name: str, args: dict) -> str:
 
     if name in ("get_current_metrics", "get_history", "get_breakdown",
                 "run_diagnostics", "run_sql", "read_logs", "explain_query",
-                "get_schema", "get_workload", "get_replication") and not cluster:
+                "get_schema", "get_workload", "get_replication",
+                "analyse_app_log") and not cluster:
         return f"Кластер «{cname}» не найден. Доступные: " + \
                ", ".join(c["name"] for c in enabled_clusters())
 
     try:
+        if name == "analyse_app_log":
+            from agent.services import lanbilling as lb
+            data = await lb.collect(cluster, hours or 2.0,
+                                    str(args.get("filter") or ""))
+            return lb.fmt_report(data, cluster["label"])
+
         if name == "get_schema":
             from agent.services import schema as schema_service
             snapshot = await schema_service.load(cluster["name"])

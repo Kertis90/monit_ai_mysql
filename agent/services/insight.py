@@ -60,8 +60,8 @@ ALL_TASK = """Собери всё это в один разбор кластер
 
 Выше уже собрано всё, до чего агент дотягивается сам: текущие метрики всех
 серверов, история за период со сравнением с прошлой неделей, память со
-свопом и следами OOM, планы выполнения тяжёлых запросов. Не пиши, что этих
-данных нет, — посмотри в разделы выше. Если какого-то раздела там нет, в
+свопом и следами OOM, планы выполнения тяжёлых запросов, разбор ошибок в
+логах АСР. Не пиши, что этих данных нет, — посмотри в разделы выше. Если какого-то раздела там нет, в
 конце перечислено, почему именно он не собрался.
 
 Не перечисляй блоки по очереди и не повторяй их содержимое: человек их уже
@@ -172,6 +172,10 @@ async def gather_missing(cluster: dict, have: str, hours: float = 3.0) -> tuple:
         wanted.append(("память, своп и следы OOM", _memory(cluster)))
     if "План выполнения" not in have and "EXPLAIN" not in have.upper():
         wanted.append(("планы выполнения тяжёлых запросов", _plans(cluster)))
+    # Логи ядра — только если они вообще настроены: у кластера без АСР
+    # этот раздел будет каждый раз падать в «не собралось»
+    if "АСР Lanbilling" not in have and (cluster.get("app_log_dirs") or "").strip():
+        wanted.append(("ошибки в логах АСР", _app_log(cluster, hours)))
 
     if not wanted:
         return "", []
@@ -207,6 +211,13 @@ async def _history(cluster: dict, hours: float) -> str:
 
 async def _memory(cluster: dict) -> str:
     return memory.fmt_memory(await memory.collect(cluster), cluster["label"])
+
+
+async def _app_log(cluster: dict, hours: float) -> str:
+    from agent.services import lanbilling
+    data = await lanbilling.collect(cluster, max(0.5, min(hours, 12.0)))
+    # «Ошибок нет» — тоже ответ, и он снимает подозрение с АСР
+    return lanbilling.fmt_report(data, cluster["label"])
 
 
 async def _plans(cluster: dict) -> str:

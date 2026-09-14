@@ -14,8 +14,8 @@ from agent.api.deps import (AdminUser, Audit, CurrentUser, DbSession,
 from agent.db.repositories.notes import NoteRepository
 from agent.services import (anomaly, audit, backups, config_audit,
                             config_history, forecast, growth, indexes,
-                            explain, insight, memory, readiness,
-                            schema, tasks)
+                            explain, insight, lanbilling, memory,
+                            readiness, schema, tasks)
 from agent.schemas.api import (ExplainRequest, InsightOut,
                                InsightRequest, SqlRequest, SqlResult)
 from agent.services.analysis import (DIAG_QUERIES, collect_series_table,
@@ -46,6 +46,15 @@ INSIGHT_GRACE_S = 30
 # HTML-страницей; лучше ответить раньше него и по делу. Работа при этом не
 # бросается: она досчитается в фоне, и повторное нажатие вернёт готовое.
 DIAGNOSE_BUDGET_S = float(os.environ.get("DIAGNOSE_BUDGET_S", "40"))
+
+# Сколько ждём съёмку схемы, прежде чем ответить «идёт в фоне». Маленькая
+# база успевает, большая — нет, и держать браузер в ожидании незачем.
+SCHEMA_BUDGET_S = float(os.environ.get("SCHEMA_BUDGET_S", "8"))
+
+
+def schema_key(name: str) -> str:
+    """Ключ съёмки. Один на кластер — по нему и склеиваются нажатия."""
+    return "schema:%s" % name
 
 # Поля реестра, которые наружу не отдаются ни при каких обстоятельствах
 SECRET_FIELDS = {"mysql_exporter_password", "db_password"}
@@ -443,19 +452,29 @@ async def schema_read(name: str, user: CurrentUser, table: str = "",
     делать его на каждый вопрос незачем."""
     cluster = _need(name)
     snapshot = await schema.load(name)
+    # Съёмка могла быть запущена кем-то другим и идти прямо сейчас
+    collecting = tasks.running(schema_key(name))
 
     if table:
         data = schema.describe(snapshot, table)
         return {"cluster": name, "taken_at": snapshot.get("taken_at", ""),
-                "text": schema.fmt_describe(data)}
+                "collecting": collecting, "text": schema.fmt_describe(data)}
     if search:
         data = schema.find(snapshot, search)
         return {"cluster": name, "taken_at": snapshot.get("taken_at", ""),
-                "text": schema.fmt_find(data)}
+                "collecting": collecting, "text": schema.fmt_find(data)}
+
+    text = schema.fmt_snapshot(snapshot, cluster["label"])
+    if collecting:
+        text = ("## Схема базы — %s\n\n  Сейчас идёт съёмка. Она началась по "
+                "чьей-то кнопке и продолжается\n  в фоне; результат появится "
+                "здесь, как только обход закончится." % cluster["label"]
+                + ("\n\n" + text if snapshot else ""))
     return {"cluster": name, "taken_at": snapshot.get("taken_at", ""),
+            "collecting": collecting,
             "databases": len(snapshot.get("databases") or []),
             "tables": len(snapshot.get("tables") or {}),
-            "text": schema.fmt_snapshot(snapshot, cluster["label"])}
+            "text": text}
 
 
 @router.post("/api/schema/{name}/snapshot", tags=["Диагностика"],
@@ -463,23 +482,47 @@ async def schema_read(name: str, user: CurrentUser, table: str = "",
 async def schema_snapshot(name: str, admin: AdminUser, journal: Audit,
                           request: Request):
     """Пересъёмка — действие администратора: это обращение к боевому
-    серверу, и запускать его походя не стоит."""
-    cluster = _need(name)
-    data = await schema.collect(cluster)
-    if data.get("error"):
-        await journal.add(action="Снимок схемы", username=admin.get("username", ""),
-                          target=name, detail=data["error"][:500],
-                          ip=audit.client_ip(request), ok=False)
-        return {"cluster": name, "error": data["error"],
-                "text": "## Схема базы\n\n  " + data["error"]}
+    серверу, и запускать его походя не стоит.
 
-    await schema.save(name, data)
-    await journal.add(action="Снимок схемы", username=admin.get("username", ""),
-                      target=name,
-                      detail="баз %d, таблиц %d" % (len(data.get("databases") or []),
-                                                    len(data.get("tables") or {})),
-                      ip=audit.client_ip(request))
+    Съёмка идёт в фоне и привязана к кластеру, а не к запросу. Двое
+    нажали одновременно — обход всё равно один: второй подключается к
+    уже идущему. Браузер при этом не ждёт: на большой базе обход длиннее
+    любого разумного таймаута, и держать соединение открытым незачем.
+    """
+    cluster = _need(name)
+    key = schema_key(name)
+    already = tasks.running(key)
+
+    async def build():
+        data = await schema.collect(cluster)
+        if not data.get("error"):
+            await schema.save(name, data)
+        return data
+
+    await journal.add(
+        action="Снимок схемы", username=admin.get("username", ""), target=name,
+        detail="подключился к идущей съёмке" if already else "запущена съёмка",
+        ip=audit.client_ip(request))
+
+    # Ждём недолго: маленькая база успеет, и человек сразу увидит результат.
+    # Большая — досчитается в фоне, и об этом сказано прямо.
+    data, in_time = await tasks.shared_within(key, build,
+                                              budget=SCHEMA_BUDGET_S, ttl=0)
+    if not in_time:
+        return {"cluster": name, "collecting": True,
+                "text": "## Схема базы\n\n"
+                        "  Съёмка идёт в фоне — на большой базе обход "
+                        "information_schema занимает\n  до нескольких минут. "
+                        "Нажмите «Показать» через минуту: как только обход\n"
+                        "  закончится, снимок появится здесь.\n\n"
+                        "  Если кто-то нажмёт кнопку в это же время, второй "
+                        "съёмки не начнётся —\n  он подключится к этой."}
+
+    if data.get("error"):
+        return {"cluster": name, "error": data["error"], "collecting": False,
+                "text": "## Схема базы\n\n  " + data["error"]}
     return {"cluster": name, "taken_at": data.get("taken_at", ""),
+            "collecting": False,
             "databases": len(data.get("databases") or []),
             "tables": len(data.get("tables") or {}),
             "text": schema.fmt_snapshot(data, cluster["label"])}
@@ -506,6 +549,31 @@ async def explain_query(req: ExplainRequest, user: CurrentUser,
                       ip=audit.client_ip(request),
                       ok=not data.get("error"))
     return data
+
+
+@router.get("/api/lanbilling/{name}", tags=["Диагностика"],
+            summary="Разбор логов АСР Lanbilling")
+async def lanbilling_one(name: str, user: CurrentUser, hours: float = 2,
+                         filter: str = ""):
+    """Логи ядра мы и так читаем; здесь они сворачиваются в образцы.
+
+    За два часа набегают десятки тысяч строк, и одна и та же ошибка
+    повторяется сотни раз. Отчёт отвечает на другой вопрос: что именно
+    случилось, сколько раз и когда началось.
+    """
+    cluster = _need(name)
+    window = max(0.25, min(float(hours), 24.0))
+
+    async def build():
+        data = await lanbilling.collect(cluster, window, filter)
+        data["text"] = lanbilling.fmt_report(data, cluster["label"])
+        # Сырой лог наружу не отдаём: он весит мегабайты, а в отчёте уже
+        # есть всё, ради чего его читали
+        data.pop("raw", None)
+        return data
+
+    key = "lanbilling:%s:%g:%s" % (name, window, filter)
+    return await tasks.shared(key, build, ttl=60)
 
 
 @router.get("/api/memory/{name}", tags=["Диагностика"],
