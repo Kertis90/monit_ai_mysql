@@ -329,6 +329,7 @@ def application() -> None:
         tables_picked_by_model()
         settings_reach_the_agent()
         ask_has_a_way_out()
+        css_names_are_unique()
         answer_in_words()
 
         c.post("/api/logout")
@@ -3941,8 +3942,8 @@ def ask_has_a_way_out() -> None:
         print("  [ном] node не найден — прогон разметки пропущен")
 
     css = (ROOT / "web" / "style.css").read_text(encoding="utf-8")
-    check("подсказка под вопросом оформлена", ".ask-hint" in css, True)
-    check("и сами кнопки тоже", ".ask-btn" in css, True)
+    check("подсказка под вопросом оформлена", ".ask-note" in css, True)
+    check("и сами кнопки тоже", ".ask-choice" in css, True)
 
     # Служебные записи идут перед пузырём ответа, а не после него: иначе
     # ответ висит над собственными шагами, будто готов раньше них
@@ -4136,6 +4137,58 @@ def names_come_from_schema() -> None:
           "ОТ ПРАВИЛЬНОГО ОТВЕТА НЕ ОТРЕКАЙСЯ" in prompt, True)
     check("и объяснено, почему",
           "согласие принимают на веру" in prompt, True)
+
+
+# Классы, объявленные на верхнем уровне дважды намеренно: поздний раздел
+# стилей переопределяет ранний через величины оформления. Список закрытый —
+# всё, что появится сверх него, почти наверняка случайное совпадение имён.
+KNOWN_RESTYLED = {
+    "blk-inner", "chat-pane", "ctx-chip", "ghost-btn", "pane-actions",
+    "pane-head", "side-title", "sidebar", "stat-label", "tab", "tabs",
+    "toast",
+}
+
+
+def css_names_are_unique() -> None:
+    """Два класса с одним именем и разным смыслом — невидимая поломка.
+
+    Так уже трижды выходило. `.icon-btn` кнопки темы забрал размеры у
+    кнопки боковой панели; `.range-pick` с display:inline-flex перебил
+    hidden; а `.ask-btn` кнопок «продолжаем?» совпал с кнопкой карточки
+    кластера, у которой opacity: 0 до наведения, — кнопки были в разметке,
+    честно приходили с сервера и не были видны человеку ни разу.
+
+    Поиск по файлу такое не ловит: строки на месте, разметка верная.
+    Ловится только сравнением имён.
+    """
+    import re as _re
+
+    css = (ROOT / "web" / "style.css").read_text(encoding="utf-8")
+    seen, depth = {}, 0
+    for number, line in enumerate(css.split("\n"), 1):
+        found = _re.match(r"^\.([a-z0-9_-]+)\s*\{", line.strip())
+        if found and depth == 0:
+            seen.setdefault(found.group(1), []).append(number)
+        depth += line.count("{") - line.count("}")
+
+    twice = {name: lines for name, lines in seen.items() if len(lines) > 1}
+    surprise = {n: ls for n, ls in twice.items() if n not in KNOWN_RESTYLED}
+    check("новых совпадений имён классов нет",
+          ", ".join("%s (%s)" % (n, ls) for n, ls in sorted(surprise.items())),
+          "")
+
+    # Кнопки вопроса агента обязаны владеть своими именами единолично
+    for name in ("ask-panel", "ask-text", "ask-choices", "ask-choice",
+                 "ask-lead", "ask-note", "stale-banner"):
+        check("класс .%s объявлен один раз" % name, len(seen.get(name, [])), 1)
+
+    # И не быть спрятанными: прозрачность и display:none в этих правилах
+    # означали бы ровно ту поломку, ради которой проверка и написана
+    block = css[css.index(".ask-panel"):css.index(".ask-note")]
+    check("кнопки вопроса не прячутся прозрачностью",
+          "opacity: 0" in block.replace("opacity: 0;", "").replace(
+              "opacity: 0,", ""), False)
+    check("и не скрываются вовсе", "display: none" in block, False)
 
 
 def websocket(client) -> None:

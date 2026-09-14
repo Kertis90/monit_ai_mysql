@@ -321,11 +321,11 @@ const App = (() => {
   // вкладке никто бы не увидел.
   function showAsk(msg) {
     // Убираем молча: это не ответ человека, а замена вопроса
-    const stale = $('ask-box');
+    const stale = $('ask-panel');
     if (stale) stale.remove();
     const box = document.createElement('div');
-    box.className = 'ask-box';
-    box.id = 'ask-box';
+    box.className = 'ask-panel';
+    box.id = 'ask-panel';
 
     // Если вариантов не пришло, подставляем свои: вопрос без кнопок —
     // тупик, человек не может ни ответить, ни писать в чат
@@ -334,7 +334,7 @@ const App = (() => {
       { value: 'no',  label: 'Ответить по тому, что есть' },
     ];
     const opts = choices.map((o, i) =>
-      '<button class="ask-btn' + (i === 0 ? ' ask-primary' : '') +
+      '<button class="ask-choice' + (i === 0 ? ' ask-lead' : '') +
       '" type="button" data-v="' + esc(o.value) + '">' +
       esc(o.label) + '</button>').join('');
     // Срок ответа: если не ответить, агент закончит сам. Человек должен
@@ -344,15 +344,15 @@ const App = (() => {
                  '«нет» — отвечать по собранному.' +
                  (wait ? ' Без ответа агент закончит сам примерно через ' +
                          wait + ' мин.' : '');
-    box.innerHTML = '<div class="ask-q">' + esc(msg.question || '') + '</div>' +
-                    '<div class="ask-row">' + opts + '</div>' +
-                    '<div class="ask-hint">' + esc(hint) + '</div>';
+    box.innerHTML = '<div class="ask-text">' + esc(msg.question || '') + '</div>' +
+                    '<div class="ask-choices">' + opts + '</div>' +
+                    '<div class="ask-note">' + esc(hint) + '</div>';
 
     box.addEventListener('click', (e) => {
-      const b = e.target.closest('.ask-btn');
+      const b = e.target.closest('.ask-choice');
       if (!b) return;
       // Кнопки гасим сразу: ответ уже ушёл, второй клик ничего не изменит
-      box.querySelectorAll('.ask-btn').forEach(x => { x.disabled = true; });
+      box.querySelectorAll('.ask-choice').forEach(x => { x.disabled = true; });
       if (state.wsReady) {
         state.ws.send(JSON.stringify({ type: 'answer',
                                        thread_id: state.threadId,
@@ -393,7 +393,7 @@ const App = (() => {
   function closeAsk(value) {
     state.asking = false;
     lockInputBack();
-    const box = $('ask-box');
+    const box = $('ask-panel');
     if (!box) return;
     box.remove();
     if (value === 'yes')      inlineNote('Продолжаем сбор данных');
@@ -461,7 +461,7 @@ const App = (() => {
     bar.innerHTML =
       '<span>Агент версии ' + esc(server) + ', а ' + esc(why) +
       '. Часть кнопок и разделов может не работать.</span>' +
-      '<button class="ask-btn" type="button">Обновить страницу</button>';
+      '<button class="ask-choice" type="button">Обновить страницу</button>';
     bar.querySelector('button').addEventListener('click', () => {
       location.reload(true);
     });
@@ -1088,7 +1088,7 @@ const App = (() => {
            onclick="App.openCluster('${c.name}')"
            title="Открыть метрики и диагностику кластера">
         <div class="cname">${esc(c.label)}
-          <button class="ask-btn" title="Спросить о нём в чате"
+          <button class="card-ask" title="Спросить о нём в чате"
                   onclick="event.stopPropagation();App.pickCluster('${c.name}')">💬</button>
         </div>
         <div class="cmeta">${esc(c.primary_ip)}${c.replica_ip ? ' · ' + esc(c.replica_ip) : ''}</div>

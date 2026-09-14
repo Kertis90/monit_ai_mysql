@@ -644,19 +644,19 @@ textarea#input:disabled { opacity: .55; }
 
 /* Вопрос агента посреди работы: продолжать ли сбор. Заметный, но не
    тревожный — это не ошибка, а развилка */
-.ask-box  { margin: 10px 0; padding: 12px 14px; border-radius: 10px;
+.ask-panel  { margin: 10px 0; padding: 12px 14px; border-radius: 10px;
             border: 1px solid rgb(var(--accent-rgb) / .45);
             background: rgb(var(--accent-rgb) / .07);
             animation: ask-in .22s ease both; }
-.ask-q    { font-size: 13px; margin-bottom: 10px; }
-.ask-row  { display: flex; flex-wrap: wrap; gap: 8px; }
-.ask-btn  { font: inherit; font-size: 12px; padding: 5px 12px; cursor: pointer;
+.ask-text    { font-size: 13px; margin-bottom: 10px; }
+.ask-choices  { display: flex; flex-wrap: wrap; gap: 8px; }
+.ask-choice  { font: inherit; font-size: 12px; padding: 5px 12px; cursor: pointer;
             color: inherit; background: var(--bg); border-radius: 6px;
             border: 1px solid var(--border); transition: .15s ease; }
-.ask-btn:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); }
-.ask-btn:disabled { opacity: .5; cursor: default; }
-.ask-primary { border-color: var(--accent); color: var(--accent); }
-.ask-hint { margin-top: 8px; font-size: 11px; color: var(--muted); }
+.ask-choice:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); }
+.ask-choice:disabled { opacity: .5; cursor: default; }
+.ask-lead { border-color: var(--accent); color: var(--accent); }
+.ask-note { margin-top: 8px; font-size: 11px; color: var(--muted); }
 
 /* Интерфейс не той версии, что агент. Полоса сверху и на виду: пока она
    висит, любое «не работает» объясняется именно этим */
@@ -673,7 +673,7 @@ textarea#input:disabled { opacity: .55; }
 
 @keyframes ask-in { from { opacity: 0; transform: translateY(6px); }
                     to   { opacity: 1; transform: none; } }
-@media (prefers-reduced-motion: reduce) { .ask-box { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .ask-panel { animation: none; } }
 
 /* Записанное решение инцидента */
 .resolution { margin-top: 6px; padding: 6px 10px; font-size: 12px;
@@ -1052,7 +1052,11 @@ textarea#input:disabled { opacity: .55; }
 .toast .t-sub   { color: var(--muted); font-size: 11.5px; }
 
 .cname { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.ask-btn {
+/* Кнопка «спросить про кластер» на карточке. Имя менять нельзя без
+   оглядки: класс .ask-choice уже занят кнопками вопроса агента, а два
+   одинаковых имени с разным смыслом однажды уже сделали кнопки
+   невидимыми — здесь opacity: 0 до наведения, и это правильно ЗДЕСЬ */
+.card-ask {
   border: none;
   background: transparent;
   color: var(--muted);
@@ -1062,8 +1066,8 @@ textarea#input:disabled { opacity: .55; }
   opacity: 0;
   transition: opacity .15s;
 }
-.cluster-card:hover .ask-btn { opacity: 1; }
-.ask-btn:hover { color: var(--accent); }
+.cluster-card:hover .card-ask { opacity: 1; }
+.card-ask:hover { color: var(--accent); }
 
 /* ── Бублик ожидания ────────────────────────────────────────────────
    Раздел, который «просто ничего не показывает», выглядит как поломка:
