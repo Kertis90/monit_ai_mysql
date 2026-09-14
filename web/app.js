@@ -360,7 +360,7 @@ const App = (() => {
       }
     });
 
-    $('messages').appendChild(box);
+    addToFeed(box);
     // Пока висит вопрос, писать в чат можно: это и есть способ ответить,
     // а заодно выход, если кнопки почему-то не отрисовались
     state.asking = true;
@@ -406,8 +406,62 @@ const App = (() => {
     div.className = 'muted';
     div.style.cssText = 'text-align:center;padding:6px 0;font-size:12px';
     div.textContent = '— ' + text + ' —';
-    $('messages').appendChild(div);
+    addToFeed(div);
     scrollToBottom();
+  }
+
+  function addToFeed(el) {
+    // Пузырь ответа создаётся ПЕРЕД работой и стоит в ленте последним, а
+    // всё, что происходит во время подготовки — заметки, вопрос агента, —
+    // случается раньше. Дописывая их в конец, мы получали ответ НАД ними,
+    // будто он готов раньше собственных шагов. Поэтому вставляем перед
+    // пузырём: лента читается сверху вниз по времени.
+    const wrap = $('messages');
+    const bubble = state.streamingEl ? state.streamingEl.parentElement : null;
+    if (bubble && bubble.parentElement === wrap) wrap.insertBefore(el, bubble);
+    else wrap.appendChild(el);
+  }
+
+  // Интерфейс и агент должны быть одной версии. Расхождение выглядит не
+  // как расхождение, а как необъяснимая поломка: кнопки не появляются,
+  // ответ не приходит, а в логе агента всё чисто. Поэтому проверяем сами
+  // и говорим прямо, вместо того чтобы оставлять человека гадать.
+  async function checkVersion() {
+    let mine = '';
+    const tag = document.querySelector('script[src*="app.js"]');
+    if (tag) {
+      const found = /[?&]v=([^&]+)/.exec(tag.getAttribute('src') || '');
+      mine = found ? decodeURIComponent(found[1]) : '';
+    }
+
+    let server = '';
+    try {
+      const r = await fetch('health');
+      if (r.ok) server = String((await r.json()).version || '');
+    } catch (e) { return; }        // агент недоступен — это другая беда
+    if (!server) return;
+
+    // Версии в адресе скрипта нет — страница из кэша, прежней сборки
+    if (!mine) {
+      staleBanner(server, 'страница открыта из кэша браузера');
+      return;
+    }
+    if (mine !== server) staleBanner(server, 'интерфейс версии ' + mine);
+  }
+
+  function staleBanner(server, why) {
+    if ($('stale-banner')) return;
+    const bar = document.createElement('div');
+    bar.id = 'stale-banner';
+    bar.className = 'stale-banner';
+    bar.innerHTML =
+      '<span>Агент версии ' + esc(server) + ', а ' + esc(why) +
+      '. Часть кнопок и разделов может не работать.</span>' +
+      '<button class="ask-btn" type="button">Обновить страницу</button>';
+    bar.querySelector('button').addEventListener('click', () => {
+      location.reload(true);
+    });
+    document.body.insertBefore(bar, document.body.firstChild);
   }
 
   function setChatTitle(text) {
@@ -3181,6 +3235,9 @@ const App = (() => {
     state.fingerprint = browserFingerprint();
 
     loadUser();
+    // Раньше всего остального: если интерфейс не той версии, дальнейшие
+    // странности объясняются этим, и человек должен знать об этом сразу
+    checkVersion();
 
     // Сначала история (она же скажет, какой чат текущий), затем список
     // История говорит, какой разговор текущий: только после неё можно

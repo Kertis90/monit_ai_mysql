@@ -3903,6 +3903,21 @@ def ask_has_a_way_out() -> None:
     check("подсказка под вопросом оформлена", ".ask-hint" in css, True)
     check("и сами кнопки тоже", ".ask-btn" in css, True)
 
+    # Служебные записи идут перед пузырём ответа, а не после него: иначе
+    # ответ висит над собственными шагами, будто готов раньше них
+    check("заметки встают в ленту по времени",
+          "function addToFeed" in js and "wrap.insertBefore(el, bubble)" in js,
+          True)
+    check("и вопрос агента тоже", "addToFeed(box)" in js, True)
+    check("и обычные заметки", "addToFeed(div)" in js, True)
+
+    # Расхождение версий должно называться, а не выглядеть поломкой
+    check("интерфейс сверяет свою версию с агентом",
+          "async function checkVersion" in js and "fetch('health')" in js, True)
+    check("и говорит об этом человеку",
+          "stale-banner" in js and "Обновить страницу" in js, True)
+    check("полоса о расхождении оформлена", ".stale-banner" in css, True)
+
 
 def websocket(client) -> None:
     """Разговор по WebSocket от начала до конца.
