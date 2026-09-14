@@ -357,6 +357,20 @@ LLM_API_KEY=$(sq "${LLM_API_KEY}")
 LLM_MODEL="${LLM_MODEL}"
 LLM_MAX_TOKENS=${LLM_MAX_TOKENS}
 LLM_TEMPERATURE=${LLM_TEMPERATURE}
+# Инструменты и смысловой поиск. Значения по умолчанию рабочие: менять
+# нужно, только если хочется другого поведения.
+#   LLM_TOOLS       auto | on | off — модель сама запрашивает данные
+#   LLM_TOOL_ROUNDS порция раундов, после которой агент спросит: продолжать?
+#                   0 — без предела и без вопросов
+#   LLM_TOOL_ASK_S  сколько ждать ответа на вопрос; 0 — не спрашивать
+#   EMBED_MODE      auto | on | off — поиск таблиц по смыслу
+#   EMBED_MODEL     имя модели векторов на ВАШЕМ эндпоинте; пусто — агент
+#                   спросит у него сам. Скачивать ничего не надо
+LLM_TOOLS="${LLM_TOOLS:-auto}"
+LLM_TOOL_ROUNDS=${LLM_TOOL_ROUNDS:-4}
+LLM_TOOL_ASK_S=${LLM_TOOL_ASK_S:-120}
+EMBED_MODE="${EMBED_MODE:-auto}"
+EMBED_MODEL="${EMBED_MODEL:-}"
 
 # Grafana
 GRAFANA_ADMIN_PASSWORD=$(sq "${GRAFANA_ADMIN_PASSWORD}")

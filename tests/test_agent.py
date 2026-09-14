@@ -321,6 +321,7 @@ def application() -> None:
         schema_links()
         embed_model_discovery()
         tables_picked_by_model()
+        settings_reach_the_agent()
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -3824,6 +3825,31 @@ def tables_picked_by_model() -> None:
         check("лишнего запроса к модели не было", len(asked), count)
     finally:
         llm_module.llm_complete = original
+
+
+def settings_reach_the_agent() -> None:
+    """Настройка, которой нет в .env агента, — не настройка.
+
+    Документировать переменную, которую установщик не пишет, бессмысленно:
+    задать её человеку негде, а руками правленный .env затрётся при
+    следующей установке.
+    """
+    env_block = (ROOT / "scripts" / "install_agent.sh").read_text(
+        encoding="utf-8")
+    config = (ROOT / "configure.sh").read_text(encoding="utf-8")
+
+    for name in ("LLM_TOOLS", "LLM_TOOL_ROUNDS", "LLM_TOOL_ASK_S",
+                 "EMBED_MODE", "EMBED_MODEL"):
+        check("%s доезжает до агента" % name,
+              ("%s=" % name) in env_block, True)
+        check("%s видно в config.env" % name, ("%s=" % name) in config, True)
+
+    # Смена модели не должна стирать остальной конфиг
+    update = (ROOT / "scripts" / "update_llm.sh").read_text(encoding="utf-8")
+    check("смена модели не переписывает .env целиком",
+          'cat > "$AGENT_ENV"' in update, False)
+    check("а правит нужные ключи", "set_env LLM_MODEL" in update, True)
+    check("и делает копию перед правкой", "AGENT_ENV}.bak" in update, True)
 
 
 def websocket(client) -> None:

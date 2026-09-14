@@ -194,6 +194,21 @@ LLM_API_KEY=${LLM_API_KEY}
 LLM_MODEL=${LLM_MODEL}
 LLM_MAX_TOKENS=${LLM_MAX_TOKENS}
 LLM_TEMPERATURE=${LLM_TEMPERATURE}
+# Инструменты: модель сама запрашивает нужные данные.
+# auto — проверить пробным запросом, on — принудительно, off — выключить
+LLM_TOOLS=${LLM_TOOLS:-auto}
+# Порция раундов инструментов, после которой агент спросит человека,
+# продолжать ли сбор. 0 — без предела и без вопросов
+LLM_TOOL_ROUNDS=${LLM_TOOL_ROUNDS:-4}
+# Сколько секунд ждать ответа на «продолжаем?». 0 — не спрашивать
+LLM_TOOL_ASK_S=${LLM_TOOL_ASK_S:-120}
+# Смысловой поиск по схеме: «учётные записи» находят таблицу, подписанную
+# «Абоненты». auto — проверить, on — считать доступным, off — выключить
+EMBED_MODE=${EMBED_MODE:-auto}
+# Имя модели векторов НА ВАШЕМ эндпоинте. Пусто — спросить у него самого
+# (GET /v1/models). Скачивать ничего не нужно: нет такой модели — агент
+# ищет по словам и выбором через генеративную модель
+EMBED_MODEL=${EMBED_MODEL:-}
 PROMETHEUS_URL=${PROM_URL_FOR_AGENT}
 AGENT_PORT=${AGENT_PORT}
 ROOT_PATH=${ROOT_PATH:-}
