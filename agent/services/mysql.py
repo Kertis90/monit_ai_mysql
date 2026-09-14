@@ -264,7 +264,13 @@ async def sql_run_ssh(cluster: dict, sql: str,
         return {"error": "Запрос отклонён: " + why}
 
     ip = host or cluster["primary_ip"]
-    query = sql_add_limit(sql)
+    cap = max_rows or SQL_MAX_ROWS
+    # cap обязан дойти до самого запроса, а не только до нарезки строк:
+    # без него сюда дописывался общий предел в 200 строк, и служебные
+    # запросы агента молча обрывались. Столбцы всех таблиц базы — это
+    # тысячи строк, из них доезжали первые двести, то есть несколько
+    # таблиц по алфавиту, а у остальных столбцов не было вовсе
+    query = sql_add_limit(sql, cap)
     creds = cluster_db_creds(cluster)
 
     # -B: табличный вывод через табуляцию, с заголовками
@@ -290,7 +296,6 @@ async def sql_run_ssh(cluster: dict, sql: str,
         return {"error": "Ошибка выполнения на {}: {}".format(ip, out[:300])}
 
     cols, rows = parse_mysql_batch(out)
-    cap = max_rows or SQL_MAX_ROWS
     return {"host": ip, "query": query, "columns": cols,
             "rows": rows[:cap],
             "truncated": len(rows) > cap, "via": "ssh"}

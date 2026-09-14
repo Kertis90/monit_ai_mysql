@@ -44,6 +44,10 @@ MAX_DETAIL_TABLES = 300
 MAX_COLUMNS = 120
 MAX_MATCHES = 40
 
+# Сколько таблиц опрашивать запасным путём (SHOW FULL COLUMNS). Там запрос
+# на таблицу, поэтому предел жёстче остальных.
+FALLBACK_TABLES = 40
+
 
 def _quote(value: str) -> str:
     """Строковый литерал для SQL: имена приходят от человека и от модели."""
@@ -52,6 +56,11 @@ def _quote(value: str) -> str:
 
 def _safe_name(value: str) -> str:
     return re.sub(r"[^0-9A-Za-z_$\--￿]", "", str(value or ""))[:64]
+
+
+def _ident(value: str) -> str:
+    """Имя объекта в обратных кавычках: внутри они удваиваются."""
+    return "`%s`" % str(value or "").replace("`", "``")
 
 
 def split_table(name: str) -> tuple:
@@ -206,10 +215,19 @@ async def collect(cluster: dict, host: Optional[str] = None) -> dict:
                 "indexes": indexes.get(t.get("tbl"), []),
             }
 
-    with_note = sum(1 for t in snapshot["tables"].values() if t.get("note"))
-    cols_with_note = sum(1 for t in snapshot["tables"].values()
-                         for c in (t.get("columns") or []) if c.get("note"))
-    snapshot["comments"] = {"tables": with_note, "columns": cols_with_note}
+    source = "information_schema"
+    if snapshot["tables"] and not any(_count_notes(snapshot)):
+        # information_schema отдала комментарии пустыми. Это не приговор:
+        # у тех же таблиц SHOW CREATE TABLE их показывает. Идём вторым путём
+        if await _notes_via_show(cluster, host, snapshot):
+            source = "SHOW"
+            snapshot["cut"].append(
+                "комментарии прочитаны через SHOW: information_schema на "
+                "этом сервере вернула их пустыми")
+
+    with_note, cols_with_note = _count_notes(snapshot)
+    snapshot["comments"] = {"tables": with_note, "columns": cols_with_note,
+                            "source": source}
 
     if detailed >= MAX_DETAIL_TABLES:
         snapshot["cut"].append(
@@ -217,6 +235,74 @@ async def collect(cluster: dict, host: Optional[str] = None) -> dict:
             "для остальных известны только имена и размеры" % detailed)
     snapshot["host"] = dbs.get("host", "")
     return snapshot
+
+
+def _count_notes(snapshot: dict) -> tuple:
+    """Сколько комментариев набралось: у таблиц и у столбцов."""
+    tables = (snapshot.get("tables") or {}).values()
+    return (sum(1 for t in tables if t.get("note")),
+            sum(1 for t in tables for c in (t.get("columns") or [])
+                if c.get("note")))
+
+
+async def _notes_via_show(cluster: dict, host, snapshot: dict) -> int:
+    """Добрать комментарии через SHOW. Возвращает, сколько добрал.
+
+    Второй путь к тем же данным нужен потому, что на живых серверах
+    случается так: в information_schema комментарии пустые, а
+    SHOW CREATE TABLE показывает их целиком.
+
+    SHOW FULL COLUMNS, а не SHOW CREATE TABLE: комментарий приходит
+    отдельным столбцом, а не внутри текста DDL, который пришлось бы
+    разбирать регулярками — и ошибаться на каждой кавычке внутри
+    комментария. Данные те же, разбирать нечего.
+
+    Платим запросом на таблицу, поэтому сюда попадают только самые
+    крупные и только когда первый путь не дал ничего.
+    """
+    tables = snapshot.get("tables") or {}
+    added = 0
+
+    # Таблицы — один запрос на базу, это дёшево
+    for db in snapshot.get("databases") or []:
+        name = _safe_name(db.get("db"))
+        if not name:
+            continue
+        res = await sql_execute(cluster, "SHOW TABLE STATUS FROM %s"
+                                % _ident(name), host, MAX_TABLES_PER_DB + 5)
+        if res.get("error"):
+            continue
+        for row in _rows(res):
+            key = "%s.%s" % (name, row.get("Name"))
+            note = clean_comment(row.get("Comment"))
+            if note and key in tables and not tables[key].get("note"):
+                tables[key]["note"] = note
+                added += 1
+
+    # Столбцы — запрос на таблицу, поэтому с пределом
+    biggest = sorted((t for t in tables.values() if t.get("columns")),
+                     key=lambda t: -(t.get("size_mb") or 0))[:FALLBACK_TABLES]
+    for t in biggest:
+        res = await sql_execute(cluster, "SHOW FULL COLUMNS FROM %s.%s"
+                                % (_ident(t["db"]), _ident(t["table"])),
+                                host, MAX_COLUMNS + 10)
+        if res.get("error"):
+            continue
+        notes = {}
+        for row in _rows(res):
+            notes[row.get("Field")] = clean_comment(row.get("Comment"))
+        for col in t["columns"]:
+            note = notes.get(col.get("col"))
+            if note and not col.get("note"):
+                col["note"] = note
+                added += 1
+
+    if added and len(biggest) >= FALLBACK_TABLES:
+        snapshot["cut"].append(
+            "комментарии столбцов через SHOW добраны для %d самых крупных "
+            "таблиц: это запрос на таблицу, и делать его для всех дорого"
+            % FALLBACK_TABLES)
+    return added
 
 
 # ── Хранение ─────────────────────────────────────────────────────────────
@@ -428,14 +514,25 @@ def fmt_snapshot(snapshot: dict, label: str) -> str:
         # Прямо говорим, нашлись ли комментарии: иначе по отчёту не понять,
         # то ли их не читали, то ли их нет в базе
         if comments.get("tables") or comments.get("columns"):
-            lines += ["", "  Комментарии из базы прочитаны: у %s и %s."
+            via = ""
+            if comments.get("source") == "SHOW":
+                via = (" Прочитаны через SHOW: information_schema на этом "
+                       "сервере вернула их пустыми.")
+            lines += ["", "  Комментарии из базы прочитаны: у %s и %s.%s"
                       % (count_of(comments.get("tables", 0), "таблицы",
                                   "таблиц", "таблиц"),
                          count_of(comments.get("columns", 0), "столбца",
-                                  "столбцов", "столбцов"))]
+                                  "столбцов", "столбцов"), via)]
+        elif "comments" not in snapshot:
+            # Снимок снят до того, как агент научился читать COMMENT.
+            # Сказать «комментариев нет» было бы неправдой: их не спрашивали
+            lines += ["", "  Комментарии в этом снимке не читались — он снят "
+                          "прежней версией агента. Нажмите «Снять схему» "
+                          "заново: комментарии таблиц и столбцов подтянутся."]
         else:
-            lines += ["", "  Комментариев (COMMENT) в базе не нашлось — ни у "
-                          "таблиц, ни у столбцов."]
+            lines += ["", "  Комментариев (COMMENT) не нашлось ни у таблиц, ни "
+                          "у столбцов — ни в information_schema, ни через "
+                          "SHOW. Значит, в базе их действительно нет."]
 
         biggest = sorted(tables.values(),
                          key=lambda t: -(t.get("size_mb") or 0))[:20]
@@ -523,11 +620,18 @@ def fmt_brief(snapshot: dict) -> str:
     lines = ["## Что есть в базе", "",
              "  Имена ниже — настоящие, из снимка схемы. Подробности по "
              "столбцам и индексам запрашивай инструментом get_schema, "
-             "не угадывай.",
-             "  Рядом с именем — комментарий из базы: по нему и понимай, что "
-             "в таблице лежит.",
-             "  Ищешь таблицу по смыслу («про договоры», «про платежи») — "
-             "get_schema с search ищет и по комментариям."]
+             "не угадывай."]
+    # Обещать модели комментарии, которых в снимке нет, нельзя: она станет
+    # ссылаться на них, а сослаться не на что
+    if any(_count_notes(snapshot)):
+        lines += ["  Рядом с именем — комментарий из базы: по нему и понимай, "
+                  "что в таблице лежит.",
+                  "  Ищешь таблицу по смыслу («про договоры», «про платежи») — "
+                  "get_schema с search ищет и по комментариям."]
+    else:
+        lines.append("  Комментариев (COMMENT) в этом снимке нет — понимать "
+                     "назначение таблицы придётся по имени и по данным. Если "
+                     "не уверен, так и скажи, не выдумывай.")
     tables = snapshot.get("tables") or {}
     for db in (snapshot["databases"])[:6]:
         name = db.get("db")

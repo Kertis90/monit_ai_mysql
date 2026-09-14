@@ -305,6 +305,8 @@ def application() -> None:
         schema_comments_collected()
         schema_mentioned()
         schema_in_chat_context()
+        schema_notes_via_show()
+        sql_limit_over_ssh()
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -2670,8 +2672,28 @@ def schema_comments() -> None:
     silent = schema.fmt_snapshot(dict(snapshot, comments={"tables": 0,
                                                           "columns": 0}),
                                  "Кемерово")
-    check("их отсутствие тоже названо прямо",
-          "Комментариев (COMMENT) в базе не нашлось" in silent, True)
+    check("их отсутствие названо прямо и с оговоркой про оба пути",
+          "ни в information_schema, ни через SHOW" in silent, True)
+
+    # Снимок прежней версии: комментарии не читались, а не отсутствуют
+    old_one = dict(snapshot)
+    old_one.pop("comments")
+    stale = schema.fmt_snapshot(old_one, "Кемерово")
+    check("старый снимок не выдаётся за отсутствие комментариев",
+          "снят прежней версией агента" in stale, True)
+    check("и сказано, что делать", "Снять схему" in stale, True)
+
+    # Модели не обещаем того, чего в снимке нет
+    bare = schema.fmt_brief({"databases": [{"db": "billing", "tables": 1,
+                                            "size_mb": 10}],
+                             "tables": {"billing.t": {"db": "billing",
+                                                      "table": "t",
+                                                      "note": "",
+                                                      "columns": []}}})
+    check("без комментариев модели про них не обещают",
+          "Рядом с именем — комментарий" in bare, False)
+    check("и прямо сказано не выдумывать",
+          "не выдумывай" in bare, True)
 
     # Приписка MySQL 5.6 — не комментарий разработчика
     check("служебная приписка вычищена",
@@ -2730,8 +2752,10 @@ def schema_comments_collected() -> None:
               table["note"], "Договоры абонентов")
         check("комментарий столбца тоже",
               table["columns"][0]["note"], "Остаток на счёте")
-        check("и посчитан", snapshot["comments"],
-              {"tables": 1, "columns": 1})
+        check("и посчитан", (snapshot["comments"]["tables"],
+                             snapshot["comments"]["columns"]), (1, 1))
+        check("и записано, откуда взят",
+              snapshot["comments"]["source"], "information_schema")
     finally:
         schema.sql_execute = original
 
@@ -2835,6 +2859,134 @@ def schema_in_chat_context() -> None:
           "устройство ЭТОЙ базы" in prompt, True)
     check("и требуется отделять проверенное от предположений",
           "проверить нечем" in prompt, True)
+
+
+def sql_limit_over_ssh() -> None:
+    """Предел строк запроса должен доходить до самого запроса.
+
+    Через SSH сюда дописывался общий предел в 200 строк независимо от
+    того, сколько запросили. Столбцы всех таблиц базы — тысячи строк:
+    доезжали первые двести, то есть несколько таблиц по алфавиту, а у
+    остальных столбцов не оказывалось вовсе. Ровно так пропали
+    комментарии, которые в базе есть.
+    """
+    from agent.services import mysql, ssh
+
+    sent = []
+
+    async def fake_ssh(ip, cmd, ok_codes=(0,), env=None):
+        sent.append(cmd)
+        return True, "col" + chr(9) + "note" + chr(10) + "a" + chr(9) + "Платежи"
+
+    original = mysql.log_ssh
+    mysql.log_ssh = fake_ssh
+    try:
+        cluster = {"name": "k", "primary_ip": "10.0.0.1", "db_user": "u",
+                   "db_password": "p"}
+        res = asyncio.run(mysql.sql_run_ssh(
+            cluster, "SELECT COLUMN_COMMENT AS note FROM information_schema.COLUMNS",
+            None, 20000))
+        check("запрошенный предел дошёл до запроса",
+              "LIMIT 20000" in sent[-1], True)
+        check("общий предел не подставился вместо него",
+              "LIMIT 200 " in sent[-1] or sent[-1].endswith("LIMIT 200"), False)
+        check("русский комментарий доехал целым",
+              res["rows"][0][1], "Платежи")
+
+        sent.clear()
+        asyncio.run(mysql.sql_run_ssh(cluster, "SELECT 1", None, 0))
+        check("без запрошенного предела действует общий",
+              "LIMIT %d" % mysql.SQL_MAX_ROWS in sent[-1], True)
+    finally:
+        mysql.log_ssh = original
+
+
+def schema_notes_via_show() -> None:
+    """Комментарии через SHOW, когда information_schema отдала пустые.
+
+    На живом сервере так и вышло: в information_schema пусто, а
+    SHOW CREATE TABLE показывает комментарии. Берём SHOW FULL COLUMNS —
+    те же данные, но отдельным столбцом, без разбора текста DDL.
+    """
+    from agent.services import schema
+
+    asked = []
+
+    async def fake_sql(cluster, sql, host=None, max_rows=0):
+        asked.append(sql)
+        low = sql.lower()
+        if "group by table_schema" in low:
+            return {"host": "10.1.0.1",
+                    "columns": ["db", "tables", "size_mb", "rows_est"],
+                    "rows": [["billing", 1, 10, 100]]}
+        if "from information_schema.tables" in low:
+            # Комментарий пустой — та самая жалоба
+            return {"columns": ["tbl", "engine", "rows_est", "size_mb",
+                                "idx_mb", "note"],
+                    "rows": [["payments", "InnoDB", 100, 10, 2, ""]]}
+        if "from information_schema.columns" in low:
+            return {"columns": ["tbl", "col", "type", "nullable", "ckey",
+                                "extra", "note"],
+                    "rows": [["payments", "amount", "decimal(10,2)", "YES",
+                              "", "", ""]]}
+        if "from information_schema.statistics" in low:
+            return {"columns": ["tbl", "idx", "cols", "non_unique",
+                                "cardinality"], "rows": []}
+        if low.startswith("show table status"):
+            return {"columns": ["Name", "Engine", "Comment"],
+                    "rows": [["payments", "InnoDB",
+                              "Платежи абонентов; InnoDB free: 1024 kB"]]}
+        if low.startswith("show full columns"):
+            return {"columns": ["Field", "Type", "Comment"],
+                    "rows": [["amount", "decimal(10,2)", "Сумма платежа"]]}
+        return {"columns": [], "rows": []}
+
+    original = schema.sql_execute
+    schema.sql_execute = fake_sql
+    try:
+        snapshot = asyncio.run(schema.collect(
+            {"name": "k", "label": "K", "primary_ip": "1.1.1.1",
+             "db_user": "u", "db_password": "p"}))
+    finally:
+        schema.sql_execute = original
+
+    table = snapshot["tables"]["billing.payments"]
+    check("комментарий таблицы добран через SHOW",
+          table["note"], "Платежи абонентов")
+    check("служебная приписка вычищена и здесь",
+          "InnoDB free" in table["note"], False)
+    check("комментарий столбца тоже добран",
+          table["columns"][0]["note"], "Сумма платежа")
+    check("и записано, что взято не из information_schema",
+          snapshot["comments"]["source"], "SHOW")
+    check("в отчёте это сказано человеку",
+          any("через SHOW" in n for n in snapshot["cut"]), True)
+
+    # Имена в обратных кавычках: иначе имя со спецсимволом развалит запрос
+    check("имя базы взято в кавычки",
+          any(chr(96) + "billing" + chr(96) in q for q in asked), True)
+
+    # Даром второй путь не ходит: комментарии есть — SHOW не нужен
+    asked.clear()
+
+    async def with_notes(cluster, sql, host=None, max_rows=0):
+        res = await fake_sql(cluster, sql, host, max_rows)
+        cols, rows = res.get("columns") or [], res.get("rows") or []
+        if "note" in cols and "tbl" in cols and "col" not in cols and rows:
+            rows[0][cols.index("note")] = "Платежи абонентов"
+        return res
+
+    schema.sql_execute = with_notes
+    try:
+        full = asyncio.run(schema.collect(
+            {"name": "k", "label": "K", "primary_ip": "1.1.1.1",
+             "db_user": "u", "db_password": "p"}))
+    finally:
+        schema.sql_execute = original
+    check("нашлись в information_schema — SHOW не запускается",
+          any(q.lower().startswith("show") for q in asked), False)
+    check("и источник записан правильно",
+          full["comments"]["source"], "information_schema")
 
 
 def websocket(client) -> None:
