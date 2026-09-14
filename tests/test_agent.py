@@ -321,6 +321,8 @@ def application() -> None:
         job_asks_and_waits()
         vector_math()
         schema_links()
+        views_are_real_objects()
+        names_come_from_schema()
         embed_model_discovery()
         tables_picked_by_model()
         settings_reach_the_agent()
@@ -4011,6 +4013,92 @@ def typed_answer_reaches_the_job(client) -> None:
     finally:
         (chat_routes.build_chat_context, chat_routes.llm_stream,
          chat_routes.llm_probe_tools, chat_routes.llm_with_tools) = original
+
+
+def views_are_real_objects() -> None:
+    """Представления — такой же объект запроса, как таблица.
+
+    Их не было в снимке, и агент выглядел выдумщиком: называл
+    существующее в базе представление, а на возражение «такой таблицы
+    нет» извинялся и переписывал запрос — то есть менял верный ответ на
+    неверный.
+    """
+    from agent.services import schema
+
+    async def fake_sql(cluster, sql, host=None, max_rows=0):
+        low = sql.lower()
+        if "group by table_schema" in low:
+            return {"host": "10.1.0.1",
+                    "columns": ["db", "tables", "size_mb", "rows_est"],
+                    "rows": [["billing", 1, 10, 100]]}
+        if "table_type = 'view'" in low:
+            return {"columns": ["tbl", "kind", "note"],
+                    "rows": [["v_balance", "VIEW", "VIEW"]]}
+        if "from information_schema.tables" in low:
+            return {"columns": ["tbl", "kind", "engine", "rows_est", "size_mb",
+                                "idx_mb", "note"],
+                    "rows": [["payments", "BASE TABLE", "InnoDB", 100, 10, 2,
+                              "Платежи"]]}
+        if "from information_schema.columns" in low:
+            return {"columns": ["tbl", "col", "type", "nullable", "ckey",
+                                "extra", "note"],
+                    "rows": [["payments", "amount", "decimal(10,2)", "YES",
+                              "", "", "Сумма"],
+                             ["v_balance", "balance", "decimal(10,2)", "YES",
+                              "", "", "Остаток"]]}
+        return {"columns": [], "rows": []}
+
+    original = schema.sql_execute
+    schema.sql_execute = fake_sql
+    try:
+        snapshot = asyncio.run(schema.collect(
+            {"name": "k", "label": "K", "primary_ip": "1.1.1.1",
+             "db_user": "u", "db_password": "p"}))
+    finally:
+        schema.sql_execute = original
+
+    check("представление попало в снимок",
+          "billing.v_balance" in snapshot["tables"], True)
+    view = snapshot["tables"]["billing.v_balance"]
+    check("и помечено как представление", view["kind"], "представление")
+    check("таблица помечена таблицей",
+          snapshot["tables"]["billing.payments"]["kind"], "таблица")
+    check("посчитано, сколько их", snapshot.get("views"), 1)
+    check("служебный комментарий VIEW не выдан за описание",
+          view["note"], "")
+    check("столбцы представления прочитаны",
+          view["columns"][0]["col"], "balance")
+
+    # В описании прямо сказано, что это представление и чем оно отличается
+    text = schema.fmt_describe(schema.describe(snapshot, "v_balance"))
+    check("в описании названо представлением",
+          "представление (VIEW)" in text, True)
+    check("и сказано, что выбирать можно так же",
+          "так же, как из таблицы" in text, True)
+
+    # В общем списке для модели пометка тоже видна
+    brief = schema.fmt_brief(snapshot)
+    check("в справке представление помечено",
+          "v_balance (VIEW)" in brief, True)
+
+
+def names_come_from_schema() -> None:
+    """Подсказка запрещает выдумывать имена и отрекаться от верного ответа."""
+    from agent.services import analysis
+
+    prompt = analysis.system_prompt()
+    check("велено сверять каждое имя со схемой",
+          "ИМЕНА БЕРИ ТОЛЬКО ИЗ СХЕМЫ" in prompt, True)
+    check("запрещено достраивать имена по смыслу",
+          "payments_archive" in prompt, True)
+    check("и переносить имена из чужих баз",
+          "из других биллингов" in prompt, True)
+    check("пометка VIEW объяснена",
+          "(VIEW) означает представление" in prompt, True)
+    check("запрещено отрекаться от верного ответа",
+          "ОТ ПРАВИЛЬНОГО ОТВЕТА НЕ ОТРЕКАЙСЯ" in prompt, True)
+    check("и объяснено, почему",
+          "согласие принимают на веру" in prompt, True)
 
 
 def websocket(client) -> None:

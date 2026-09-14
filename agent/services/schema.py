@@ -40,6 +40,9 @@ _SYS_LIST = ", ".join("'%s'" % d for d in SYSTEM_DBS)
 # а подсказка модели, забитая именами, вытесняет всё остальное.
 MAX_DBS = 20
 MAX_TABLES_PER_DB = 80
+# Представления считаем отдельно: их обычно немного, а вытеснять ими
+# таблицы из снимка нельзя
+MAX_VIEWS_PER_DB = 40
 MAX_DETAIL_TABLES = 300
 MAX_COLUMNS = 120
 MAX_MATCHES = 40
@@ -98,6 +101,12 @@ def clean_comment(value) -> str:
     return " ".join(text.split())[:400]
 
 
+def _kind_of(row: dict) -> str:
+    """Таблица или представление. Разница видна и человеку, и модели."""
+    return ("представление"
+            if str(row.get("kind") or "").upper() == "VIEW" else "таблица")
+
+
 def _num(value):
     try:
         return int(float(value))
@@ -139,8 +148,14 @@ async def collect(cluster: dict, host: Optional[str] = None) -> dict:
         if not name:
             continue
 
+        # Представления берём наравне с таблицами. Выбирать из них можно
+        # так же, и без них агент выглядит выдумщиком: называет
+        # существующий объект, а в снимке его нет — значит «придумал».
+        # Сортировка по размеру ставит их в конец (размера у них нет),
+        # поэтому берём отдельным запросом, чтобы таблицы их не вытеснили
         tbls = await sql_execute(cluster, """
-            SELECT TABLE_NAME AS tbl, ENGINE AS engine, TABLE_ROWS AS rows_est,
+            SELECT TABLE_NAME AS tbl, TABLE_TYPE AS kind, ENGINE AS engine,
+                   TABLE_ROWS AS rows_est,
                    ROUND((DATA_LENGTH + INDEX_LENGTH) / 1048576) AS size_mb,
                    ROUND(INDEX_LENGTH / 1048576) AS idx_mb,
                    TABLE_COMMENT AS note
@@ -155,6 +170,21 @@ async def collect(cluster: dict, host: Optional[str] = None) -> dict:
             continue
 
         rows = _rows(tbls)
+
+        views = await sql_execute(cluster, """
+            SELECT TABLE_NAME AS tbl, TABLE_TYPE AS kind, TABLE_COMMENT AS note
+              FROM information_schema.TABLES
+             WHERE TABLE_SCHEMA = %s AND TABLE_TYPE = 'VIEW'
+             ORDER BY TABLE_NAME
+             LIMIT %d""" % (_quote(name), MAX_VIEWS_PER_DB),
+            host, MAX_VIEWS_PER_DB + 5)
+        if not views.get("error"):
+            seen_views = _rows(views)
+            rows += seen_views
+            if seen_views:
+                snapshot.setdefault("views", 0)
+                snapshot["views"] += len(seen_views)
+
         if _num(db.get("tables")) and _num(db.get("tables")) > len(rows):
             snapshot["cut"].append(
                 "%s — в снимке %d самых крупных таблиц из %s"
@@ -227,7 +257,8 @@ async def collect(cluster: dict, host: Optional[str] = None) -> dict:
             key = "%s.%s" % (name, t.get("tbl"))
             snapshot["tables"][key] = {
                 "db": name, "table": t.get("tbl"),
-                "engine": t.get("engine"), "rows_est": _num(t.get("rows_est")),
+                "engine": t.get("engine"), "kind": _kind_of(t),
+                "rows_est": _num(t.get("rows_est")),
                 "size_mb": _num(t.get("size_mb")), "idx_mb": _num(t.get("idx_mb")),
                 "note": clean_comment(t.get("note")),
                 "columns": columns.get(t.get("tbl"), []),
@@ -829,9 +860,16 @@ def fmt_snapshot(snapshot: dict, label: str) -> str:
 def fmt_describe(data: dict) -> str:
     if data.get("error"):
         return "## Таблица\n\n  %s" % data["error"]
-    lines = ["## %s.%s — строк ~%s, %s МБ"
-             % (data["db"], data["table"], data.get("rows_est"),
-                data.get("size_mb"))]
+    if data.get("kind") == "представление":
+        lines = ["## %s.%s — представление (VIEW)"
+                 % (data["db"], data["table"]),
+                 "  Выбирать из него можно так же, как из таблицы. Своих "
+                 "данных и индексов у него нет: они у таблиц, на которых "
+                 "оно построено."]
+    else:
+        lines = ["## %s.%s — строк ~%s, %s МБ"
+                 % (data["db"], data["table"], data.get("rows_est"),
+                    data.get("size_mb"))]
     if data.get("note"):
         lines.append("  " + data["note"])
     lines += ["", "  Столбцы:"]
@@ -951,10 +989,12 @@ def fmt_brief(snapshot: dict) -> str:
         # назначение таблицы. Без него — списком, чтобы не раздувать подсказку
         plain = []
         for t in picked:
+            mark = " (VIEW)" if t.get("kind") == "представление" else ""
             if t.get("note"):
-                lines.append("    %-30s — %s" % (t["table"], t["note"][:90]))
+                lines.append("    %-30s — %s"
+                             % (t["table"] + mark, t["note"][:90]))
             else:
-                plain.append(t["table"])
+                plain.append(t["table"] + mark)
         if plain:
             lines.append("    без комментария: " + ", ".join(plain))
     return "\n".join(lines)
