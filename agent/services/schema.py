@@ -331,6 +331,75 @@ def find(snapshot: dict, needle: str) -> dict:
     return {"needle": text, "matches": matches[:MAX_MATCHES]}
 
 
+# Слова короче этого в поиске по комментариям бесполезны: «по», «из»,
+# «на» найдутся везде
+MEANINGFUL_WORD = 4
+
+# По скольким первым буквам считаем слова одним и тем же. Пять — потому
+# что «платеж»/«платежи»/«платежей» совпадают, а «договор» и «догонять»
+# уже нет.
+STEM = 5
+
+
+def mentioned(snapshot: dict, text: str, limit: int = 3) -> list:
+    """Про какие таблицы спрашивают. Возвращает ключи «база.таблица».
+
+    Нужно потому, что описание таблицы обязано попасть в подсказку само.
+    Полагаться на то, что модель сходит за ним инструментом, нельзя: не
+    всякий эндпоинт умеет вызовы функций, и тогда модель отвечает по
+    смыслу имени — то есть выдумывает столбцы, которых нет.
+
+    Сначала ищем по именам, потом по комментариям: имена в базе
+    английские, а спрашивают по-русски.
+    """
+    tables = snapshot.get("tables") or {}
+    if not tables or not str(text or "").strip():
+        return []
+
+    low = str(text).lower()
+    words = set(re.findall(r"[0-9a-zа-яё_]{3,}", low))
+    found = []
+
+    # Полное имя «база.таблица» — самое надёжное совпадение
+    for key in tables:
+        if key.lower() in low:
+            found.append(key)
+
+    # Имя таблицы отдельным словом. Подстрокой нельзя: «log» найдётся в
+    # половине схемы и утопит ответ в лишнем
+    for key, table in tables.items():
+        if key in found:
+            continue
+        if str(table.get("table", "")).lower() in words:
+            found.append(key)
+
+    if found:
+        return _by_size(tables, found)[:limit]
+
+    # По комментариям: «сколько платежей» должно находить таблицу с
+    # комментарием «Платежи». Сравниваем по основе слова, иначе падежи и
+    # числа не совпадут ни разу — а спрашивают именно ими.
+    asked = {w[:STEM] for w in words if len(w) >= MEANINGFUL_WORD}
+    for key, table in tables.items():
+        note = str(table.get("note") or "").lower()
+        if not note:
+            continue
+        stems = {w[:STEM] for w in re.findall(r"[0-9a-zа-яё_]{3,}", note)}
+        if asked & stems:
+            found.append(key)
+    return _by_size(tables, found)[:limit]
+
+
+def _by_size(tables: dict, keys: list) -> list:
+    """Крупные вперёд: спрашивают обычно про них, а не про справочник."""
+    seen, unique = set(), []
+    for key in keys:
+        if key not in seen:
+            seen.add(key)
+            unique.append(key)
+    return sorted(unique, key=lambda k: -(tables[k].get("size_mb") or 0))
+
+
 # ── Вывод ────────────────────────────────────────────────────────────────
 
 def fmt_snapshot(snapshot: dict, label: str) -> str:

@@ -408,6 +408,31 @@ async def llm_with_tools(messages: list) -> tuple:
     return convo, used
 
 
+async def schema_blocks(cluster_name: str, user_message: str) -> list:
+    """Схема для подсказки: общий список плюс описания нужных таблиц.
+
+    Описание кладём сами, а не надеемся, что модель сходит за ним
+    инструментом. Не всякий эндпоинт умеет вызовы функций, и тогда модель
+    отвечает по смыслу имени таблицы — то есть перечисляет столбцы,
+    которых в ней нет. Это хуже отказа: выдумка выглядит как ответ.
+    """
+    from agent.services import schema as schema_service
+
+    snapshot = await schema_service.load(cluster_name)
+    if not snapshot:
+        return []
+
+    out = []
+    brief = schema_service.fmt_brief(snapshot)
+    if brief:
+        out.append(brief)
+
+    for key in schema_service.mentioned(snapshot, user_message):
+        out.append(schema_service.fmt_describe(
+            schema_service.describe(snapshot, key)))
+    return out
+
+
 async def build_chat_context(user_message: str, progress=None
                              ) -> tuple[str, Optional[dict], float]:
     """Определить кластер и временное окно, собрать контекст метрик.
@@ -477,11 +502,7 @@ async def build_chat_context(user_message: str, progress=None
         # верхнего слоя модель не знает имён и либо отказывается писать
         # выборку, либо придумывает таблицы
         try:
-            from agent.services import schema as schema_service
-            brief = schema_service.fmt_brief(
-                await schema_service.load(cluster["name"]))
-            if brief:
-                blocks.append(brief)
+            blocks += await schema_blocks(cluster["name"], user_message)
         except Exception as exc:
             logger.info("Справка по схеме не добавлена: %s", exc)
 
@@ -631,6 +652,19 @@ async def build_chat_context(user_message: str, progress=None
                 f"conn={p.get('connections_pct','?')}%  "
                 f"CPU={p.get('cpu_pct','?')}%  лаг={lag}s")
         blocks.append("\n".join(lines))
+
+        # Про таблицу спрашивают, не называя города. Ищем её по снимкам:
+        # без этого модель отвечает по смыслу имени, то есть выдумывает
+        for c in clusters:
+            try:
+                found = await schema_blocks(c["name"], user_message)
+            except Exception as exc:
+                logger.info("Схема %s не добавлена: %s", c["name"], exc)
+                continue
+            # Общий список кладём один раз, описания таблиц — только те,
+            # что нашлись: в другом кластере схема может быть иной
+            if len(found) > 1:
+                blocks += found[1:]
 
         # Спросили про историю, но город не назвали — раньше в контекст
         # уходил только текущий статус, и агент отвечал, что данных нет.

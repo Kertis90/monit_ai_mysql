@@ -303,6 +303,8 @@ def application() -> None:
         schema_decimal()
         schema_comments()
         schema_comments_collected()
+        schema_mentioned()
+        schema_in_chat_context()
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -2732,6 +2734,107 @@ def schema_comments_collected() -> None:
               {"tables": 1, "columns": 1})
     finally:
         schema.sql_execute = original
+
+
+def schema_mentioned() -> None:
+    """Про какую таблицу спросили — агент должен понять сам.
+
+    Иначе описание таблицы в подсказку не попадёт, и модель ответит по
+    смыслу имени: перечислит столбцы, которых в базе нет.
+    """
+    from agent.services import schema
+
+    snapshot = dict(SCHEMA_WITH_COMMENTS, tables=dict(
+        SCHEMA_WITH_COMMENTS["tables"],
+        **{"billing.payments": {"db": "billing", "table": "payments",
+                                "size_mb": 900, "note": "Платежи абонентов",
+                                "columns": [], "indexes": []}}))
+
+    check("полное имя базы и таблицы",
+          schema.mentioned(snapshot, "что лежит в billing.agreements"),
+          ["billing.agreements"])
+    check("имя таблицы отдельным словом",
+          schema.mentioned(snapshot, "какие поля в таблице agreements?"),
+          ["billing.agreements"])
+    check("русский вопрос находит английскую таблицу по комментарию",
+          schema.mentioned(snapshot, "сколько платежей за вчера"),
+          ["billing.payments"])
+    check("падеж комментарию не мешает",
+          schema.mentioned(snapshot, "по договорам есть долги?"),
+          ["billing.agreements"])
+
+    # Подстрокой искать нельзя: log найдётся в половине схемы
+    check("случайная подстрока не тянет лишние таблицы",
+          schema.mentioned(snapshot, "посмотри log"), [])
+    check("вопрос не про данные ничего не цепляет",
+          schema.mentioned(snapshot, "как дела в Кемерово"), [])
+    check("пустой вопрос безопасен",
+          schema.mentioned(snapshot, ""), [])
+    check("без снимка пусто", schema.mentioned({}, "agreements"), [])
+
+    # Крупные вперёд: спрашивают про них, а не про справочник
+    both = schema.mentioned(snapshot, "сверь agreements и payments")
+    check("две таблицы, крупная первой", both,
+          ["billing.agreements", "billing.payments"])
+    check("больше трёх таблиц в подсказку не льём",
+          len(schema.mentioned(snapshot, "agreements payments log_tmp",
+                               limit=2)), 2)
+
+
+def schema_in_chat_context() -> None:
+    """Описание таблицы кладём в подсказку сами.
+
+    Ждать, что модель сходит за ним инструментом, нельзя: не всякий
+    эндпоинт умеет вызовы функций. Тогда в контексте не будет столбцов —
+    и модель их придумает.
+    """
+    from agent.services import assistant, schema
+
+    snapshot = SCHEMA_WITH_COMMENTS
+    original = schema.load
+
+    async def fake_load(name):
+        return snapshot if name == "kemerovo" else None
+
+    schema.load = fake_load
+    try:
+        blocks = asyncio.run(assistant.schema_blocks(
+            "kemerovo", "какие поля в agreements?"))
+        text = "\n".join(blocks)
+        check("общий список таблиц приложен",
+              "## Что есть в базе" in text, True)
+        check("описание нужной таблицы приложено",
+              "## billing.agreements" in text, True)
+        check("столбцы в подсказке настоящие",
+              "balance" in text and "decimal(10,2)" in text, True)
+        check("комментарии столбцов тоже приложены",
+              "Остаток на счёте" in text, True)
+
+        only = asyncio.run(assistant.schema_blocks(
+            "kemerovo", "что с нагрузкой на базу?"))
+        check("вопрос не про таблицы — только общий список", len(only), 1)
+
+        check("без снимка схемы блоков нет",
+              asyncio.run(assistant.schema_blocks("novosibirsk", "agreements")),
+              [])
+    finally:
+        schema.load = original
+
+    # Правило в подсказке: столбцы берутся только из приложенного блока
+    from agent.services import analysis
+    prompt = analysis.system_prompt()
+    check("модели запрещено выдумывать столбцы",
+          "СТОЛБЦЫ НЕ ВЫДУМЫВАЙ" in prompt, True)
+    check("сказано, что делать без схемы",
+          "структуры этой таблицы у меня нет" in prompt, True)
+    check("и что общий список — не список столбцов",
+          "Перечислять по нему столбцы нельзя" in prompt, True)
+    check("запрет выдумывать распространён на всё, чего агент не знает",
+          "НЕ ЗНАЕШЬ — ТАК И СКАЖИ" in prompt, True)
+    check("сказано не выдавать чужие базы за эту",
+          "устройство ЭТОЙ базы" in prompt, True)
+    check("и требуется отделять проверенное от предположений",
+          "проверить нечем" in prompt, True)
 
 
 def websocket(client) -> None:
