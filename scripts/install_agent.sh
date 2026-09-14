@@ -209,6 +209,11 @@ EMBED_MODE=${EMBED_MODE:-auto}
 # (GET /v1/models). Скачивать ничего не нужно: нет такой модели — агент
 # ищет по словам и выбором через генеративную модель
 EMBED_MODEL=${EMBED_MODEL:-}
+# Тяжёлый запрос агент сначала взвешивает по EXPLAIN и спрашивает
+# человека. 0 — не спрашивать и выполнять сразу
+SQL_CONFIRM_S=${SQL_CONFIRM_S:-120}
+# С какой оценки числа строк запрос считается тяжёлым
+SQL_HEAVY_ROWS=${SQL_HEAVY_ROWS:-1000000}
 PROMETHEUS_URL=${PROM_URL_FOR_AGENT}
 AGENT_PORT=${AGENT_PORT}
 ROOT_PATH=${ROOT_PATH:-}

@@ -140,6 +140,12 @@ class SQLSettings(BaseModel):
     timeout_s: int = 15
     max_rows:  int = 200
     via_ssh:   str = "direct"     # direct | tunnel | exec
+    # Сколько ждать подтверждения на тяжёлый запрос. 0 — не спрашивать
+    # и выполнять сразу, как было раньше
+    confirm_s: float = 120.0
+    # Во сколько строк по оценке оптимизатора запрос считается тяжёлым.
+    # Оценки перемножаются: тысяча на тысячу — это миллион
+    heavy_rows: int = 1000000
 
 
 class Settings(BaseModel):
@@ -281,6 +287,8 @@ def load_settings() -> Settings:
             timeout_s = int(_env("SQL_TIMEOUT_S", "15")),
             max_rows  = int(_env("SQL_MAX_ROWS", "200")),
             via_ssh   = _env("DB_VIA_SSH", "direct").strip().lower(),
+            confirm_s = max(0.0, float(_env("SQL_CONFIRM_S", "120"))),
+            heavy_rows = max(0, int(_env("SQL_HEAVY_ROWS", "1000000"))),
         ),
     )
 

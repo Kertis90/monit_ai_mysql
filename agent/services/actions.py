@@ -88,11 +88,72 @@ def _outcome(result) -> str:
     body = " ".join(body.split())
     low = body.lower()
 
-    if "ошибка" in low[:200] or "отклонён" in low[:200] or "не найден" in low[:200]:
-        return "ОШИБКА: " + body[:160]
+    if body.startswith("ОТКАЗ ЧЕЛОВЕКА"):
+        return "НЕ ВЫПОЛНЯЛСЯ: человек отменил тяжёлый запрос"
+    # «Строк не найдено» проверяем раньше ошибок: это успешный ответ, а
+    # подстрока «не найден» в нём есть
     if "строк не найдено" in low:
         return "выполнено, строк не найдено"
+    if "ошибка" in low[:200] or "отклонён" in low[:200] or "не найден" in low[:200]:
+        return "ОШИБКА: " + body[:160]
     return "выполнено, ответ получен (%d символов)" % len(text)
+
+
+# Как называть инструменты человеку. «get_workload» ничего не говорит
+# тому, кто просто задал вопрос
+HUMAN = {
+    "run_sql":             ("Запрос", "выполнен", "отменён"),
+    "get_schema":          ("Схема", "прочитана", "не прочитана"),
+    "explain_query":       ("План запроса", "получен", "не получен"),
+    "run_diagnostics":     ("Диагностика", "собрана", "не собрана"),
+    "get_workload":        ("Профиль нагрузки", "снят", "не снят"),
+    "get_current_metrics": ("Метрики", "собраны", "не собраны"),
+    "get_history":         ("История", "собрана", "не собрана"),
+    "get_breakdown":       ("Разбивка по интервалам", "готова", "не готова"),
+    "get_replication":     ("Состояние репликации", "получено", "не получено"),
+    "read_logs":           ("Логи", "прочитаны", "не прочитаны"),
+    "analyse_app_log":     ("Логи АСР", "разобраны", "не разобраны"),
+    "get_alerts":          ("Алерты", "собраны", "не собраны"),
+}
+DEFAULT_HUMAN = ("Инструмент", "отработал", "не отработал")
+
+
+def progress_line(name: str, args: dict, result) -> str:
+    """Чем кончился вызов — одной строкой для показа в чате.
+
+    Человек ждёт ответа минуту и дольше. Видеть, что запрос уже выполнен и
+    вернул пять строк, — не то же самое, что смотреть на три точки: по
+    первому понятно, что работа идёт и в какую сторону.
+    """
+    subject, done, failed = HUMAN.get(str(name), DEFAULT_HUMAN)
+    outcome = _outcome(result)
+
+    if outcome.startswith("НЕ ВЫПОЛНЯЛСЯ"):
+        return "%s %s" % (subject, failed)
+    if outcome.startswith("ОШИБКА"):
+        return "%s — ошибка: %s" % (subject, outcome[8:120])
+    if "строк не найдено" in outcome:
+        return "%s %s: строк нет" % (subject, done)
+
+    if str(name) == "run_sql":
+        rows = _rows_in(result)
+        if rows is not None:
+            return "%s %s: строк %d" % (subject, done, rows)
+
+    about = str((args or {}).get("table") or (args or {}).get("search") or "")
+    return "%s %s%s" % (subject, done, (": " + about[:40]) if about else "")
+
+
+def _rows_in(text: str):
+    """Сколько строк вернул запрос. None — в ответе этого нет."""
+    for line in str(text or "").splitlines():
+        body = line.strip()
+        if body.startswith("Строк:"):
+            try:
+                return int(body.split(":", 1)[1].strip())
+            except ValueError:
+                return None
+    return None
 
 
 def fmt_block(thread_id: str) -> str:

@@ -454,6 +454,9 @@ def fmt_sql_result(res: dict) -> str:
         for r in rows:
             head.append("  " + " | ".join(text(v).ljust(w)
                                           for v, w in zip(r, widths)))
+        # Число строк отдельной строкой: модель по ней отвечает «сколько»,
+        # не пересчитывая таблицу глазами, а агент — показывает ход работы
+        head.append(f"  Строк: {len(rows)}")
         if res.get("truncated"):
             head.append(f"  (показаны первые {SQL_MAX_ROWS} строк)")
         return "\n".join(head)

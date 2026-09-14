@@ -344,7 +344,12 @@ const App = (() => {
                  '«нет» — отвечать по собранному.' +
                  (wait ? ' Без ответа агент закончит сам примерно через ' +
                          wait + ' мин.' : '');
+    // Подробности — план запроса и сам запрос. Решать «долго или нет»
+    // человек должен по тому же, по чему решал агент, а не на слово
+    const details = msg.details
+      ? '<pre class="ask-details">' + esc(msg.details) + '</pre>' : '';
     box.innerHTML = '<div class="ask-text">' + esc(msg.question || '') + '</div>' +
+                    details +
                     '<div class="ask-choices">' + opts + '</div>' +
                     '<div class="ask-note">' + esc(hint) + '</div>';
 

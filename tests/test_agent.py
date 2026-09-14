@@ -324,6 +324,8 @@ def application() -> None:
         tool_budget_is_a_question()
         repeat_does_not_end_collection()
         agent_remembers_what_it_did()
+        heavy_query_is_weighed()
+        heavy_query_asks_first()
         job_asks_and_waits()
         vector_math()
         schema_links()
@@ -3241,7 +3243,7 @@ def rounds_end_with_answer() -> None:
         async def post(self, *a, **kw):
             return FakeResponse()
 
-    async def fake_tool(name, args):
+    async def fake_tool(name, args, confirm=None):
         return "## %s\n\n  данные" % name
 
     originals = (assistant.httpx.AsyncClient, assistant.run_tool)
@@ -3349,7 +3351,7 @@ def tool_budget_is_a_question() -> None:
         async def post(self, *a, **kw):
             return FakeResponse()
 
-    async def fake_tool(name, args):
+    async def fake_tool(name, args, confirm=None):
         return "данные %s" % args.get("cluster")
 
     originals = (assistant.httpx.AsyncClient, assistant.run_tool,
@@ -3852,7 +3854,8 @@ def settings_reach_the_agent() -> None:
     config = (ROOT / "configure.sh").read_text(encoding="utf-8")
 
     for name in ("LLM_TOOLS", "LLM_TOOL_ROUNDS", "LLM_TOOL_ASK_S",
-                 "EMBED_MODE", "EMBED_MODEL"):
+                 "EMBED_MODE", "EMBED_MODEL", "SQL_CONFIRM_S",
+                 "SQL_HEAVY_ROWS"):
         check("%s доезжает до агента" % name,
               ("%s=" % name) in env_block, True)
         check("%s видно в config.env" % name, ("%s=" % name) in config, True)
@@ -3994,7 +3997,7 @@ def typed_answer_reaches_the_job(client) -> None:
 
     asked = {"answer": None}
 
-    async def fake_with_tools(messages, ask=None, note=None):
+    async def fake_with_tools(messages, ask=None, note=None, confirm=None):
         # Порция инструментов кончилась — спрашиваем человека и ждём
         if ask is not None:
             asked["answer"] = await ask(4, 4)
@@ -4236,7 +4239,7 @@ def repeat_does_not_end_collection() -> None:
 
     done = []
 
-    async def fake_tool(name, args):
+    async def fake_tool(name, args, confirm=None):
         done.append((name, args.get("table") or args.get("cluster")))
         return "данные"
 
@@ -4401,10 +4404,10 @@ def executed_sql_reaches_next_turn(client) -> None:
     async def yes_tools():
         return True
 
-    async def fake_with_tools(messages, ask=None, note=None):
+    async def fake_with_tools(messages, ask=None, note=None, confirm=None):
         # Первый ход: модель выполнила запрос
         if note is not None and len(seen_context) == 0:
-            note("run_sql",
+            await note("run_sql",
                  {"cluster": "kemerovo",
                   "sql": "SELECT uid FROM billing.vgroups LIMIT 5"},
                  "## Результат SQL\n\n  uid\n  8")
@@ -4443,6 +4446,169 @@ def executed_sql_reaches_next_turn(client) -> None:
         (chat_routes.build_chat_context, chat_routes.llm_stream,
          chat_routes.llm_probe_tools, chat_routes.llm_with_tools) = original
         actions.forget()
+
+
+def heavy_query_is_weighed() -> None:
+    """План смотрится до выполнения, а не после ожидания."""
+    from agent.services import explain
+
+    light = explain.weigh({"rows_estimate": 120, "findings": []})
+    check("лёгкий запрос тяжёлым не считается", light["heavy"], False)
+    check("и оценка названа", "120 строк" in light["short"], True)
+
+    scan = explain.weigh({"rows_estimate": 4200000, "findings": [
+        {"level": "critical", "table": "billing.agreements",
+         "what": "таблица читается целиком (4200000 строк по оценке)"}]})
+    check("полное сканирование — тяжёлый", scan["heavy"], True)
+    check("названа таблица", "billing.agreements" in scan["short"], True)
+
+    # Сортировка без индекса на объёме — тоже тяжело, а на сотне строк нет
+    big_sort = explain.weigh({"rows_estimate": 300000, "findings": [
+        {"level": "warning", "table": "p", "what": "сортировка идёт без индекса"}]})
+    check("сортировка на объёме — тяжёлый", big_sort["heavy"], True)
+    small_sort = explain.weigh({"rows_estimate": 900, "findings": [
+        {"level": "warning", "table": "p", "what": "сортировка идёт без индекса"}]})
+    check("та же сортировка на сотнях строк — нет", small_sort["heavy"], False)
+
+    # Миллионы строк без единого замечания — всё равно ждать долго
+    many = explain.weigh({"rows_estimate": 9000000, "findings": []})
+    check("миллионы строк — тяжёлый сам по себе", many["heavy"], True)
+    check("число названо человеку", "9 000 000" in many["short"], True)
+
+    # План не получился — это не повод объявлять запрос тяжёлым
+    check("без плана не гадаем",
+          explain.weigh({"error": "нет прав на EXPLAIN"})["heavy"], False)
+
+
+def heavy_query_asks_first() -> None:
+    """Тяжёлый запрос не выполняется, пока человек не согласится."""
+    from agent.services import assistant, explain
+
+    plan = {"heavy": True}
+    asked, ran = [], []
+
+    async def fake_explain(cluster, sql="", connection_id=0, host=None,
+                           with_schema=True):
+        return {"rows_estimate": 4200000, "findings": [
+            {"level": "critical", "table": "billing.agreements",
+             "what": "таблица читается целиком (4200000 строк по оценке)"}]
+        } if plan["heavy"] else {"rows_estimate": 50, "findings": []}
+
+    async def fake_sql(cluster, sql, host=None, max_rows=0):
+        ran.append(sql)
+        return {"host": "10.1.0.1", "query": sql, "columns": ["n"],
+                "rows": [[5]]}
+
+    answer = {"say": False}
+
+    async def fake_confirm(sql, verdict):
+        asked.append((sql, verdict))
+        return answer["say"]
+
+    cluster = {"name": "kemerovo", "label": "Кемерово", "primary_ip": "1.1.1.1",
+               "db_user": "u", "db_password": "p"}
+
+    originals = (explain.explain, assistant.sql_execute,
+                 assistant.find_cluster)
+    explain.explain = fake_explain
+    assistant.sql_execute = fake_sql
+    assistant.find_cluster = lambda name: cluster
+    try:
+        # Отказ: запрос не выполняется вовсе
+        out = asyncio.run(assistant.run_tool(
+            "run_sql", {"cluster": "kemerovo",
+                        "sql": "SELECT * FROM billing.agreements"},
+            fake_confirm))
+        check("спросили перед выполнением", len(asked), 1)
+        check("человеку показали, во что обойдётся",
+              "читается целиком" in asked[0][1]["short"], True)
+        check("после отказа запрос не выполнялся", ran, [])
+        check("модели сказано прямо, что это отказ",
+              out.startswith("ОТКАЗ ЧЕЛОВЕКА"), True)
+        check("и что повторять бессмысленно",
+              "Не выполняй его повторно" in out, True)
+        check("предложено, чем заменить", "сузить период" in out, True)
+
+        # Согласие: выполняется
+        answer["say"] = True
+        asked.clear()
+        out = asyncio.run(assistant.run_tool(
+            "run_sql", {"cluster": "kemerovo",
+                        "sql": "SELECT * FROM billing.agreements"},
+            fake_confirm))
+        check("после согласия выполнили", len(ran), 1)
+        check("результат вернулся модели", "Результат SQL" in out, True)
+
+        # Лёгкий запрос не тревожит человека
+        plan["heavy"] = False
+        asked.clear()
+        ran.clear()
+        asyncio.run(assistant.run_tool(
+            "run_sql", {"cluster": "kemerovo",
+                        "sql": "SELECT COUNT(*) FROM billing.agreements "
+                               "WHERE uid = 5"},
+            fake_confirm))
+        check("лёгкий запрос спрашивать не о чем", asked, [])
+        check("и выполнен сразу", len(ran), 1)
+
+        # Без спрашивающего всё работает по-старому
+        ran.clear()
+        plan["heavy"] = True
+        asyncio.run(assistant.run_tool(
+            "run_sql", {"cluster": "kemerovo", "sql": "SELECT 1"}))
+        check("без подтверждающего выполняем сразу", len(ran), 1)
+    finally:
+        (explain.explain, assistant.sql_execute,
+         assistant.find_cluster) = originals
+
+    # Отказ в журнале — не ошибка агента
+    from agent.services import actions
+    actions.forget()
+    actions.record("t-h", "run_sql", {"cluster": "k", "sql": "SELECT 1"},
+                   "ОТКАЗ ЧЕЛОВЕКА: запрос не выполнялся. План показал…")
+    check("в журнале отказ отличён от ошибки",
+          "НЕ ВЫПОЛНЯЛСЯ" in actions.fmt_block("t-h"), True)
+    actions.forget()
+
+    # Ход работы виден человеку, пока она идёт
+    rows = "## Результат SQL\n\n  uid\n  8\n  Строк: 5"
+    check("после запроса видно, сколько строк",
+          actions.progress_line("run_sql", {}, rows),
+          "Запрос выполнен: строк 5")
+    check("пустой ответ не выдаётся за ошибку",
+          actions.progress_line("run_sql", {}, "## Результат SQL\n\n  "
+                                               "Строк не найдено."),
+          "Запрос выполнен: строк нет")
+    check("отказ назван отказом",
+          actions.progress_line("run_sql", {}, "ОТКАЗ ЧЕЛОВЕКА: не выполнялся"),
+          "Запрос отменён")
+    check("ошибка названа ошибкой и показана",
+          actions.progress_line("run_sql", {}, "## Результат SQL\n\n  "
+                                               "Ошибка выполнения: нет таблицы"),
+          "Запрос — ошибка: Ошибка выполнения: нет таблицы")
+    check("у каждого инструмента своё сказуемое",
+          [actions.progress_line(n, {}, "## данные")
+           for n in ("get_schema", "run_diagnostics", "get_workload")],
+          ["Схема прочитана", "Диагностика собрана",
+           "Профиль нагрузки снят"])
+    check("и видно, что именно прочитано",
+          actions.progress_line("get_schema", {"table": "billing.payments"},
+                                "## billing.payments"),
+          "Схема прочитана: billing.payments")
+
+    # Число строк в самом ответе — им пользуется и модель
+    from agent.services.mysql import fmt_sql_result
+    text = fmt_sql_result({"host": "10.1.0.1", "query": "SELECT 1",
+                           "columns": ["uid"], "rows": [[8], [9], [10]]})
+    check("в ответе SQL указано число строк", "Строк: 3" in text, True)
+
+    # Правило в подсказке
+    from agent.services import analysis
+    prompt = analysis.system_prompt()
+    check("модель знает про взвешивание",
+          "ТЯЖЁЛЫЙ ЗАПРОС СНАЧАЛА ВЗВЕШИВАЕТСЯ" in prompt, True)
+    check("и что отказ — не результат",
+          "запрос НЕ выполнялся" in prompt, True)
 
 
 def websocket(client) -> None:

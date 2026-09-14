@@ -79,6 +79,23 @@ console.log('── Если options пришло пустым списком �
 r = render({ question: 'Продолжаем?', options: [], timeout: 0 });
 console.log('кнопок:', (r.html.match(/<button/g) || []).length);
 
+
+console.log('');
+console.log('── Вопрос с планом тяжёлого запроса ──────────────────────');
+r = render({ question: 'Запрос может идти долго: таблица читается целиком. Выполняем?',
+             options: [{ value: 'yes', label: 'Выполнить' },
+                       { value: 'no', label: 'Отменить' }],
+             details: 'Что показал план:' + String.fromCharCode(10) +
+                      '  · billing.agreements: таблица читается целиком',
+             timeout: 120 });
+console.log('кнопок:', (r.html.match(/<button/g) || []).length,
+            '| план показан:', r.html.indexOf('ask-details') >= 0);
+if ((r.html.match(/<button/g) || []).length !== 2 ||
+    r.html.indexOf('ask-details') < 0) {
+  console.error('ПОДРОБНОСТИ ПЛАНА НЕ ПОКАЗАНЫ');
+  process.exit(1);
+}
+
 // Итог для вызывающего: во всех трёх случаях кнопок должно быть две
 const cases = [
   { question: 'Продолжаем?',

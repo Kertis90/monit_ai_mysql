@@ -371,6 +371,11 @@ LLM_TOOL_ROUNDS=${LLM_TOOL_ROUNDS:-4}
 LLM_TOOL_ASK_S=${LLM_TOOL_ASK_S:-120}
 EMBED_MODE="${EMBED_MODE:-auto}"
 EMBED_MODEL="${EMBED_MODEL:-}"
+#   SQL_CONFIRM_S   сколько ждать подтверждения на тяжёлый запрос;
+#                   0 — не спрашивать
+#   SQL_HEAVY_ROWS  с какой оценки строк запрос считается тяжёлым
+SQL_CONFIRM_S=${SQL_CONFIRM_S:-120}
+SQL_HEAVY_ROWS=${SQL_HEAVY_ROWS:-1000000}
 
 # Grafana
 GRAFANA_ADMIN_PASSWORD=$(sq "${GRAFANA_ADMIN_PASSWORD}")

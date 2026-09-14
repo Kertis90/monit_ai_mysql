@@ -30,6 +30,7 @@ from agent.services.toolcalls import StreamFilter
 from agent.services.intents import detect_chart_intent, detect_export_intent
 from agent.core.words import count_of
 from agent.services import actions
+from agent.core.config import settings as app_settings
 from agent.services.llm import (LLM_TOOL_ASK_S, llm_complete, llm_probe_tools,
                                 llm_stream)
 from agent.services.prometheus import build_charts
@@ -211,12 +212,46 @@ async def generate(owner: str, thread_id: str, thread_title: str, text: str,
         """Рассказать, чем агент занят прямо сейчас."""
         await job.emit({"type": "step", "text": what})
 
-    def remember(name: str, args: dict, result) -> None:
-        """Записать выполненное действие в журнал разговора."""
+    async def confirm_heavy(sql: str, verdict: dict) -> bool:
+        """Спросить, выполнять ли тяжёлый запрос.
+
+        План уже посчитан — здесь только показать человеку, во что он
+        обойдётся, и дождаться ответа. Не дождались — не выполняем: ждать
+        минуту у экрана, не зная этого заранее, хуже, чем не получить
+        данные сразу.
+        """
+        wait = app_settings.sql.confirm_s
+        if not wait:
+            return True
+
+        reasons = verdict.get("reasons") or []
+        answer = await job.ask(
+            "Запрос может идти долго: %s. Выполняем?"
+            % verdict.get("short", "план выглядит тяжёлым"),
+            [{"value": "yes", "label": "Выполнить"},
+             {"value": "no", "label": "Отменить"}],
+            wait,
+            details="\n".join(["Что показал план:"]
+                               + ["  · " + str(r) for r in reasons]
+                               + ["", "Запрос:", sql.strip()]))
+        if answer == "yes":
+            await say("Выполняю тяжёлый запрос")
+            return True
+        logger.info("Тяжёлый запрос отменён (%s): %s",
+                    answer or "не дождались", sql[:120])
+        return False
+
+    async def remember(name: str, args: dict, result) -> None:
+        """Записать действие в журнал и показать, чем оно кончилось.
+
+        Одно место на две задачи нарочно: и журнал, и строка о ходе работы
+        берут одно и то же — что было выполнено и что из этого вышло.
+        """
         try:
             actions.record(thread_id, name, args, result)
-        except Exception as exc:            # журнал не должен ломать ответ
-            logger.info("Действие не записано в журнал: %s", exc)
+            await say(actions.progress_line(name, args, result))
+        except Exception as exc:            # ход работы не должен её ломать
+            logger.info("Действие не записано: %s", exc)
 
     await say("Разбираю вопрос")
     try:
@@ -299,7 +334,7 @@ async def generate(owner: str, thread_id: str, thread_title: str, text: str,
 
         try:
             messages, used = await llm_with_tools(messages, ask_more,
-                                                  remember)
+                                                  remember, confirm_heavy)
             if used:
                 await job.emit({"type": "tools", "used": used})
         except Exception as exc:
@@ -327,10 +362,10 @@ async def generate(owner: str, thread_id: str, thread_title: str, text: str,
         results = []
         for call in calls:
             try:
-                out = await run_tool(call["name"], call["args"])
+                out = await run_tool(call["name"], call["args"], confirm_heavy)
             except Exception as exc:
                 out = "Инструмент не выполнен: %s" % exc
-            remember(call["name"], call["args"], out)
+            await remember(call["name"], call["args"], out)
             results.append("## %s\n\n%s" % (call["name"], str(out)[:20000]))
         await job.emit({"type": "tools", "used": names})
 

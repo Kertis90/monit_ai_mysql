@@ -311,8 +311,30 @@ def looks_unfinished(text: str) -> bool:
     return body.endswith(PREAMBLE_TAILS)
 
 
-async def run_tool(name: str, args: dict) -> str:
-    """Выполнить инструмент и вернуть текст для модели."""
+async def weigh_before_run(cluster: dict, sql: str) -> dict:
+    """План запроса до выполнения. Пусто — взвесить не удалось.
+
+    EXPLAIN не выполняет запрос, а спрашивает оптимизатор, как он
+    собирается его выполнять. Стоит это доли секунды, а узнать можно
+    главное: пойдёт ли чтение таблицы целиком и во сколько строк обойдётся.
+    """
+    from agent.services import explain as explain_service
+
+    plan = await explain_service.explain(cluster, sql, with_schema=False)
+    if plan.get("error"):
+        # План не получился — не повод не выполнять запрос: EXPLAIN может
+        # не работать там, где сам SELECT работает (права, версия)
+        logger.info("Запрос не взвешен: %s", str(plan["error"])[:120])
+        return {}
+    return explain_service.weigh(plan)
+
+
+async def run_tool(name: str, args: dict, confirm=None) -> str:
+    """Выполнить инструмент и вернуть текст для модели.
+
+    confirm — чем спросить человека перед тяжёлым запросом:
+    async (sql, вердикт) -> bool. Без него запросы выполняются сразу.
+    """
     cname   = str(args.get("cluster") or "").strip()
     cluster = find_cluster(cname) if cname else None
     hours   = min(float(args.get("hours") or 6), MAX_METRICS_HOURS)
@@ -413,8 +435,22 @@ async def run_tool(name: str, args: dict) -> str:
             return fmt_replication(states, cluster["label"])
 
         if name == "run_sql":
-            return fmt_sql_result(
-                await sql_execute(cluster, str(args.get("sql") or "")))
+            sql = str(args.get("sql") or "")
+            # Тяжёлый запрос — это минуты ожидания и нагрузка на боевой
+            # сервер. Человек должен узнать об этом до, а не после
+            if confirm is not None and sql.strip():
+                verdict = await weigh_before_run(cluster, sql)
+                if verdict.get("heavy") and not await confirm(sql, verdict):
+                    return ("ОТКАЗ ЧЕЛОВЕКА: запрос не выполнялся. План "
+                            "показал, что он тяжёлый — %s. Человек это "
+                            "видел и отказался ждать.\n\n"
+                            "Не выполняй его повторно. Предложи более лёгкий "
+                            "вариант: сузить период, добавить условие по "
+                            "индексированному столбцу, посчитать на стороне "
+                            "базы вместо выборки всех строк — и спроси, "
+                            "какой из вариантов подходит."
+                            % verdict.get("short", "оценка не названа"))
+            return fmt_sql_result(await sql_execute(cluster, sql))
 
         if name == "read_logs":
             out = []
@@ -463,7 +499,8 @@ async def run_tool(name: str, args: dict) -> str:
 IDLE_ROUNDS = 2
 
 
-async def llm_with_tools(messages: list, ask=None, note=None) -> tuple:
+async def llm_with_tools(messages: list, ask=None, note=None,
+                         confirm=None) -> tuple:
     """Диалог с инструментами. Возвращает (сообщения для финального ответа,
     список выполненных инструментов).
 
@@ -536,12 +573,12 @@ async def llm_with_tools(messages: list, ask=None, note=None) -> tuple:
                           + seen[mark])
             else:
                 logger.info(f"Инструмент: {name} {args}")
-                result = await run_tool(name, args)
+                result = await run_tool(name, args, confirm)
                 seen[mark] = result
                 used.append(name)
                 fresh += 1
                 if note is not None:
-                    note(name, args, result)
+                    await note(name, args, result)
 
             convo.append({"role": "tool", "tool_call_id": call.get("id", ""),
                           "name": name, "content": result[:20000]})

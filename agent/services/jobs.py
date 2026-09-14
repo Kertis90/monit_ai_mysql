@@ -69,7 +69,7 @@ class Job:
                 self.subscribers.discard(queue)
 
     async def ask(self, question: str, options: list,
-                  timeout: float) -> str:
+                  timeout: float, details: str = "") -> str:
         """Спросить человека и дождаться ответа.
 
         Возвращает выбранное значение или пусто, если не дождались. Пусто —
@@ -79,7 +79,8 @@ class Job:
         loop = asyncio.get_running_loop()
         self.pending = loop.create_future()
         await self.emit({"type": "ask", "question": question,
-                         "options": options, "timeout": int(timeout)})
+                         "options": options, "timeout": int(timeout),
+                         "details": str(details or "")[:2000]})
 
         stop = asyncio.ensure_future(self.stop_event.wait())
         try:

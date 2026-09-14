@@ -23,6 +23,7 @@ import logging
 import re
 from typing import Optional
 
+from agent.core.config import settings
 from agent.services.mysql import (cluster_db_creds, fmt_sql_result,
                                   server_version, sql_execute, sql_validate)
 
@@ -204,6 +205,61 @@ async def explain(cluster: dict, sql: str = "", connection_id: int = 0,
 
 # С какой длительности запрос стоит объяснять сам собой. Секунда — это
 # шум, пять секунд на боевой базе — уже повод посмотреть план.
+# Во сколько строк запрос считается тяжёлым и сколько строк достаточно,
+# чтобы сортировка без индекса стала заметной. Значения из настроек:
+# на разных базах «много» — разное число
+HEAVY_ROWS = settings.sql.heavy_rows
+SORT_ROWS = 100000
+
+
+def weigh(data: dict) -> dict:
+    """Тяжёлый ли запрос — по плану, до выполнения.
+
+    EXPLAIN не выполняет запрос, а только спрашивает оптимизатор, как он
+    собирается его выполнять. Это дёшево, а узнать можно главное: пойдёт
+    ли чтение таблицы целиком и во сколько строк это обойдётся.
+
+    Оценка приблизительная по своей природе — оптимизатор и сам ошибается.
+    Поэтому она нужна не чтобы запретить, а чтобы предупредить: человек
+    должен знать, что ждать придётся долго, ДО того как начал ждать.
+    """
+    if data.get("error"):
+        return {"heavy": False, "rows": 0, "reasons": [],
+                "short": "план получить не удалось"}
+
+    rows = int(data.get("rows_estimate") or 0)
+    found = data.get("findings") or []
+    reasons = []
+
+    for item in found:
+        if item.get("level") == "critical":
+            reasons.append("%s: %s" % (item.get("table", "?"),
+                                       item.get("what", "")))
+
+    heavy = bool(reasons)
+    if HEAVY_ROWS and rows >= HEAVY_ROWS:
+        heavy = True
+        reasons.append("по оценке оптимизатора придётся просмотреть "
+                       "%s строк" % f"{rows:,}".replace(",", " "))
+
+    # Сортировка и временная таблица сами по себе не беда — бедой они
+    # становятся на объёме, когда уходят на диск
+    if rows >= SORT_ROWS:
+        for item in found:
+            what = str(item.get("what", ""))
+            if "сортировка идёт без индекса" in what or "временная" in what:
+                heavy = True
+                reasons.append("%s на объёме в %s строк"
+                               % (what, f"{rows:,}".replace(",", " ")))
+
+    if not reasons:
+        reasons.append("полных сканирований нет, оценка — %s строк"
+                       % f"{rows:,}".replace(",", " "))
+
+    return {"heavy": heavy, "rows": rows, "reasons": reasons[:4],
+            "short": reasons[0]}
+
+
 SLOW_NOW_SECONDS = 5
 MAX_RUNNING_PLANS = 3
 
