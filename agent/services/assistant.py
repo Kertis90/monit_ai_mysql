@@ -573,6 +573,11 @@ async def schema_blocks(cluster_name: str, user_message: str) -> list:
                 cluster_name, user_message)]
             if found:
                 logger.info("Таблицы найдены по смыслу: %s", ", ".join(found))
+            else:
+                # Модели векторов нет — спрашиваем генеративную: она уже
+                # есть у всех, и смысл слов понимает не хуже
+                found = await schema_service.search_by_model(snapshot,
+                                                             user_message)
         except Exception as exc:
             logger.info("Смысловой поиск не сработал: %s", exc)
 

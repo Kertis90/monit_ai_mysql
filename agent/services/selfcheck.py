@@ -103,6 +103,32 @@ async def check_ssh() -> list[dict]:
     return out
 
 
+async def check_embeddings() -> dict:
+    """Есть ли смысловой поиск по схеме.
+
+    Пункт не про поломку: без модели векторов агент работает, просто ищет
+    таблицы иначе. Но знать, какой путь включён, надо — иначе непонятно,
+    почему «учётные записи» находятся в одной установке и не находятся в
+    другой.
+    """
+    from agent.services import embed
+
+    if embed.EMBED_MODE == "off":
+        return _item("Смысловой поиск", True,
+                     "Выключен настройкой EMBED_MODE=off — "
+                     "таблицы ищутся по словам и через саму модель")
+
+    ready = await embed.probe()
+    if ready:
+        return _item("Смысловой поиск", True,
+                     "Работает на модели %s" % embed.EMBED_MODEL)
+    return _item("Смысловой поиск", True,
+                 "Модели векторов на эндпоинте нет — таблицы ищутся по "
+                 "словам, а при неудаче выбором через генеративную модель",
+                 "Если модель векторов у вас развёрнута, укажите её имя в "
+                 "EMBED_MODEL: скачивать ничего не нужно")
+
+
 async def check_databases() -> list[dict]:
     """Права учётки агента: их отзывают при плановой смене паролей."""
     out = []
@@ -149,9 +175,11 @@ async def check_directory() -> Optional[dict]:
 async def run() -> dict:
     """Полная проверка. Возвращает список пунктов и общий вердикт."""
     parts: list[dict] = []
-    prom, llm = await asyncio.gather(check_prometheus(), check_llm())
+    prom, llm, vec = await asyncio.gather(
+        check_prometheus(), check_llm(), check_embeddings())
     parts.append(prom)
     parts.append(llm)
+    parts.append(vec)
     parts.extend(await check_ssh())
     parts.extend(await check_databases())
     ldap = await check_directory()

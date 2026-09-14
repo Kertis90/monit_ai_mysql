@@ -39,6 +39,12 @@ EMBED_MODE = settings.llm.embed_mode
 EMBED_MODEL = settings.llm.embed_model
 EMBED_TIMEOUT = settings.llm.embed_timeout
 
+# По каким кускам имени узнаётся модель векторов в списке эндпоинта.
+# Скачивать её неоткуда и незачем: она либо уже развёрнута рядом с
+# генеративной, либо её нет вовсе — и тогда работает запасной путь.
+EMBED_HINTS = ("embed", "bge", "e5", "gte", "minilm", "labse", "sbert",
+               "rubert", "sentence")
+
 # По сколько текстов в одном запросе. Больше — быстрее, но ответ на тысячу
 # документов весит десятки мегабайт и упирается в предел тела запроса
 BATCH = 64
@@ -51,14 +57,53 @@ MIN_SCORE = 0.30
 EMBED_SUPPORTED: Optional[bool] = None
 
 
+async def discover() -> str:
+    """Найти модель векторов среди тех, что отдаёт эндпоинт.
+
+    Имя модели незачем угадывать руками: эндпоинт сам перечисляет, что у
+    него развёрнуто. Без интернета это единственный вменяемый путь —
+    скачать модель всё равно неоткуда, а та, что уже стоит рядом с
+    генеративной, называется как ей вздумается.
+    """
+    headers = {"Authorization": AUTH_HEADER}
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(f"{LLM_BASE_URL}/models", headers=headers)
+            r.raise_for_status()
+            data = r.json().get("data") or []
+    except Exception as exc:
+        logger.info("Список моделей не получен: %s", exc)
+        return ""
+
+    names = [str(item.get("id") or "") for item in data if item.get("id")]
+    for name in names:
+        low = name.lower()
+        if any(hint in low for hint in EMBED_HINTS):
+            logger.info("Модель векторов найдена сама: %s", name)
+            return name
+    logger.info("Среди %d моделей эндпоинта векторной не нашлось",
+                len(names))
+    return ""
+
+
 async def probe() -> bool:
-    """Отдаёт ли эндпоинт /embeddings. Проверяем один раз за жизнь агента."""
-    global EMBED_SUPPORTED
+    """Готов ли смысловой поиск. Проверяем один раз за жизнь агента."""
+    global EMBED_SUPPORTED, EMBED_MODEL
     if EMBED_SUPPORTED is not None:
         return EMBED_SUPPORTED
     if EMBED_MODE == "off":
         EMBED_SUPPORTED = False
         return False
+
+    # Имя не задано — спрашиваем эндпоинт, что у него есть
+    if not EMBED_MODEL:
+        EMBED_MODEL = await discover()
+        if not EMBED_MODEL:
+            EMBED_SUPPORTED = False
+            logger.info("Векторный поиск: модели векторов нет, "
+                        "ищем по словам и через саму модель")
+            return False
+
     if EMBED_MODE == "on":
         EMBED_SUPPORTED = True
         return True
@@ -66,7 +111,7 @@ async def probe() -> bool:
     got = await encode(["проверка"])
     EMBED_SUPPORTED = bool(got)
     logger.info("Векторный поиск: %s",
-                "доступен" if EMBED_SUPPORTED else
+                "доступен, модель %s" % EMBED_MODEL if EMBED_SUPPORTED else
                 "эндпоинт не отдаёт /embeddings, ищем по словам")
     return EMBED_SUPPORTED
 

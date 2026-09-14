@@ -530,6 +530,65 @@ async def load_index(cluster_name: str) -> dict:
     return cached
 
 
+# Сколько таблиц показываем модели, когда просим её выбрать. Больше — это
+# уже полотно, в котором теряется и модель, и смысл затеи
+MODEL_PICK_TABLES = 200
+
+
+async def search_by_model(snapshot: dict, question: str,
+                          limit: int = 3) -> list:
+    """Спросить саму модель, про какие таблицы вопрос.
+
+    Запасной путь для установок без модели векторов: скачать её бывает
+    неоткуда, а генеративная модель уже есть и смысл слов понимает не
+    хуже. Платим одним коротким запросом — и только тогда, когда по
+    буквам не нашлось ничего.
+
+    Ответ модели проверяем по снимку: имена, которых в схеме нет,
+    отбрасываем молча. Придуманная таблица здесь опаснее, чем отсутствие
+    ответа, — по ней будет построен запрос.
+    """
+    from agent.services.llm import llm_complete
+
+    tables = snapshot.get("tables") or {}
+    if not tables or not str(question or "").strip():
+        return []
+
+    listing = []
+    for key, table in sorted(tables.items(),
+                             key=lambda kv: -(kv[1].get("size_mb") or 0)):
+        note = str(table.get("note") or "")
+        listing.append("%s — %s" % (key, note) if note else key)
+        if len(listing) >= MODEL_PICK_TABLES:
+            break
+
+    ask = ("Ниже список таблиц базы с комментариями из самой базы.\n\n"
+           "%s\n\nВопрос человека: %s\n\n"
+           "Выбери не больше %d таблиц, о которых этот вопрос. Ответь "
+           "ТОЛЬКО именами из списка, по одному в строке, без пояснений. "
+           "Если вопрос не про данные или подходящей таблицы нет, ответь "
+           "одним словом: нет."
+           % ("\n".join(listing), str(question)[:500], limit))
+
+    try:
+        answer = await llm_complete([{"role": "user", "content": ask}])
+    except Exception as exc:
+        logger.info("Выбор таблиц моделью не удался: %s", exc)
+        return []
+
+    found = []
+    for line in str(answer or "").splitlines():
+        name = line.strip().strip("-*`. ").split()[0] if line.strip() else ""
+        # Проверяем по снимку: имя, которого в схеме нет, — выдумка
+        if name in tables and name not in found:
+            found.append(name)
+        if len(found) >= limit:
+            break
+    if found:
+        logger.info("Таблицы выбраны моделью: %s", ", ".join(found))
+    return found
+
+
 async def search_semantic(cluster_name: str, question: str,
                           limit: int = 3) -> list:
     """Таблицы, близкие вопросу по смыслу: [(ключ, близость), ...].

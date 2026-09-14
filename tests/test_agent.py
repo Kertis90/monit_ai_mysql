@@ -319,6 +319,8 @@ def application() -> None:
         job_asks_and_waits()
         vector_math()
         schema_links()
+        embed_model_discovery()
+        tables_picked_by_model()
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -3576,9 +3578,11 @@ def schema_semantic(client) -> None:
     async def yes():
         return True
 
-    originals = (embed.encode, embed.probe, schema.embed if hasattr(
-        schema, "embed") else None)
+    originals = (embed.encode, embed.probe, embed.EMBED_MODEL)
     embed.encode, embed.probe = fake_encode, yes
+    # Имя модели в бою определяется само при пробе; заглушка пробы этого
+    # не делает, поэтому подставляем
+    embed.EMBED_MODEL = "тест-векторы"
     try:
         asyncio.run(schema.save("kemerovo", snapshot))
         built = asyncio.run(schema.build_index("kemerovo", snapshot))
@@ -3608,7 +3612,10 @@ def schema_semantic(client) -> None:
               "Проверь, та ли это таблица" in text, True)
         check("близость показана", "близость 1.00" in text, True)
     finally:
-        embed.encode, embed.probe = originals[0], originals[1]
+        embed.encode, embed.probe, embed.EMBED_MODEL = originals
+
+    check("модель индекса записана",
+          asyncio.run(schema.load_index("kemerovo"))["model"], "тест-векторы")
 
     # Эндпоинт векторов не отвечает — работаем без индекса, не падая
     async def no_vectors():
@@ -3703,6 +3710,120 @@ def switching_threads(client) -> None:
     finally:
         (chat_routes.build_chat_context, chat_routes.llm_stream,
          chat_routes.llm_probe_tools) = original
+
+
+def embed_model_discovery() -> None:
+    """Имя модели векторов агент узнаёт у эндпоинта сам.
+
+    Скачивать её бывает неоткуда: сеть наружу закрыта. Значит, работать
+    надо с тем, что уже развёрнуто, — а как оно называется, знает сам
+    эндпоинт.
+    """
+    from agent.services import embed
+
+    listed = {"data": []}
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return listed
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, *a, **kw):
+            return FakeResponse()
+
+    original = embed.httpx.AsyncClient
+    embed.httpx.AsyncClient = FakeClient
+    try:
+        listed["data"] = [{"id": "qwen2.5-72b-instruct"},
+                          {"id": "bge-m3"},
+                          {"id": "whisper-large"}]
+        check("модель векторов найдена среди развёрнутых",
+              asyncio.run(embed.discover()), "bge-m3")
+
+        listed["data"] = [{"id": "multilingual-e5-large"}]
+        check("имя без слова embed тоже узнаётся",
+              asyncio.run(embed.discover()), "multilingual-e5-large")
+
+        listed["data"] = [{"id": "qwen2.5-72b-instruct"}]
+        check("векторной модели нет — так и говорим",
+              asyncio.run(embed.discover()), "")
+
+        listed["data"] = []
+        check("пустой список не ломает", asyncio.run(embed.discover()), "")
+    finally:
+        embed.httpx.AsyncClient = original
+
+
+def tables_picked_by_model() -> None:
+    """Без модели векторов таблицы выбирает сама генеративная модель.
+
+    Она уже есть у всех, скачивать нечего, а смысл слов понимает не хуже:
+    «учётные записи» и «Абоненты» для неё одно и то же.
+    """
+    from agent.services import schema
+
+    snapshot = {"tables": {
+        "billing.vgroups": {"db": "billing", "table": "vgroups",
+                            "size_mb": 10, "note": "Абоненты", "columns": []},
+        "billing.logs": {"db": "billing", "table": "logs", "size_mb": 1,
+                         "note": "Журнал событий", "columns": []}}}
+
+    said = {"text": "billing.vgroups"}
+    asked = []
+
+    async def fake_complete(messages):
+        asked.append(messages[0]["content"])
+        return said["text"]
+
+    import agent.services.llm as llm_module
+    original = llm_module.llm_complete
+    llm_module.llm_complete = fake_complete
+    try:
+        found = asyncio.run(schema.search_by_model(snapshot,
+                                                   "покажи учётные записи"))
+        check("модель выбрала таблицу", found, ["billing.vgroups"])
+        check("ей показали комментарии из базы",
+              "Абоненты" in asked[0], True)
+        check("и попросили отвечать только именами",
+              "ТОЛЬКО именами" in asked[0], True)
+
+        # Ответ модели проверяется по снимку: выдумка отбрасывается
+        said["text"] = "billing.accounts\nbilling.users"
+        check("несуществующие таблицы отброшены",
+              asyncio.run(schema.search_by_model(snapshot, "учётки")), [])
+
+        # Обычная манера отвечать списком тоже понимается
+        said["text"] = "- billing.logs — журнал"
+        check("список с дефисом разобран",
+              asyncio.run(schema.search_by_model(snapshot, "события")),
+              ["billing.logs"])
+
+        said["text"] = "нет"
+        check("отказ модели понят", asyncio.run(
+            schema.search_by_model(snapshot, "как дела")), [])
+
+        check("без снимка модель не тревожим",
+              asyncio.run(schema.search_by_model({}, "учётные записи")), [])
+        count = len(asked)
+        check("и без вопроса тоже",
+              asyncio.run(schema.search_by_model(snapshot, "  ")), [])
+        check("лишнего запроса к модели не было", len(asked), count)
+    finally:
+        llm_module.llm_complete = original
 
 
 def websocket(client) -> None:

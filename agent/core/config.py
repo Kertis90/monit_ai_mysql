@@ -43,7 +43,9 @@ class LLMSettings(BaseModel):
     # Смысловой поиск по схеме: auto — проверить пробным запросом,
     # on — считать доступным, off — искать только по словам
     embed_mode:  str   = "auto"
-    embed_model: str   = "text-embedding-3-small"
+    # Пусто — спросить у эндпоинта, какая модель векторов у него есть.
+    # Угадывать имя руками незачем, а скачать модель бывает неоткуда
+    embed_model: str   = ""
     # Векторизация снимка идёт сотнями документов и дольше обычного вызова
     embed_timeout: float = 120.0
     # Сколько ждать ОЧЕРЕДНОЙ порции ответа, а не весь ответ целиком.
@@ -225,7 +227,7 @@ def load_settings() -> Settings:
             tool_rounds = max(0, int(_env("LLM_TOOL_ROUNDS", "4"))),
             tool_ask_s  = max(0.0, float(_env("LLM_TOOL_ASK_S", "120"))),
             embed_mode  = _env("EMBED_MODE", "auto").strip().lower(),
-            embed_model = _env("EMBED_MODEL", "text-embedding-3-small"),
+            embed_model = _env("EMBED_MODEL", "").strip(),
             embed_timeout = float(_env("EMBED_TIMEOUT", "120")),
             timeout     = float(_env("LLM_TIMEOUT", "300")),
         ),
