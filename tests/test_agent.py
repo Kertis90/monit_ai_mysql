@@ -255,6 +255,7 @@ def application() -> None:
         background_answer(c)
         switching_threads(c)
         typed_answer_reaches_the_job(c)
+        executed_sql_reaches_next_turn(c)
         mysql_hints()
         tool_calls_in_text()
         log_bisect()
@@ -322,6 +323,7 @@ def application() -> None:
         rounds_end_with_answer()
         tool_budget_is_a_question()
         repeat_does_not_end_collection()
+        agent_remembers_what_it_did()
         job_asks_and_waits()
         vector_math()
         schema_links()
@@ -3992,7 +3994,7 @@ def typed_answer_reaches_the_job(client) -> None:
 
     asked = {"answer": None}
 
-    async def fake_with_tools(messages, ask=None):
+    async def fake_with_tools(messages, ask=None, note=None):
         # Порция инструментов кончилась — спрашиваем человека и ждём
         if ask is not None:
             asked["answer"] = await ask(4, 4)
@@ -4316,6 +4318,131 @@ def schema_without_a_city() -> None:
     check("описание нужной таблицы тоже приложено",
           "## billing.agreements" in text, True)
     check("со столбцами, а не только с именем", "uid" in text, True)
+
+
+def agent_remembers_what_it_did() -> None:
+    """Агент помнит выполненные запросы — иначе отрекается от них.
+
+    В историю чата уходят только вопрос и текст ответа. Вызовов там нет, и
+    на «напиши запрос, которым ты это получил» модель отвечала, что
+    ничего не выполняла, а прошлый ответ выдуман, — объявляя выдумкой
+    настоящие данные, полученные настоящим запросом.
+    """
+    from agent.services import actions
+
+    actions.forget()
+    sql = "SELECT v.uid, v.login\nFROM billing.vgroups v\nLIMIT 5"
+    actions.record("t-1", "get_schema",
+                   {"cluster": "kemerovo", "table": "billing.payments"},
+                   "## billing.payments — строк ~9000000")
+    actions.record("t-1", "run_sql", {"cluster": "kemerovo", "sql": sql},
+                   "## Результат SQL\n\n  uid | login\n  8 | user8")
+    actions.record("t-1", "run_sql",
+                   {"cluster": "kemerovo", "sql": "SELECT 1 FROM nope"},
+                   "## Результат SQL\n\n  Ошибка выполнения: нет таблицы")
+
+    block = actions.fmt_block("t-1")
+    check("запрос сохранён дословно, со переносами строк",
+          "FROM billing.vgroups v" in block, True)
+    check("инструмент назван", "run_sql (kemerovo)" in block, True)
+    check("и чем именно интересовались",
+          "table=billing.payments" in block, True)
+    check("ошибка названа ошибкой", "ОШИБКА: Ошибка выполнения" in block, True)
+    check("заголовок ответа в итог не попал",
+          "## Результат SQL" in block.split("Ничего из перечисленного")[-1],
+          False)
+
+    # Главное: модели прямо сказано, что это не её память
+    check("сказано, что записи не выдуманы",
+          "выдумкой не является" in block, True)
+    check("сказано, откуда брать запрос",
+          "бери запрос отсюда и приводи дословно" in block, True)
+    check("и что делать, если запроса нет",
+          "запрос не сохранился" in block, True)
+
+    # Чужой разговор не подмешивается
+    check("журнал раздельный по разговорам", actions.fmt_block("t-2"), "")
+    check("без действий блока нет", actions.fmt_block(""), "")
+
+    # Предел на разговор соблюдается
+    for n in range(actions.MAX_PER_THREAD + 5):
+        actions.record("t-3", "run_sql",
+                       {"cluster": "k", "sql": "SELECT %d" % n}, "ок")
+    kept = actions.fmt_block("t-3")
+    check("помним не больше предела",
+          kept.count("run_sql"), actions.MAX_PER_THREAD)
+    check("забываем самое старое", "SELECT 0" in kept, False)
+    check("свежее на месте", "SELECT 24" in kept, True)
+
+    check("забывание работает", actions.forget("t-1"), 1)
+    check("после забывания пусто", actions.fmt_block("t-1"), "")
+    actions.forget()
+
+    # Правило в подсказке
+    from agent.services import analysis
+    prompt = analysis.system_prompt()
+    check("подсказка запрещает отрекаться от выполненного",
+          "ЧТО ВЫПОЛНЕНО — ТО ВЫПОЛНЕНО" in prompt, True)
+    check("и отличает «не сохранился» от «не выполнял»",
+          "то же самое, что «я его не выполнял»" in prompt, True)
+
+
+def executed_sql_reaches_next_turn(client) -> None:
+    """Выполненный запрос доезжает до следующего вопроса в том же чате."""
+    from agent.api.routes import chat as chat_routes
+    from agent.services import actions
+
+    actions.forget()
+    seen_context = []
+
+    async def fake_ctx(text, progress=None):
+        return "## Метрики", None, 0
+
+    async def yes_tools():
+        return True
+
+    async def fake_with_tools(messages, ask=None, note=None):
+        # Первый ход: модель выполнила запрос
+        if note is not None and len(seen_context) == 0:
+            note("run_sql",
+                 {"cluster": "kemerovo",
+                  "sql": "SELECT uid FROM billing.vgroups LIMIT 5"},
+                 "## Результат SQL\n\n  uid\n  8")
+        return messages, ["run_sql"]
+
+    async def fake_stream(messages, tool_sink=None):
+        # Запоминаем, что видела модель в вопросе человека
+        seen_context.append(messages[-1]["content"])
+        yield "Готово."
+
+    original = (chat_routes.build_chat_context, chat_routes.llm_stream,
+                chat_routes.llm_probe_tools, chat_routes.llm_with_tools)
+    chat_routes.build_chat_context = fake_ctx
+    chat_routes.llm_stream = fake_stream
+    chat_routes.llm_probe_tools = yes_tools
+    chat_routes.llm_with_tools = fake_with_tools
+    try:
+        thread = client.post("/chat/threads?title=Журнал").json()["id"]
+        for question in ("дай 5 аккаунтов", "напиши сам запрос"):
+            with client.websocket_connect("/ws") as ws:
+                ws.send_json({"type": "message", "text": question,
+                              "client_id": "web-11", "thread_id": thread})
+                for _ in range(20):
+                    if ws.receive_json().get("type") == "done":
+                        break
+
+        check("оба хода состоялись", len(seen_context), 2)
+        check("в первом вопросе журнала ещё нет",
+              "Что агент уже выполнял" in seen_context[0], False)
+        check("во втором журнал приложен",
+              "Что агент уже выполнял" in seen_context[1], True)
+        check("и в нём тот самый запрос",
+              "SELECT uid FROM billing.vgroups LIMIT 5" in seen_context[1],
+              True)
+    finally:
+        (chat_routes.build_chat_context, chat_routes.llm_stream,
+         chat_routes.llm_probe_tools, chat_routes.llm_with_tools) = original
+        actions.forget()
 
 
 def websocket(client) -> None:

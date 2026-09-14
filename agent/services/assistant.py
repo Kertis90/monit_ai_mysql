@@ -463,7 +463,7 @@ async def run_tool(name: str, args: dict) -> str:
 IDLE_ROUNDS = 2
 
 
-async def llm_with_tools(messages: list, ask=None) -> tuple:
+async def llm_with_tools(messages: list, ask=None, note=None) -> tuple:
     """Диалог с инструментами. Возвращает (сообщения для финального ответа,
     список выполненных инструментов).
 
@@ -476,6 +476,11 @@ async def llm_with_tools(messages: list, ask=None) -> tuple:
 
     ask — чем спросить человека: async (сделано вызовов, раундов) -> bool.
     Без него порция работает как прежний потолок.
+
+    note — куда записать выполненное: (имя, аргументы, результат). Журнал
+    нужен следующему ходу: в истории чата вызовов нет, и без него модель
+    на вопрос «каким запросом ты это получил» отвечает, что запроса не
+    было, — то есть объявляет выдумкой настоящие данные.
     """
     headers = {"Content-Type": "application/json", "Authorization": AUTH_HEADER}
     used = []
@@ -535,6 +540,8 @@ async def llm_with_tools(messages: list, ask=None) -> tuple:
                 seen[mark] = result
                 used.append(name)
                 fresh += 1
+                if note is not None:
+                    note(name, args, result)
 
             convo.append({"role": "tool", "tool_call_id": call.get("id", ""),
                           "name": name, "content": result[:20000]})

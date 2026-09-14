@@ -29,6 +29,7 @@ from agent.services.assistant import (UNFINISHED_NOTE, build_chat_context,
 from agent.services.toolcalls import StreamFilter
 from agent.services.intents import detect_chart_intent, detect_export_intent
 from agent.core.words import count_of
+from agent.services import actions
 from agent.services.llm import (LLM_TOOL_ASK_S, llm_complete, llm_probe_tools,
                                 llm_stream)
 from agent.services.prometheus import build_charts
@@ -210,6 +211,13 @@ async def generate(owner: str, thread_id: str, thread_title: str, text: str,
         """Рассказать, чем агент занят прямо сейчас."""
         await job.emit({"type": "step", "text": what})
 
+    def remember(name: str, args: dict, result) -> None:
+        """Записать выполненное действие в журнал разговора."""
+        try:
+            actions.record(thread_id, name, args, result)
+        except Exception as exc:            # журнал не должен ломать ответ
+            logger.info("Действие не записано в журнал: %s", exc)
+
     await say("Разбираю вопрос")
     try:
         context_text, cluster, hours = await build_chat_context(text, say)
@@ -247,6 +255,13 @@ async def generate(owner: str, thread_id: str, thread_title: str, text: str,
         except Exception as exc:
             logger.error("Не удалось собрать графики: %s", exc)
 
+    # Что агент уже выполнял в этом разговоре. Без этого блока модель не
+    # видит ни одного своего запроса и на «напиши сам запрос» отвечает,
+    # что ничего не выполняла, — объявляя выдумкой настоящие данные.
+    done_before = actions.fmt_block(thread_id)
+    if done_before:
+        context_text = context_text + "\n\n" + done_before
+
     messages = [{"role": "system", "content": system_prompt()}]
     # Выжимка вытесненной части + последние реплики дословно
     messages += history_to_messages(history[-CHAT_CONTEXT_MESSAGES:])
@@ -283,7 +298,8 @@ async def generate(owner: str, thread_id: str, thread_title: str, text: str,
             return False
 
         try:
-            messages, used = await llm_with_tools(messages, ask_more)
+            messages, used = await llm_with_tools(messages, ask_more,
+                                                  remember)
             if used:
                 await job.emit({"type": "tools", "used": used})
         except Exception as exc:
@@ -314,6 +330,7 @@ async def generate(owner: str, thread_id: str, thread_title: str, text: str,
                 out = await run_tool(call["name"], call["args"])
             except Exception as exc:
                 out = "Инструмент не выполнен: %s" % exc
+            remember(call["name"], call["args"], out)
             results.append("## %s\n\n%s" % (call["name"], str(out)[:20000]))
         await job.emit({"type": "tools", "used": names})
 
