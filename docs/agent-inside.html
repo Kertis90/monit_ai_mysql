@@ -1,0 +1,1532 @@
+<title>Агент MySQL изнутри</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=PT+Serif:ital,wght@0,400;0,700;1,400&family=Golos+Text:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap">
+<style>
+:root {
+  --paper:      #f4f6f9;
+  --sheet:      #ffffff;
+  --sheet-2:    #eef1f6;
+  --ink:        #141a21;
+  --ink-soft:   #3c4753;
+  --muted:      #5f6b79;
+  --line:       #d5dce5;
+  --line-soft:  #e4e9f0;
+  --accent:     #1f5f8b;
+  --accent-ink: #17486a;
+  --accent-wash:#e6eef5;
+  --amber:      #9a5c0b;
+  --amber-wash: #f7eede;
+  --green:      #2c6a4d;
+  --green-wash: #e3f0e9;
+  --red:        #962f2f;
+  --red-wash:   #f6e5e4;
+
+  --fs-xs: 12px;  --fs-sm: 13.5px; --fs-base: 16px; --fs-lg: 18px;
+  --fs-h3: 21px;  --fs-h2: 27px;   --fs-h1: 40px;
+  --sp-1: 4px; --sp-2: 8px; --sp-3: 14px; --sp-4: 22px; --sp-5: 34px; --sp-6: 54px;
+  --r: 4px;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper:      #0d1217;
+    --sheet:      #141b23;
+    --sheet-2:    #1b242e;
+    --ink:        #dfe6ee;
+    --ink-soft:   #c2ccd8;
+    --muted:      #8a97a6;
+    --line:       #2a3542;
+    --line-soft:  #202a35;
+    --accent:     #65aada;
+    --accent-ink: #8cc4e9;
+    --accent-wash:#152a3a;
+    --amber:      #d99a3d;
+    --amber-wash: #2e2416;
+    --green:      #62bd92;
+    --green-wash: #14271e;
+    --red:        #e0837a;
+    --red-wash:   #2c1917;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper:      #0d1217;
+  --sheet:      #141b23;
+  --sheet-2:    #1b242e;
+  --ink:        #dfe6ee;
+  --ink-soft:   #c2ccd8;
+  --muted:      #8a97a6;
+  --line:       #2a3542;
+  --line-soft:  #202a35;
+  --accent:     #65aada;
+  --accent-ink: #8cc4e9;
+  --accent-wash:#152a3a;
+  --amber:      #d99a3d;
+  --amber-wash: #2e2416;
+  --green:      #62bd92;
+  --green-wash: #14271e;
+  --red:        #e0837a;
+  --red-wash:   #2c1917;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: "Golos Text", "Segoe UI", system-ui, sans-serif;
+  font-size: var(--fs-base);
+  line-height: 1.62;
+  -webkit-font-smoothing: antialiased;
+}
+
+.wrap {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding-inline: 20px;
+  padding-block: 0 var(--sp-6);
+}
+
+/* ── Шапка ───────────────────────────────────────────────────────── */
+.masthead {
+  border-bottom: 3px double var(--line);
+  padding-block: var(--sp-6) var(--sp-4);
+  margin-bottom: var(--sp-5);
+}
+.eyebrow {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: var(--fs-xs);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--muted);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2) var(--sp-3);
+  align-items: center;
+}
+.eyebrow .dot { color: var(--accent); }
+h1 {
+  font-family: "PT Serif", Georgia, serif;
+  font-size: var(--fs-h1);
+  line-height: 1.12;
+  font-weight: 700;
+  margin: var(--sp-3) 0 var(--sp-3);
+  text-wrap: balance;
+  letter-spacing: -.01em;
+}
+.standfirst {
+  font-size: var(--fs-lg);
+  color: var(--ink-soft);
+  max-width: 62ch;
+  margin: 0;
+}
+.facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-4);
+  margin-top: var(--sp-4);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--line-soft);
+}
+.fact { display: flex; flex-direction: column; gap: 2px; }
+.fact b {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+.fact span { font-size: var(--fs-xs); color: var(--muted); }
+
+/* ── Каркас ──────────────────────────────────────────────────────── */
+.frame { display: grid; grid-template-columns: 1fr; gap: var(--sp-5); }
+@media (min-width: 1000px) {
+  .frame { grid-template-columns: 210px minmax(0, 1fr); gap: var(--sp-6); align-items: start; }
+  .rail { position: sticky; top: 20px; }
+}
+.rail ol {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1) var(--sp-3);
+  font-size: var(--fs-sm);
+}
+@media (min-width: 1000px) {
+  .rail ol { flex-direction: column; gap: 2px; border-left: 2px solid var(--line); padding-left: var(--sp-3); }
+}
+.rail a { color: var(--muted); text-decoration: none; display: block; padding: 2px 0; }
+.rail a:hover, .rail a:focus-visible { color: var(--accent); }
+.rail .num {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 11px;
+  color: var(--line);
+  margin-right: 6px;
+}
+
+main { min-width: 0; display: flex; flex-direction: column; gap: var(--sp-6); }
+section { scroll-margin-top: 16px; display: flex; flex-direction: column; gap: var(--sp-3); }
+
+h2 {
+  font-family: "PT Serif", Georgia, serif;
+  font-size: var(--fs-h2);
+  line-height: 1.2;
+  margin: 0;
+  font-weight: 700;
+  text-wrap: balance;
+}
+h2 .h-num {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: var(--fs-sm);
+  color: var(--accent);
+  font-weight: 500;
+  margin-right: var(--sp-2);
+  vertical-align: 3px;
+}
+h3 {
+  font-family: "Golos Text", system-ui, sans-serif;
+  font-size: var(--fs-h3);
+  line-height: 1.3;
+  margin: var(--sp-3) 0 0;
+  font-weight: 600;
+  text-wrap: balance;
+}
+h4 {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: .09em;
+  color: var(--muted);
+  margin: 0;
+  font-weight: 500;
+}
+p { margin: 0; max-width: 68ch; }
+p + p { margin-top: var(--sp-2); }
+a { color: var(--accent); }
+strong { font-weight: 600; }
+code {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: .88em;
+  background: var(--sheet-2);
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+
+/* ── Панели ──────────────────────────────────────────────────────── */
+.panel {
+  background: var(--sheet);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+}
+.panel-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2) var(--sp-3);
+  align-items: baseline;
+  justify-content: space-between;
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--sheet-2);
+}
+.panel-head .name {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: var(--fs-sm);
+  font-weight: 500;
+}
+.panel-head .note { font-size: var(--fs-xs); color: var(--muted); }
+
+pre {
+  margin: 0;
+  padding: var(--sp-3);
+  overflow-x: auto;
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: var(--fs-sm);
+  line-height: 1.55;
+  color: var(--ink-soft);
+  white-space: pre;
+  tab-size: 2;
+}
+pre.wrapped { white-space: pre-wrap; }
+pre.tall { max-height: 30em; overflow-y: auto; }
+.pre-plain { background: var(--sheet); border: 1px solid var(--line); border-radius: var(--r); }
+
+.k-rule { color: var(--accent-ink); font-weight: 700; }
+.k-cap  { color: var(--amber); font-weight: 700; }
+.k-com  { color: var(--muted); }
+
+/* ── Заметки на полях ────────────────────────────────────────────── */
+.note {
+  border-left: 3px solid var(--accent);
+  background: var(--accent-wash);
+  padding: var(--sp-3);
+  border-radius: 0 var(--r) var(--r) 0;
+  font-size: var(--fs-sm);
+}
+.note.warn  { border-left-color: var(--amber); background: var(--amber-wash); }
+.note.stop  { border-left-color: var(--red);   background: var(--red-wash); }
+.note.ok    { border-left-color: var(--green); background: var(--green-wash); }
+.note p { max-width: 72ch; }
+.note b { font-weight: 600; }
+
+/* ── Таблицы ─────────────────────────────────────────────────────── */
+.scroller { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--r); background: var(--sheet); }
+table { border-collapse: collapse; width: 100%; font-size: var(--fs-sm); }
+th, td { text-align: left; padding: var(--sp-2) var(--sp-3); border-bottom: 1px solid var(--line-soft); vertical-align: top; }
+th {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: .07em;
+  color: var(--muted);
+  font-weight: 500;
+  background: var(--sheet-2);
+  white-space: nowrap;
+}
+tbody tr:last-child td { border-bottom: none; }
+td.mono, th.mono { font-family: "JetBrains Mono", ui-monospace, monospace; white-space: nowrap; }
+td.num { font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+
+/* ── Поток вопроса ───────────────────────────────────────────────── */
+.flow { display: flex; flex-direction: column; gap: 0; }
+.step-row {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  gap: var(--sp-3);
+  padding-block: var(--sp-3);
+  border-bottom: 1px dashed var(--line);
+}
+.step-row:last-child { border-bottom: none; }
+.step-row .who {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: .07em;
+  color: var(--muted);
+  padding-top: 3px;
+}
+.step-row .who.agent { color: var(--accent); }
+.step-row .who.model { color: var(--amber); }
+.step-row .who.db    { color: var(--green); }
+.step-row .what { display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; }
+.step-row .what b { font-weight: 600; }
+@media (max-width: 560px) {
+  .step-row { grid-template-columns: 1fr; gap: var(--sp-1); }
+}
+
+/* ── Шаги разбора ────────────────────────────────────────────────── */
+.walk { display: flex; flex-direction: column; gap: var(--sp-4); counter-reset: walk; }
+.walk > li {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  gap: var(--sp-3);
+  counter-increment: walk;
+}
+.walk > li::before {
+  content: counter(walk);
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: var(--fs-sm);
+  font-weight: 700;
+  color: var(--accent);
+  border-top: 2px solid var(--accent);
+  padding-top: var(--sp-1);
+  font-variant-numeric: tabular-nums;
+}
+.walk > li > div { display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; }
+.walk ul, .walk ol { margin: 0; padding-left: 1.2em; }
+.walk li + li { margin-top: 2px; }
+ul.plain { margin: 0; padding-left: 1.2em; }
+ul.plain li { margin-bottom: var(--sp-1); max-width: 68ch; }
+
+/* ── Метки ───────────────────────────────────────────────────────── */
+.tag {
+  display: inline-block;
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 11px;
+  letter-spacing: .04em;
+  padding: 1px 7px;
+  border-radius: 100px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.tag.on  { color: var(--green); border-color: var(--green); background: var(--green-wash); }
+.tag.off { color: var(--red);   border-color: var(--red);   background: var(--red-wash); }
+.tag.mid { color: var(--amber); border-color: var(--amber); background: var(--amber-wash); }
+
+.two-col { display: grid; grid-template-columns: 1fr; gap: var(--sp-3); }
+@media (min-width: 760px) { .two-col { grid-template-columns: 1fr 1fr; } }
+
+.ladder { display: flex; flex-direction: column; gap: var(--sp-2); }
+.rung {
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr) auto;
+  gap: var(--sp-3);
+  align-items: start;
+  padding: var(--sp-3);
+  background: var(--sheet);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+}
+.rung .idx {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-weight: 700;
+  color: var(--accent);
+  font-size: var(--fs-sm);
+}
+.rung .body { display: flex; flex-direction: column; gap: var(--sp-1); min-width: 0; }
+.rung .body b { font-weight: 600; }
+.rung .cost { font-size: var(--fs-xs); color: var(--muted); white-space: nowrap; }
+@media (max-width: 620px) {
+  .rung { grid-template-columns: 26px minmax(0, 1fr); }
+  .rung .cost { grid-column: 2; }
+}
+
+footer {
+  margin-top: var(--sp-6);
+  padding-top: var(--sp-4);
+  border-top: 3px double var(--line);
+  font-size: var(--fs-sm);
+  color: var(--muted);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+footer .files { display: grid; grid-template-columns: 1fr; gap: 2px; font-family: "JetBrains Mono", ui-monospace, monospace; font-size: var(--fs-xs); }
+@media (min-width: 700px) { footer .files { grid-template-columns: 1fr 1fr; } }
+
+/* ── Схемы ───────────────────────────────────────────────────────── */
+figure { margin: 0; display: flex; flex-direction: column; gap: var(--sp-2); }
+figure svg { display: block; width: 100%; height: auto; max-width: 100%; }
+.fig-frame {
+  background: var(--sheet);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  padding: var(--sp-3);
+  overflow-x: auto;
+}
+figcaption { font-size: var(--fs-xs); color: var(--muted); max-width: 72ch; }
+.sv-box   { fill: var(--sheet-2); stroke: var(--line); stroke-width: 1; }
+.sv-hub   { fill: var(--accent-wash); stroke: var(--accent); stroke-width: 1.5; }
+.sv-ok    { fill: var(--green-wash); stroke: var(--green); stroke-width: 1; }
+.sv-warn  { fill: var(--amber-wash); stroke: var(--amber); stroke-width: 1; }
+.sv-stop  { fill: var(--red-wash); stroke: var(--red); stroke-width: 1; }
+.sv-t     { fill: var(--ink); font-family: "Golos Text", system-ui, sans-serif; font-size: 12px; }
+.sv-t.mono{ font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 11px; }
+.sv-t.sm  { font-size: 10.5px; fill: var(--muted); }
+.sv-t.hd  { font-size: 12.5px; font-weight: 600; }
+.sv-t.acc { fill: var(--accent); }
+.sv-line  { stroke: var(--muted); stroke-width: 1.2; fill: none; }
+.sv-line.acc { stroke: var(--accent); }
+.sv-line.dash { stroke-dasharray: 4 3; }
+.sv-arc   { fill: var(--accent-wash); stroke: none; }
+.sv-axis  { stroke: var(--line); stroke-width: 1; fill: none; }
+.sv-dot   { fill: var(--accent); }
+.sv-dot.off { fill: var(--muted); }
+
+a:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+
+<div class="wrap">
+
+<header class="masthead">
+  <div class="eyebrow">
+    <span>mysql_monit_ai</span><span class="dot">·</span>
+    <span>версия 2.22.3</span><span class="dot">·</span>
+    <span>техническое описание</span>
+  </div>
+  <h1>Агент MySQL изнутри</h1>
+  <p class="standfirst">Что происходит между вопросом в чате и ответом: какой контекст собирается, что лежит в системном промпте, какими инструментами модель ходит в базу, как находится нужная таблица и почему запрос на запись не долетит до сервера.</p>
+  <div class="facts">
+    <div class="fact"><b>12</b><span>инструментов модели</span></div>
+    <div class="fact"><b>15</b><span>правил в промпте</span></div>
+    <div class="fact"><b>3</b><span>пути к нужной таблице</span></div>
+    <div class="fact"><b>6</b><span>разрешённых начал SQL</span></div>
+    <div class="fact"><b>763</b><span>проверки в тестах</span></div>
+  </div>
+</header>
+
+<div class="frame">
+
+  <nav class="rail" aria-label="Разделы">
+    <ol>
+      <li><a href="#parts"><span class="num">01</span>Из чего собран</a></li>
+      <li><a href="#path"><span class="num">02</span>Путь вопроса</a></li>
+      <li><a href="#prompt"><span class="num">03</span>Системный промпт</a></li>
+      <li><a href="#tools"><span class="num">04</span>Инструменты</a></li>
+      <li><a href="#loop"><span class="num">05</span>Цикл инструментов</a></li>
+      <li><a href="#schema"><span class="num">06</span>Снимок схемы</a></li>
+      <li><a href="#search"><span class="num">07</span>Поиск таблицы</a></li>
+      <li><a href="#walk"><span class="num">08</span>Разбор: топ-5</a></li>
+      <li><a href="#guard"><span class="num">09</span>Только чтение</a></li>
+      <li><a href="#limits"><span class="num">10</span>Пределы</a></li>
+      <li><a href="#unknown"><span class="num">11</span>Когда не знает</a></li>
+    </ol>
+  </nav>
+
+  <main>
+
+  <!-- ═══ 01 ═══ -->
+  <section id="parts">
+    <h2><span class="h-num">01</span>Из чего собран</h2>
+    <p>Агент — это служба FastAPI на сервере мониторинга. Она ничего не считает сама: метрики берёт из Prometheus, данные — из MySQL кластеров, логи — по SSH, а рассуждает за неё внешняя модель по OpenAI-совместимому API. Своё у агента — SQLite (или MySQL) со снимками схемы, историей чатов, алертами и журналом действий.</p>
+
+    <div class="scroller">
+      <table>
+        <thead>
+          <tr><th>Часть</th><th>Роль</th><th>Как агент к ней ходит</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="mono">Prometheus</td><td>метрики СУБД и серверов</td><td>HTTP, <code>/api/v1/query</code> и <code>query_range</code></td></tr>
+          <tr><td class="mono">MySQL кластеры</td><td>сами данные и performance_schema</td><td>pymysql напрямую, SSH-туннель или <code>mysql</code> на сервере</td></tr>
+          <tr><td class="mono">SSH</td><td>slow-лог, логи АСР, <code>dmesg</code>, время сервера</td><td>общая учётка из настроек, ключ</td></tr>
+          <tr><td class="mono">LLM</td><td>рассуждение и выбор инструментов</td><td><code>/chat/completions</code>, стриминг SSE</td></tr>
+          <tr><td class="mono">Эмбеддинги</td><td>поиск таблицы по смыслу</td><td><code>/embeddings</code>, если эндпоинт их отдаёт</td></tr>
+          <tr><td class="mono">Хранилище агента</td><td>снимки схемы, векторы, чаты, алерты</td><td>SQLAlchemy async</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+
+    <figure>
+      <div class="fig-frame">
+        <svg viewBox="0 0 900 320" role="img" aria-label="Агент в центре, вокруг Prometheus, MySQL, SSH, LLM, эмбеддинги и хранилище" style="color: var(--muted); max-width: 900px;">
+          <defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M 0 1 L 9 5 L 0 9 z" fill="currentColor" />
+  </marker>
+</defs>
+          <rect class="sv-hub" x="330" y="120" width="220" height="80" rx="4" />
+          <text class="sv-t hd" x="440" y="152" text-anchor="middle">Агент</text>
+          <text class="sv-t sm" x="440" y="170" text-anchor="middle">FastAPI · сервер мониторинга</text>
+          <text class="sv-t sm" x="440" y="186" text-anchor="middle">единственная дверь к данным</text>
+
+          <rect class="sv-box" x="40" y="130" width="150" height="60" rx="4" />
+          <text class="sv-t" x="115" y="156" text-anchor="middle">Браузер</text>
+          <text class="sv-t sm" x="115" y="173" text-anchor="middle">чат, WebSocket</text>
+
+          <rect class="sv-ok" x="250" y="20" width="170" height="56" rx="4" />
+          <text class="sv-t" x="335" y="44" text-anchor="middle">Prometheus</text>
+          <text class="sv-t sm" x="335" y="61" text-anchor="middle">метрики СУБД и ОС</text>
+
+          <rect class="sv-ok" x="700" y="110" width="170" height="56" rx="4" />
+          <text class="sv-t" x="785" y="134" text-anchor="middle">MySQL кластеры</text>
+          <text class="sv-t sm" x="785" y="151" text-anchor="middle">данные, perf_schema</text>
+
+          <rect class="sv-ok" x="700" y="200" width="170" height="56" rx="4" />
+          <text class="sv-t" x="785" y="224" text-anchor="middle">SSH</text>
+          <text class="sv-t sm" x="785" y="241" text-anchor="middle">slow-лог, логи АСР</text>
+
+          <rect class="sv-warn" x="480" y="20" width="200" height="56" rx="4" />
+          <text class="sv-t" x="580" y="44" text-anchor="middle">Модель (LLM)</text>
+          <text class="sv-t sm" x="580" y="61" text-anchor="middle">рассуждение, инструменты</text>
+
+          <rect class="sv-warn" x="480" y="244" width="200" height="56" rx="4" />
+          <text class="sv-t" x="580" y="268" text-anchor="middle">Эмбеддинги</text>
+          <text class="sv-t sm" x="580" y="285" text-anchor="middle">поиск таблицы по смыслу</text>
+
+          <rect class="sv-box" x="200" y="244" width="200" height="56" rx="4" />
+          <text class="sv-t" x="300" y="268" text-anchor="middle">Хранилище агента</text>
+          <text class="sv-t sm" x="300" y="285" text-anchor="middle">схема, векторы, чаты</text>
+
+          <path class="sv-line acc" d="M 190 160 H 330" marker-end="url(#ah)" style="color: var(--accent);" />
+          <path class="sv-line acc" d="M 330 160 H 190" marker-end="url(#ah)" style="color: var(--accent);" />
+          <path class="sv-line" d="M 380 120 V 76" marker-end="url(#ah)" />
+          <path class="sv-line" d="M 470 120 V 76" marker-end="url(#ah)" />
+          <path class="sv-line" d="M 550 145 H 700" marker-end="url(#ah)" />
+          <path class="sv-line" d="M 550 175 C 620 175, 640 228, 700 228" marker-end="url(#ah)" />
+          <path class="sv-line" d="M 500 200 C 520 220, 540 232, 560 244" marker-end="url(#ah)" />
+          <path class="sv-line" d="M 380 200 C 360 220, 340 232, 320 244" marker-end="url(#ah)" />
+
+          <text class="sv-t sm" x="337" y="100">PromQL</text>
+          <text class="sv-t sm" x="477" y="100">промпт + инструменты</text>
+          <text class="sv-t sm" x="560" y="138">SQL</text>
+          <text class="sv-t sm" x="600" y="212">ssh</text>
+        </svg>
+      </div>
+      <figcaption>Модель не имеет доступа ни к базе, ни к серверам, ни к Prometheus — она может только попросить агента. Двусторонняя стрелка одна: чат с браузером.</figcaption>
+    </figure>
+
+    <div class="note">
+      <p><b>Ключевое свойство:</b> модель не имеет доступа ни к базе, ни к серверам. Она может только <em>попросить</em> агента что-то сделать — списком инструментов. Всё, что уходит в базу, проходит через проверку агента, и это единственная дверь.</p>
+    </div>
+  </section>
+
+  <!-- ═══ 02 ═══ -->
+  <section id="path">
+    <h2><span class="h-num">02</span>Путь вопроса</h2>
+    <p>Вопрос из чата не уходит в модель сразу. Сначала агент собирает контекст сам — по ключевым словам и по снимку схемы, — и только потом отдаёт модели всё вместе.</p>
+
+
+    <figure>
+      <div class="fig-frame">
+        <svg viewBox="0 0 900 104" role="img" aria-label="Конвейер: вопрос, контекст, сообщения, инструменты, стриминг, страховки" style="color: var(--muted); max-width: 900px;">
+          <defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M 0 1 L 9 5 L 0 9 z" fill="currentColor" />
+  </marker>
+</defs>
+          <rect class="sv-box" x="10" y="26" width="132" height="62" rx="4" /><text class="sv-t hd" x="76" y="50" text-anchor="middle">вопрос</text><text class="sv-t sm" x="76" y="68" text-anchor="middle">сохранён в историю</text>
+          <path class="sv-line" d="M 142 57 H 156" marker-end="url(#ah)" />
+          <rect class="sv-hub" x="158" y="26" width="132" height="62" rx="4" /><text class="sv-t hd" x="224" y="50" text-anchor="middle">контекст</text><text class="sv-t sm" x="224" y="68" text-anchor="middle">метрики, схема, алерты</text>
+          <path class="sv-line" d="M 290 57 H 304" marker-end="url(#ah)" />
+          <rect class="sv-box" x="306" y="26" width="132" height="62" rx="4" /><text class="sv-t hd" x="372" y="50" text-anchor="middle">сообщения</text><text class="sv-t sm" x="372" y="68" text-anchor="middle">system + history + user</text>
+          <path class="sv-line" d="M 438 57 H 452" marker-end="url(#ah)" />
+          <rect class="sv-hub" x="454" y="26" width="132" height="62" rx="4" /><text class="sv-t hd" x="520" y="50" text-anchor="middle">инструменты</text><text class="sv-t sm" x="520" y="68" text-anchor="middle">раунды, порция 4</text>
+          <path class="sv-line" d="M 586 57 H 600" marker-end="url(#ah)" />
+          <rect class="sv-box" x="602" y="26" width="132" height="62" rx="4" /><text class="sv-t hd" x="668" y="50" text-anchor="middle">стриминг</text><text class="sv-t sm" x="668" y="68" text-anchor="middle">фильтр разметки</text>
+          <path class="sv-line" d="M 734 57 H 748" marker-end="url(#ah)" />
+          <rect class="sv-box" x="750" y="26" width="132" height="62" rx="4" /><text class="sv-t hd" x="816" y="50" text-anchor="middle">страховки</text><text class="sv-t sm" x="816" y="68" text-anchor="middle">SQL, вступление</text>
+          <text class="sv-t sm" x="10" y="16">собирает агент, без модели</text>
+          <text class="sv-t sm" x="454" y="16">работает модель</text>
+          <text class="sv-t sm" x="750" y="16">проверяет агент</text>
+        </svg>
+      </div>
+      <figcaption>Синим — то, где агент решает сам: сбор контекста и цикл инструментов. Модель включается только между ними.</figcaption>
+    </figure>
+
+    <div class="panel">
+      <div class="panel-head"><span class="name">generate() · agent/api/routes/chat.py</span><span class="note">задача живёт в памяти агента, а не в сокете</span></div>
+      <div class="flow" style="padding: 0 var(--sp-3);">
+
+        <div class="step-row">
+          <div class="who">человек</div>
+          <div class="what"><b>«Напиши запрос для получения топ 5 договоров по длительности»</b>
+            <span>Вопрос сразу сохраняется в историю — до генерации. Перезагрузил страницу — вопрос на месте, а ответ догоняется.</span></div>
+        </div>
+
+        <div class="step-row">
+          <div class="who agent">агент</div>
+          <div class="what"><b>build_chat_context()</b>
+            <span>Определяет кластер по названию города в тексте и период по словам «за сутки», «за 3 часа». Собирает блоки: текущие метрики, история, алерты, заметки по кластеру, справка по схеме, описания упомянутых таблиц. Всё, что собрать не удалось, попадает в отдельный блок «Чего собрать не удалось» — чтобы отсутствие данных не выглядело как отсутствие проблемы.</span></div>
+        </div>
+
+        <div class="step-row">
+          <div class="who agent">агент</div>
+          <div class="what"><b>Сборка сообщений</b>
+            <pre class="wrapped">[system]  системный промпт (15 правил, ниже целиком)
+[history] последние реплики разговора дословно + выжимка вытесненного
+[user]    &lt;собранные блоки контекста&gt;
+
+          ## Вопрос
+
+          Напиши запрос для получения топ 5 договоров по длительности</pre></div>
+        </div>
+
+        <div class="step-row">
+          <div class="who model">модель</div>
+          <div class="what"><b>Раунды инструментов</b>
+            <span>Если эндпоинт умеет function calling, модель сама просит недостающее: схему таблицы, план запроса, строки из базы. Агент выполняет и возвращает результат. Порция раундов — 4, дальше агент спрашивает человека, продолжать ли.</span></div>
+        </div>
+
+        <div class="step-row">
+          <div class="who model">модель</div>
+          <div class="what"><b>Стриминг ответа</b>
+            <span>Токены идут в браузер по мере генерации. По дороге вырезается всё, что предназначалось не человеку: теги рассуждений <code>&lt;think&gt;</code> и вызовы инструментов, написанные текстом.</span></div>
+        </div>
+
+        <div class="step-row">
+          <div class="who agent">агент</div>
+          <div class="what"><b>Три страховки после ответа</b>
+            <ul class="plain">
+              <li>В ответе оказался <code>SELECT</code> вместо результата — агент выполняет его сам и просит модель ответить по данным.</li>
+              <li>Ответ похож на вступление («Сейчас получу…») — агент просит договорить, а показанное вступление стирает.</li>
+              <li>Ответ сохраняется в историю и очищается от разметки.</li>
+            </ul></div>
+        </div>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══ 03 ═══ -->
+  <section id="prompt">
+    <h2><span class="h-num">03</span>Системный промпт</h2>
+    <p>Промпт собирается на каждый вопрос заново: в него подставляются текущая дата с часовым поясом, список кластеров и версии MySQL на них. Дальше — 15 правил. Ниже полный текст; подставляемые части показаны в фигурных скобках.</p>
+
+    <div class="panel">
+      <div class="panel-head"><span class="name">system_prompt() · agent/services/analysis.py</span><span class="note">панель прокручивается</span></div>
+      <pre class="tall">Ты — опытный DBA и SRE со специализацией на MySQL/InnoDB и репликации.
+Ты обслуживаешь MySQL-кластеры (primary + replica) в разных городах.
+
+{сегодняшняя дата, время и часовой пояс сервера}
+
+Доступные кластеры:
+{имя, город, IP primary и replica, роль, версия}
+
+{версии MySQL по кластерам — от них зависит синтаксис}
+
+Правила:
+1. Отвечай ТОЛЬКО на русском языке.
+2. Структурируй ответ, давай конкретные команды MySQL/Linux.
+   Ход мысли в ответ не выводи: ни тегов &lt;think&gt;, &lt;thinking&gt;, &lt;reasoning&gt;,
+   ни пошаговых рассуждений вслух. Спросили результат, а не протокол
+   размышлений. Начинай сразу с того, о чём спросили.
+3. Если есть исторические данные — ссылайся на конкретные значения и время пиков.
+4. Если данных недостаточно — честно об этом говори.
+5. Интерпретируй числа, а не пересказывай их.
+
+6. <span class="k-rule">ВОПРОСЫ ПРО ДАННЫЕ.</span> На «сколько договоров с долгом», «когда последний
+   платёж», «есть ли дубли по логину» отвечают не рассуждением, а запросом:
+   бери имена из get_schema и выполняй run_sql. Не проси человека выполнить
+   запрос самому и не показывай текст запроса вместо ответа — выполни его и
+   ответь числом, а запрос приведи рядом, чтобы результат можно было
+   проверить.
+
+   <span class="k-cap">ПЛАН — НЕ ОТВЕТ.</span> «Нужно выполнить такой-то запрос», «следует посмотреть
+   в такую-то таблицу» — это не ответ, а перекладывание работы на того, кто
+   спрашивает: доступа к базе у него в чате нет, он есть у тебя. Нужен
+   запрос — выполни и ответь числом. Если ты всё же написал запрос вместо
+   ответа, агент выполнит его сам и вернёт тебе результат: тогда ответь по
+   данным, а не повторяй инструкцию.
+
+   Писать в базу нельзя ни при каких формулировках просьбы: разрешены
+   только SELECT, SHOW, EXPLAIN, DESCRIBE, всё остальное отклоняется до
+   отправки в базу. Если просят изменить данные — скажи, что агент этого
+   не делает, и предложи готовый запрос, который человек выполнит сам.
+
+   Результат обрезается по числу строк. Считай на стороне базы
+   (COUNT, SUM, GROUP BY), а не выбирай всё подряд, чтобы посчитать в уме.
+
+   <span class="k-cap">СТОЛБЦЫ НЕ ВЫДУМЫВАЙ.</span> Столбцы таблицы существуют только там, где они
+   приложены: в блоке «## база.таблица» или в ответе get_schema. Имя
+   таблицы не говорит о её содержимом — `agreements` может не иметь ни
+   одного поля из тех, что подсказывает здравый смысл. Если про таблицу
+   спрашивают, а её блока в подсказке нет и get_schema недоступен, так и
+   скажи: «структуры этой таблицы у меня нет» — и предложи снять схему
+   кнопкой «Снять схему» на вкладке кластера. Ответ «не знаю» полезен,
+   выдуманный список полей — вреден: его примут за правду.
+
+   Блок «## Что есть в базе» — это только имена и комментарии таблиц.
+   Перечислять по нему столбцы нельзя.
+
+   <span class="k-cap">ИМЕНА БЕРИ ТОЛЬКО ИЗ СХЕМЫ.</span> Прежде чем написать запрос, сверь КАЖДОЕ
+   имя — базы, таблицы, представления, столбца — с приложенными блоками
+   схемы. Имени нет в схеме — значит для тебя его нет: не подставляй
+   похожее, не достраивай по смыслу («раз есть payments, наверное есть
+   payments_archive»), не переноси имена из других биллингов, которые
+   видел при обучении. Напиши, какого имени не хватает, и предложи снять
+   схему заново.
+
+   Пометка (VIEW) означает представление: выбирать из него можно так же,
+   как из таблицы, — это существующий объект базы, а не выдумка.
+
+   <span class="k-cap">ОТ ПРАВИЛЬНОГО ОТВЕТА НЕ ОТРЕКАЙСЯ.</span> Если человек говорит «такой
+   таблицы нет», а в приложенной схеме она есть, — не извиняйся и не
+   переписывай запрос. Скажи прямо: объект в схеме есть, вот его вид
+   (таблица или представление), вот когда снят снимок; возможно, он
+   появился или исчез после съёмки — тогда предложи пересъёмку. Менять
+   верный ответ на неверный из вежливости хуже, чем спорить: спор
+   проверяется, а согласие принимают на веру.
+
+   Комментарии из базы (COMMENT) — слова тех, кто эту базу делал. Если у
+   поля есть комментарий, объясняй поле им, а не догадкой по имени.
+
+   <span class="k-cap">НЕ ЗНАЕШЬ — ТАК И СКАЖИ.</span> Это правило шире столбцов и сильнее желания
+   быть полезным. Не выдумывай таблицы, поля, значения, справочники,
+   коды статусов, связи между таблицами, смысл поля, объёмы и даты. Не
+   выдавай устройство чужих баз, известное тебе по обучению, за
+   устройство ЭТОЙ базы. Если ответа нет в приложенных блоках и его
+   нельзя получить запросом — напиши прямо: чего именно не хватает и что
+   человеку сделать, чтобы это появилось (снять схему, включить
+   экспортер, назвать кластер, задать период). Отвечать «не знаю» —
+   нормальная работа. Правдоподобная выдумка — нет: её невозможно
+   отличить от ответа, и по ней примут решение.
+
+   Если часть ответа проверена запросом, а часть — предположение, так и
+   разделяй: «по данным запроса …», «предполагаю, но проверить нечем …».
+
+7. Если приложен блок «Алерты за …» — это реальная история срабатываний
+   за {N} дн. Опирайся на неё: называй даты и время, ищи повторяющиеся и
+   связанные инциденты. Блок с фразой «Ни одного алерта за этот период не
+   было» означает именно это — не придумывай инциденты.
+
+8. <span class="k-rule">ОТСТАВАНИЕ РЕПЛИКИ.</span> Многие реплики работают с ЗАПЛАНИРОВАННОЙ задержкой
+   (MASTER_DELAY, часто 2 часа) — это защита от ошибочного DROP, а не авария.
+   В метриках три величины:
+     replication_lag_raw_s        — сырой Seconds_Behind_Master
+     replication_planned_delay_s  — запланированная задержка (SQL_Delay)
+     replication_lag_over_plan_s  — отставание СВЕРХ плана
+   Судить о здоровье репликации можно ТОЛЬКО по replication_lag_over_plan_s.
+   Пример: raw=7217, planned=7200, over_plan=17 — реплика отстаёт на 17 секунд,
+   это НОРМА. Называть это проблемой, писать про «отставание более 2 часов»
+   и предлагать чинить репликацию в такой ситуации — грубая ошибка.
+
+9. <span class="k-rule">КОНСОЛИДИРОВАННЫЙ ОТВЕТ.</span> В контексте есть метрики и СУБД, и сервера
+   (CPU, iowait, память, диски, сеть). Не разбирай их порознь — связывай:
+     - медленные запросы и рост latency при высоком iowait и загрузке дисков
+       обычно упираются в диск, а не в сам MySQL;
+     - рост отставания реплики при высоком CPU на реплике — часто однопоточный
+       SQL-поток, а не сеть;
+     - всплеск подключений при нехватке памяти — риск OOM;
+     - если метрики сервера в норме, так и скажи: узкое место внутри СУБД.
+   Структура ответа: (1) вывод одной фразой — есть проблема или нет;
+   (2) что показывают метрики СУБД; (3) что показывают метрики сервера;
+   (4) как они связаны; (5) что делать.
+
+10. <span class="k-rule">ДЕТАЛЬНАЯ СТАТИСТИКА.</span> Если приложен блок «Детальная статистика … шаг N» —
+   это реальные значения по интервалам, а не агрегаты. Называй конкретное
+   время всплесков, показывай, что происходило с ресурсами ОС в ту же минуту.
+   Не отвечай «есть только min/avg/max», если такая таблица приложена.
+
+11. <span class="k-rule">SQL.</span> Если приложен блок «Результат SQL» — это реальные строки из БД,
+    опирайся на них. Версии MySQL указаны выше: предлагай синтаксис и имена
+    таблиц именно для этих версий (у 5.7 и 8.0 разные performance_schema
+    и разный SHOW). Агент умеет только ЧИТАТЬ: не предлагай ему выполнить
+    INSERT/UPDATE/DELETE/ALTER — такие запросы отклоняются.
+
+12. <span class="k-rule">ДИАГНОСТИКА.</span> Если приложен блок «Диагностика …» — агент уже выполнил
+    набор запросов Performance Schema. Разбирай по методике:
+      1) есть ли проблема вообще — по метрикам и активным сессиям;
+      2) куда уходит время — самые тяжёлые запросы по суммарному времени,
+         а не по числу вызовов;
+      3) почему они тяжёлые — полное сканирование, ожидания блокировок,
+         ввод-вывод по таблицам и файлам;
+      4) упирается ли в ресурсы сервера — сопоставь с CPU, iowait, памятью;
+      5) что делать — конкретные индексы, переписывание запросов, параметры.
+    Называй конкретные запросы (DIGEST_TEXT), таблицы и цифры из блока.
+
+13. <span class="k-cap">ЧЕГО НЕ ВИДЕЛ — О ТОМ НЕ СУДИ.</span> Если приложен блок «Чего собрать не
+    удалось», перечисленных данных у тебя НЕТ. Не пиши «проблем не
+    обнаружено» про то, что не проверялось: отсутствие блока и отсутствие
+    проблемы — разные вещи.
+
+14. <span class="k-rule">НАГРУЗКА СЕЙЧАС И ЗА ВСЁ ВРЕМЯ — РАЗНОЕ.</span> Блок «Профиль нагрузки» — это
+    прирост за окно в несколько секунд. Блок диагностики по performance_schema —
+    суммы с момента запуска сервера. При разборе «тормозит прямо сейчас»
+    опирайся на профиль.
+
+15. <span class="k-rule">РЕПЛИКАЦИЯ.</span> Отставание на величину запланированной задержки — норма,
+    а не авария: смотри строку «сверх плана». Seconds_Behind_Source на
+    простаивающем источнике показывает 0 даже при реальном отставании.</pre>
+    </div>
+
+    <h3>Служебные промпты</h3>
+    <p>Кроме системного есть ещё четыре — они подставляются в определённые моменты и решают конкретные поломки поведения.</p>
+
+    <div class="panel">
+      <div class="panel-head"><span class="name">FINISH_NOTE</span><span class="note">когда порция раундов инструментов израсходована</span></div>
+      <pre class="wrapped">Данные собраны, инструменты закончились. Теперь дай ответ по существу:
+числа, имена, факты из полученного выше. Инструменты больше не вызывай
+и не описывай, что собираешься сделать, — делать уже нечего, надо
+отвечать. Если каких-то данных не хватило, так и скажи и ответь по тем,
+что есть.</pre>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><span class="name">UNFINISHED_NOTE</span><span class="note">когда ответ оказался вступлением</span></div>
+      <pre class="wrapped">Это не ответ, а вступление: ты написал, что собираешься сделать, и
+остановился. Ответь на вопрос по существу — числами, именами и фактами
+из данных выше. Инструменты не вызывай и намерений не описывай. Если
+данных не хватает, скажи прямо, каких именно.</pre>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><span class="name">Возврат результата инструментов</span><span class="note">два варианта, в зависимости от того, кто их запросил</span></div>
+      <pre class="wrapped">Данные, которые ты запросил:
+
+&lt;результаты&gt;
+
+Теперь ответь на вопрос по этим данным. Инструменты больше не вызывай.
+
+— — — если запрос был написан в ответе, а не вызван инструментом:
+
+Ты написал запрос вместо ответа — агент его выполнил. Вот что вернула
+база:
+
+&lt;результат&gt;
+
+Теперь ответь на вопрос по этим данным: назови числа. Запрос приведи
+рядом, чтобы результат можно было проверить. Инструменты больше не
+вызывай.</pre>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><span class="name">Выбор таблицы моделью</span><span class="note">запасной путь, когда нет модели векторов</span></div>
+      <pre class="wrapped">Ниже список таблиц базы с комментариями из самой базы.
+
+billing.agreements — Договоры абонентов
+billing.payments — Платежи абонентов
+billing.vgroups — Абоненты
+…до 200 таблиц, крупные первыми
+
+Вопрос человека: покажи учётные записи
+
+Выбери не больше 3 таблиц, о которых этот вопрос. Ответь ТОЛЬКО именами
+из списка, по одному в строке, без пояснений. Если вопрос не про данные
+или подходящей таблицы нет, ответь одним словом: нет.</pre>
+    </div>
+
+    <div class="note warn">
+      <p><b>Ответ этой модели проверяется по снимку.</b> Имя, которого в схеме нет, отбрасывается молча. Придуманная таблица здесь опаснее отсутствия ответа: по ней был бы построен запрос.</p>
+    </div>
+  </section>
+
+  <!-- ═══ 04 ═══ -->
+  <section id="tools">
+    <h2><span class="h-num">04</span>Инструменты</h2>
+    <p>Описания отдаются модели в формате OpenAI function calling. Имя кластера — обязательный параметр почти везде: в описании параметра перечислены реальные имена из реестра, поэтому модель не может сослаться на несуществующий город.</p>
+
+    <div class="scroller">
+      <table>
+        <thead>
+          <tr><th>Инструмент</th><th>Что делает</th><th>Параметры</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="mono">get_current_metrics</td><td>доступность, QPS, подключения, CPU, отставание реплики</td><td class="mono">cluster</td></tr>
+          <tr><td class="mono">get_history</td><td>min/avg/max за период и сравнение с тем же периодом неделю назад</td><td class="mono">cluster, hours</td></tr>
+          <tr><td class="mono">get_breakdown</td><td>значения по интервалам: CPU, iowait, память, диски, QPS по каждому шагу</td><td class="mono">cluster, hours, step_seconds</td></tr>
+          <tr><td class="mono">get_workload</td><td>что нагружает базу <em>прямо сейчас</em>: два среза performance_schema и разница</td><td class="mono">cluster, seconds</td></tr>
+          <tr><td class="mono">run_diagnostics</td><td>тяжёлые запросы, полные сканирования, блокировки, ожидания, планы</td><td class="mono">cluster</td></tr>
+          <tr><td class="mono">get_replication</td><td>почему реплика отстала: потоки, ошибки применения, непринятый relay log</td><td class="mono">cluster</td></tr>
+          <tr><td class="mono">get_schema</td><td>снимок схемы: таблицы с комментариями, столбцы и индексы, поиск</td><td class="mono">cluster, table, search</td></tr>
+          <tr><td class="mono">explain_query</td><td>план выполнения с разбором; вместо SQL можно дать connection_id</td><td class="mono">cluster, sql, connection_id</td></tr>
+          <tr><td class="mono">run_sql</td><td>читающий запрос к базе — этим и отвечают на вопросы про данные</td><td class="mono">cluster, sql</td></tr>
+          <tr><td class="mono">read_logs</td><td>slow-лог MySQL и логи приложения за период с серверов кластера</td><td class="mono">cluster, hours, filter</td></tr>
+          <tr><td class="mono">analyse_app_log</td><td>разбор логов АСР Lanbilling: образцы ошибок, всплески, классы бед</td><td class="mono">cluster, hours, filter</td></tr>
+          <tr><td class="mono">get_alerts</td><td>история сработавших алертов с разбором</td><td class="mono">cluster, hours</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Как выглядит описание одного инструмента</h3>
+    <div class="panel">
+      <div class="panel-head"><span class="name">run_sql · tool_specs()</span><span class="note">описание — тоже промпт</span></div>
+      <pre class="wrapped">{
+  "type": "function",
+  "function": {
+    "name": "run_sql",
+    "description": "Выполнить читающий запрос к базе и получить строки.
+      Этим и отвечают на вопросы про данные: «сколько договоров с долгом»,
+      «когда последний платёж», «есть ли дубли по логину». Имена таблиц и
+      столбцов бери из get_schema, не угадывай. Разрешены только SELECT,
+      SHOW, EXPLAIN, DESCRIBE; любая запись отклоняется до отправки в базу,
+      поэтому не пытайся менять данные — это не получится и потратит ход.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "cluster": {"type": "string",
+                    "description": "имя кластера: kemerovo, novosibirsk, …"},
+        "sql":     {"type": "string",
+                    "description": "один запрос, без ';' внутри;
+                                    LIMIT допишется сам"}
+      },
+      "required": ["cluster", "sql"]
+    }
+  }
+}</pre>
+    </div>
+
+    <div class="note">
+      <p><b>Описание инструмента — это тоже промпт.</b> В нём сказано не только что инструмент делает, но и как им пользоваться правильно: где брать имена, чего не делать и почему попытка записи — потраченный ход. Модель читает это до вызова, а не после отказа.</p>
+    </div>
+
+    <h3>Вызовы, написанные текстом</h3>
+    <p>Часть моделей не умеет штатный function calling, но обучена писать вызов прямо в ответ. Агент вылавливает такие вызовы из потока, выполняет теми же функциями и возвращает результат модели. До человека разметка не доходит ни при каком исходе — даже нераспознанный вызов показывать незачем.</p>
+    <div class="panel">
+      <div class="panel-head"><span class="name">Понимаемые форматы</span></div>
+      <pre class="wrapped">&lt;tool_call&gt;&lt;function=run_sql&gt;
+  &lt;parameter=cluster&gt;kemerovo&lt;/parameter&gt;
+  &lt;parameter=sql&gt;SELECT COUNT(*) FROM agreements&lt;/parameter&gt;
+&lt;/function&gt;&lt;/tool_call&gt;
+
+&lt;tool_call&gt;{"name": "get_history",
+             "arguments": {"cluster": "kemerovo", "hours": 6}}&lt;/tool_call&gt;
+
+&lt;tool_call&gt;&lt;parameter=cluster&gt;kemerovo&lt;/parameter&gt;
+           &lt;parameter=sql&gt;SELECT 1&lt;/parameter&gt;&lt;/tool_call&gt;
+           ← имя функции не указано: определяется по набору параметров</pre>
+    </div>
+  </section>
+
+  <!-- ═══ 05 ═══ -->
+  <section id="loop">
+    <h2><span class="h-num">05</span>Цикл инструментов</h2>
+    <p>Предел раундов — не потолок, а порция. Когда она израсходована, агент спрашивает человека прямо в чате: продолжать сбор или отвечать по собранному. Решение оставлено человеку сознательно — сбор идёт не бесплатно, это запросы к боевой базе и чтение логов по SSH.</p>
+
+
+    <figure>
+      <div class="fig-frame">
+        <svg viewBox="0 0 900 300" role="img" aria-label="Цикл: модель просит инструменты, агент выполняет, порция кончается, агент спрашивает человека" style="color: var(--muted); max-width: 900px;">
+          <defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M 0 1 L 9 5 L 0 9 z" fill="currentColor" />
+  </marker>
+</defs>
+          <rect class="sv-warn" x="40" y="40" width="180" height="62" rx="4" />
+          <text class="sv-t hd" x="130" y="64" text-anchor="middle">Модель</text>
+          <text class="sv-t sm" x="130" y="82" text-anchor="middle">просит инструменты</text>
+
+          <rect class="sv-hub" x="320" y="40" width="200" height="62" rx="4" />
+          <text class="sv-t hd" x="420" y="64" text-anchor="middle">Агент выполняет</text>
+          <text class="sv-t sm" x="420" y="82" text-anchor="middle">повтор — из кэша раунда</text>
+
+          <rect class="sv-ok" x="620" y="40" width="200" height="62" rx="4" />
+          <text class="sv-t hd" x="720" y="64" text-anchor="middle">Результат модели</text>
+          <text class="sv-t sm" x="720" y="82" text-anchor="middle">роль tool</text>
+
+          <path class="sv-line" d="M 220 71 H 320" marker-end="url(#ah)" />
+          <path class="sv-line" d="M 520 71 H 620" marker-end="url(#ah)" />
+          <path class="sv-line dash" d="M 720 102 V 132 H 130 V 102" marker-end="url(#ah)" />
+          <text class="sv-t sm" x="400" y="126" text-anchor="middle">раунд · до 4 подряд</text>
+
+          <rect class="sv-box" x="40" y="170" width="240" height="46" rx="4" />
+          <text class="sv-t" x="160" y="190" text-anchor="middle">2 раунда без нового</text>
+          <text class="sv-t sm" x="160" y="207" text-anchor="middle">топтание — сбор кончен</text>
+
+          <rect class="sv-stop" x="330" y="160" width="280" height="66" rx="4" />
+          <text class="sv-t hd" x="470" y="184" text-anchor="middle">Порция исчерпана → вопрос человеку</text>
+          <text class="sv-t sm" x="470" y="202" text-anchor="middle">«сделано N запросов, продолжаем?»</text>
+          <text class="sv-t sm" x="470" y="218" text-anchor="middle">кнопка или слово в чат · ждём 120 с</text>
+
+          <rect class="sv-ok" x="660" y="170" width="200" height="46" rx="4" />
+          <text class="sv-t" x="760" y="190" text-anchor="middle">Ответ по собранному</text>
+          <text class="sv-t sm" x="760" y="207" text-anchor="middle">FINISH_NOTE в разговор</text>
+
+          <path class="sv-line" d="M 420 102 V 160" marker-end="url(#ah)" />
+          <path class="sv-line" d="M 330 193 H 280" marker-end="url(#ah)" />
+          <path class="sv-line" d="M 610 193 H 660" marker-end="url(#ah)" />
+          <path class="sv-line acc dash" d="M 470 226 V 262 H 130 V 102" marker-end="url(#ah)" style="color: var(--accent);" />
+          <text class="sv-t sm acc" x="300" y="278" text-anchor="middle">«да» — ещё столько же раундов</text>
+          <text class="sv-t sm" x="637" y="186">«нет» / молчание</text>
+        </svg>
+      </div>
+      <figcaption>Молчание трактуется как «нет»: отказ даёт ответ по собранному, а согласие тратит запросы к боевой базе.</figcaption>
+    </figure>
+
+    <div class="ladder">
+      <div class="rung">
+        <div class="idx">1</div>
+        <div class="body"><b>Раунд</b><span>Модели отдаются сообщения и список инструментов. Она возвращает либо вызовы, либо готовность отвечать.</span></div>
+        <div class="cost">до 4 подряд</div>
+      </div>
+      <div class="rung">
+        <div class="idx">2</div>
+        <div class="body"><b>Защита от повтора</b><span>Тот же вызов с теми же аргументами не выполняется заново: модели возвращается прежний результат с пометкой «это повтор». База не дёргается второй раз.</span></div>
+        <div class="cost">кэш в памяти раунда</div>
+      </div>
+      <div class="rung">
+        <div class="idx">3</div>
+        <div class="body"><b>Топтание на месте</b><span>Два раунда подряд без единого нового вызова — сбор заканчивается. Один повтор не считается: модель часто перезапрашивает то же самое, а следующим ходом просит новое.</span></div>
+        <div class="cost">IDLE_ROUNDS = 2</div>
+      </div>
+      <div class="rung">
+        <div class="idx">4</div>
+        <div class="body"><b>Вопрос человеку</b><span>«Агент сделал 8 запросов и пока не закончил сбор. Продолжаем?» Ответить можно кнопкой или словом в чат — «да», «продолжай», «ещё». Слова разбирает сервер, поэтому это работает при любом интерфейсе.</span></div>
+        <div class="cost">ждём 120 с</div>
+      </div>
+      <div class="rung">
+        <div class="idx">5</div>
+        <div class="body"><b>Никто не ответил</b><span>Агент отвечает по собранному. Это безопасный исход: ответ всё равно будет, а согласие тратит запросы к боевой базе.</span></div>
+        <div class="cost">по умолчанию «нет»</div>
+      </div>
+    </div>
+
+    <div class="note">
+      <p><code>LLM_TOOL_ROUNDS=0</code> снимает предел совсем — агент ходит инструментами, пока модель их просит, и ни о чём не спрашивает. Страховкой остаются защита от повтора и общий предохранитель на время задачи (30 минут).</p>
+    </div>
+  </section>
+
+  <!-- ═══ 06 ═══ -->
+  <section id="schema">
+    <h2><span class="h-num">06</span>Снимок схемы</h2>
+    <p>Обход <code>information_schema</code> на базе с тысячами таблиц заметен на боевом сервере, а схема меняется раз в релиз, а не раз в минуту. Поэтому она снимается однажды по кнопке, хранится у агента и читается из его собственной базы — мгновенно и не трогая продуктив. Пересъёмка — действие администратора.</p>
+
+
+    <figure>
+      <div class="fig-frame">
+        <svg viewBox="0 0 900 250" role="img" aria-label="Съёмка схемы: information_schema, запасной путь SHOW, снимок, векторный индекс" style="color: var(--muted); max-width: 900px;">
+          <defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M 0 1 L 9 5 L 0 9 z" fill="currentColor" />
+  </marker>
+</defs>
+          <rect class="sv-ok" x="20" y="30" width="220" height="110" rx="4" />
+          <text class="sv-t hd" x="130" y="54" text-anchor="middle">information_schema</text>
+          <text class="sv-t mono" x="34" y="76">TABLES · таблицы и VIEW</text>
+          <text class="sv-t mono" x="34" y="94">COLUMNS · типы, COMMENT</text>
+          <text class="sv-t mono" x="34" y="112">STATISTICS · индексы</text>
+          <text class="sv-t mono" x="34" y="130">KEY_COLUMN_USAGE · ключи</text>
+
+          <rect class="sv-warn" x="300" y="20" width="230" height="62" rx="4" />
+          <text class="sv-t hd" x="415" y="44" text-anchor="middle">Комментарии пусты?</text>
+          <text class="sv-t sm" x="415" y="62" text-anchor="middle">SHOW TABLE STATUS · FULL COLUMNS</text>
+
+          <rect class="sv-warn" x="300" y="100" width="230" height="62" rx="4" />
+          <text class="sv-t hd" x="415" y="124" text-anchor="middle">Внешних ключей нет?</text>
+          <text class="sv-t sm" x="415" y="142" text-anchor="middle">связи по именам, помечены догадкой</text>
+
+          <rect class="sv-hub" x="590" y="20" width="290" height="76" rx="4" />
+          <text class="sv-t hd" x="735" y="44" text-anchor="middle">Снимок схемы у агента</text>
+          <text class="sv-t sm" x="735" y="62" text-anchor="middle">20 баз · 80 таблиц · 40 VIEW на базу</text>
+          <text class="sv-t sm" x="735" y="79" text-anchor="middle">300 таблиц с подробностями</text>
+
+          <rect class="sv-box" x="590" y="116" width="290" height="62" rx="4" />
+          <text class="sv-t hd" x="735" y="140" text-anchor="middle">Смысловой индекс</text>
+          <text class="sv-t sm" x="735" y="158" text-anchor="middle">по вектору на таблицу, отдельной строкой</text>
+
+          <path class="sv-line" d="M 240 60 H 300" marker-end="url(#ah)" />
+          <path class="sv-line" d="M 240 118 H 300" marker-end="url(#ah)" />
+          <path class="sv-line" d="M 530 51 H 590" marker-end="url(#ah)" />
+          <path class="sv-line" d="M 530 131 C 560 131, 560 80, 590 70" marker-end="url(#ah)" />
+          <path class="sv-line acc" d="M 735 96 V 116" marker-end="url(#ah)" style="color: var(--accent);" />
+
+          <text class="sv-t sm" x="20" y="196">Съёмка — по кнопке, администратором, в фоне: двое нажали одновременно — обход всё равно один.</text>
+          <text class="sv-t sm" x="20" y="216">Боевой сервер трогается только здесь. Дальше чат читает снимок из хранилища агента — мгновенно.</text>
+          <text class="sv-t sm" x="20" y="236">Векторизация идёт тут же, одним пакетом по 64 документа; нет модели векторов — снимок остаётся без индекса.</text>
+        </svg>
+      </div>
+      <figcaption>Два запасных пути — по комментариям и по связям — включаются, только когда основной ничего не дал.</figcaption>
+    </figure>
+
+    <div class="two-col">
+      <div class="panel">
+        <div class="panel-head"><span class="name">Что попадает в снимок</span></div>
+        <div style="padding: var(--sp-3);">
+          <ul class="plain">
+            <li>базы с размерами и оценкой числа строк;</li>
+            <li>таблицы, крупные сверху;</li>
+            <li><b>представления</b> — отдельным запросом, с пометкой <code>(VIEW)</code>;</li>
+            <li>столбцы: тип, NULL, ключ, extra, <b>комментарий</b>;</li>
+            <li>индексы: состав, уникальность, кардинальность;</li>
+            <li><b>связи</b> из <code>KEY_COLUMN_USAGE</code>, обе стороны;</li>
+            <li>что осталось за кадром — списком.</li>
+          </ul>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><span class="name">Пределы снимка</span></div>
+        <div class="scroller" style="border: none;">
+          <table>
+            <tbody>
+              <tr><td>баз</td><td class="num">20</td></tr>
+              <tr><td>таблиц на базу</td><td class="num">80</td></tr>
+              <tr><td>представлений на базу</td><td class="num">40</td></tr>
+              <tr><td>таблиц с подробностями</td><td class="num">300</td></tr>
+              <tr><td>столбцов на таблицу</td><td class="num">120</td></tr>
+              <tr><td>совпадений в поиске</td><td class="num">40</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <h3>Комментарии — то, ради чего схему и снимают</h3>
+    <p>Имя <code>balance</code> не говорит ничего, «Остаток на счёте» говорит всё. Имена в базе английские, а спрашивают по-русски — значит искать надо и по комментариям тоже. Если <code>information_schema</code> вернула их пустыми, агент идёт вторым путём: <code>SHOW TABLE STATUS</code> и <code>SHOW FULL COLUMNS</code>. Не <code>SHOW CREATE TABLE</code> — данные те же, но комментарий приходит отдельным столбцом, а не внутри DDL, который пришлось бы разбирать регулярками.</p>
+
+    <h3>Связи: объявленные и предположенные</h3>
+    <p>Чтобы написать <code>JOIN</code>, мало знать столбцы. Внешние ключи читаются из <code>KEY_COLUMN_USAGE</code>. Если их нет вовсе — на MyISAM их не бывает, да и на InnoDB их часто не заводят, — связи предполагаются по именам: столбец называется так же, как первичный ключ другой таблицы. Имена вроде <code>id</code> из рассмотрения выкинуты: они есть везде и связали бы всё со всем.</p>
+
+    <div class="note ok">
+      <p><b>Догадка помечена отдельно от объявленной связи.</b> Модель видит разницу: по внешнему ключу <code>JOIN</code> писать можно смело, по догадке — проверив. В описании таблицы это выглядит так: <code>uid → billing.vgroups.uid (внешний ключ)</code> или <code>(по имени столбца)</code>.</p>
+    </div>
+  </section>
+
+  <!-- ═══ 07 ═══ -->
+  <section id="search">
+    <h2><span class="h-num">07</span>Поиск таблицы: три пути</h2>
+    <p>Человек спрашивает «покажи учётные записи», а таблица называется <code>vgroups</code> и подписана «Абоненты». Ни одной общей буквы. Пути выстроены от дешёвого к дорогому, и следующий включается, только если предыдущий не дал ничего.</p>
+
+    <div class="ladder">
+      <div class="rung">
+        <div class="idx">1</div>
+        <div class="body"><b>По буквам</b>
+          <span>Полное имя <code>billing.agreements</code> в тексте вопроса — самое надёжное совпадение. Затем имя таблицы отдельным словом: подстрокой нельзя, <code>log</code> нашёлся бы в половине схемы. Затем по комментарию — сравнение по основе слова в 5 букв, иначе «платежей» и «Платежи» не совпали бы ни разу.</span></div>
+        <div class="cost">0 запросов</div>
+      </div>
+      <div class="rung">
+        <div class="idx">2</div>
+        <div class="body"><b>По смыслу, векторами</b>
+          <span>Каждая таблица превращена в документ — имя, комментарий, столбцы с их комментариями — и векторизована при съёмке схемы. При вопросе векторизуется только вопрос, сравнение идёт в памяти агента.</span></div>
+        <div class="cost">1 короткий запрос</div>
+      </div>
+      <div class="rung">
+        <div class="idx">3</div>
+        <div class="body"><b>Выбором самой модели</b>
+          <span>Если модели векторов нет вовсе, генеративной показывают список таблиц с комментариями и вопрос — она называет подходящие. Ответ проверяется по снимку: имя, которого в схеме нет, отбрасывается молча.</span></div>
+        <div class="cost">1 короткий диалог</div>
+      </div>
+    </div>
+
+    <h3>Как считается близость</h3>
+    <p>Векторы нормируются при сохранении — приводятся к единичной длине и округляются до пяти знаков. Тогда близость это просто скалярное произведение, без корней на каждом сравнении; округление режет размер индекса вдвое и на результат не влияет. Numpy не используется: сотни векторов перебираются за миллисекунды.</p>
+
+
+    <figure>
+      <div class="fig-frame">
+        <svg viewBox="0 0 470 316" role="img" aria-label="Близость векторов: сектор выше порога 0.30 и три таблицы под разными углами" style="color: var(--muted); max-width: 470px;">
+          <defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M 0 1 L 9 5 L 0 9 z" fill="currentColor" />
+  </marker>
+</defs>
+          <path class="sv-arc" d="M 50 250 L 250 250 A 200 200 0 0 0 110 62 Z" />
+          <path class="sv-axis" d="M 50 250 H 270" />
+          <path class="sv-axis" d="M 50 250 V 40" />
+          <path class="sv-axis" d="M 250 250 A 200 200 0 0 0 50 50" />
+
+          <path class="sv-line acc" d="M 50 250 L 250 250" marker-end="url(#ah)" style="color: var(--accent);" />
+          <text class="sv-t sm acc" x="196" y="268">вопрос</text>
+
+          <line class="sv-line dash" x1="50" y1="250" x2="214" y2="135" />
+          <circle class="sv-dot" cx="214" cy="135" r="4" />
+          <text class="sv-t mono" x="224" y="132">billing.vgroups</text>
+          <text class="sv-t sm" x="224" y="147">«Абоненты» · близость 0.82</text>
+
+          <line class="sv-line dash" x1="50" y1="250" x2="144" y2="74" />
+          <circle class="sv-dot" cx="144" cy="74" r="4" />
+          <text class="sv-t mono" x="154" y="71">billing.payments</text>
+          <text class="sv-t sm" x="154" y="86">«Платежи» · близость 0.47</text>
+
+          <line class="sv-line dash" x1="50" y1="250" x2="67" y2="51" />
+          <circle class="sv-dot off" cx="67" cy="51" r="4" />
+          <text class="sv-t mono" x="77" y="30">billing.log_tmp</text>
+          <text class="sv-t sm" x="77" y="45">0.09 — ниже порога, отброшено</text>
+
+          <path class="sv-line" d="M 50 250 L 110 62" stroke-dasharray="2 2" />
+          <text class="sv-t sm" x="118" y="58">порог 0.30</text>
+          <text class="sv-t sm" x="20" y="288">Закрашенный сектор — всё, что проходит порог.</text>
+          <text class="sv-t sm" x="20" y="304">Ниже него совпадение считается случайным и не показывается.</text>
+        </svg>
+      </div>
+      <figcaption>Векторы нормированы при сохранении, поэтому близость — это косинус угла между вопросом и документом таблицы, то есть обычное скалярное произведение. Закрашенный сектор — всё, что проходит порог.</figcaption>
+    </figure>
+
+    <div class="panel">
+      <div class="panel-head"><span class="name">Документ таблицы и сравнение</span><span class="note">agent/services/embed.py</span></div>
+      <pre class="wrapped">Документ, который векторизуется:
+
+  billing.vgroups. Абоненты. столбцы: uid (Идентификатор абонента),
+  login (Логин для входа), passwd (Пароль), balance (Остаток на счёте)
+
+Вопрос:            «покажи учётные записи»
+Близость:          0.82  ← скалярное произведение нормированных векторов
+Порог:             0.30  ← ниже этого совпадение считается случайным
+Таблиц в ответе:   3     ← крупные первыми
+
+Найденное по смыслу подаётся с оговоркой:
+
+  ## Что похоже по смыслу на «учётные записи»
+
+    По буквам ничего не совпало, поэтому искали по смыслу комментариев.
+    Проверь, та ли это таблица, прежде чем строить по ней запрос.
+
+    billing.vgroups    близость 0.82 — Абоненты</pre>
+    </div>
+
+    <div class="note warn">
+      <p><b>Порог обязателен.</b> Без него на любой вопрос находится «самое похожее», даже когда похожего нет, — и в подсказку уезжает случайная таблица. «Как дела в Кемерово» не должно находить ничего.</p>
+    </div>
+
+    <h3>Откуда берётся модель векторов</h3>
+    <p>Её не скачивают: это имя модели, развёрнутой на том же эндпоинте, что и генеративная. Агент запрашивает <code>GET /v1/models</code> и выбирает ту, чьё имя похоже на векторную — <code>embed</code>, <code>bge</code>, <code>e5</code>, <code>gte</code>, <code>minilm</code>, <code>labse</code>, <code>rubert</code>, <code>sentence</code>. Нет такой — работают первый и третий пути. В самопроверке агента видно, какой путь включён.</p>
+  </section>
+
+  <!-- ═══ 08 ═══ -->
+  <section id="walk">
+    <h2><span class="h-num">08</span>Разбор: «напиши запрос топ-5 договоров по длительности»</h2>
+    <p>Пошагово, с реальными артефактами каждого шага. Это настоящая последовательность, поэтому она и пронумерована.</p>
+
+    <ol class="walk">
+
+      <li><div>
+        <h4>Шаг 1 · агент, до модели</h4>
+        <p><b>Разбор вопроса.</b> Города в тексте нет — кластер не определён. Периода нет — метрики не собираются. Но это вопрос про данные, значит нужна схема.</p>
+      </div></li>
+
+      <li><div>
+        <h4>Шаг 2 · агент</h4>
+        <p><b>Поиск таблицы.</b> «Договоров» по буквам не совпало ни с одним именем. Сравнение по основе слова находит комментарий «Договоры абонентов» → <code>billing.agreements</code>.</p>
+      </div></li>
+
+      <li><div>
+        <h4>Шаг 3 · агент</h4>
+        <p><b>Сборка контекста.</b> В сообщение кладутся два блока: общий список таблиц и описание найденной — со столбцами, типами, комментариями и связями.</p>
+        <div class="panel">
+          <div class="panel-head"><span class="name">Блоки контекста</span><span class="note">сокращено</span></div>
+          <pre>Схема ниже снята с кластера «Кемерово»; в других городах она обычно
+такая же, но проверяй имена, если город назван.
+
+## Что есть в базе
+
+  Имена ниже — настоящие, из снимка схемы. Подробности по столбцам и
+  индексам запрашивай инструментом get_schema, не угадывай.
+  Рядом с именем — комментарий из базы.
+
+  billing (312 таблиц, 48210 МБ):
+    agreements                     — Договоры абонентов
+    payments                       — Платежи абонентов
+    vgroups                        — Абоненты
+    v_balance (VIEW)               — Остатки по договорам
+    без комментария: log_tmp, sessions_archive, …
+
+## billing.agreements — строк ~4200000, 3100 МБ
+  Договоры абонентов
+
+  Столбцы:
+    agrm_id      int(11)        первичный ключ, NOT NULL   Код договора
+    uid          int(11)        в индексе                  Абонент
+    number       varchar(32)    уникальный                 Номер договора
+    date_from    date                                      Дата начала
+    date_to      date                                      Дата окончания
+    close_date   date                                      Дата закрытия
+
+  Ссылается на:
+    uid                        -> billing.vgroups.uid  (внешний ключ)
+
+  Индексы:
+    PRIMARY      (agrm_id)     — уникальный, различных значений ~4200000
+    idx_uid      (uid)         — обычный, различных значений ~380000</pre>
+        </div>
+      </div></li>
+
+      <li><div>
+        <h4>Шаг 4 · модель</h4>
+        <p><b>Уточнение через инструмент.</b> Модель видит имена и просит подробности — либо чтобы убедиться, либо чтобы посмотреть связанную таблицу.</p>
+        <div class="panel">
+          <div class="panel-head"><span class="name">tool_calls</span></div>
+          <pre class="wrapped">{"name": "get_schema",
+ "arguments": {"cluster": "kemerovo", "table": "billing.agreements"}}</pre>
+        </div>
+      </div></li>
+
+      <li><div>
+        <h4>Шаг 5 · агент</h4>
+        <p><b>Выполнение.</b> Инструмент читает снимок из хранилища агента — боевой сервер не трогается. Результат возвращается модели ролью <code>tool</code>.</p>
+      </div></li>
+
+      <li><div>
+        <h4>Шаг 6 · модель</h4>
+        <p><b>Запрос.</b> Имена взяты из приложенной схемы: <code>date_from</code>, <code>date_to</code>, <code>close_date</code> — они там есть. <code>DATEDIFF</code> считается на стороне базы, как требует правило 6.</p>
+        <div class="panel">
+          <div class="panel-head"><span class="name">run_sql</span></div>
+          <pre class="wrapped">SELECT a.number,
+       a.date_from,
+       COALESCE(a.close_date, a.date_to, CURDATE())        AS finished,
+       DATEDIFF(COALESCE(a.close_date, a.date_to, CURDATE()),
+                a.date_from)                               AS days
+  FROM billing.agreements a
+ ORDER BY days DESC
+ LIMIT 5</pre>
+        </div>
+      </div></li>
+
+      <li><div>
+        <h4>Шаг 7 · агент, проверка</h4>
+        <p><b>Запрос проходит через ограду.</b> Первое слово <code>SELECT</code> — разрешено. Точки с запятой внутри нет. Запрещённых конструкций нет. Исполняемых комментариев <code>/*!</code> нет. <code>LIMIT</code> уже стоит — свой не дописывается.</p>
+        <div class="note ok"><p>Только после этого запрос уходит в MySQL — напрямую, через SSH-туннель или клиентом <code>mysql</code> на сервере, в зависимости от настройки кластера. Сессия при этом переводится в <code>READ ONLY</code>, а время выполнения ограничено <code>MAX_EXECUTION_TIME</code>.</p></div>
+      </div></li>
+
+      <li><div>
+        <h4>Шаг 8 · агент → модель → человек</h4>
+        <p><b>Ответ по данным.</b> Строки возвращаются модели, та отвечает числами и приводит запрос рядом — чтобы результат можно было проверить.</p>
+        <div class="panel">
+          <div class="panel-head"><span class="name">Что видит человек</span></div>
+          <pre class="wrapped">Пять самых длинных договоров в billing.agreements:
+
+  №            начало       окончание    дней
+  1000042      2009-03-14   открыт       6394
+  1000117      2009-05-02   открыт       6345
+  …
+
+Считал по DATEDIFF от date_from до close_date, а если он пуст — до
+date_to, а если пуст и он — до сегодня. Открытые договоры считаются
+по текущую дату, поэтому их «длительность» растёт каждый день.</pre>
+        </div>
+      </div></li>
+
+    </ol>
+
+    <div class="note warn">
+      <p><b>Если модель ответит инструкцией</b> — «выполните вот такой SELECT» — агент заберёт запрос из текста ответа и выполнит сам, тем же путём и с той же проверкой, а затем попросит ответить по данным. Показанная инструкция при этом стирается: человек просил результат, а не указание, что ему сделать.</p>
+    </div>
+  </section>
+
+  <!-- ═══ 09 ═══ -->
+  <section id="guard">
+    <h2><span class="h-num">09</span>Только чтение</h2>
+    <p>Это не обещание модели, а проверка в коде — та же самая для вкладки SQL, для инструмента <code>run_sql</code> и для запроса, выловленного из текста ответа. Проверка стоит <em>до</em> отправки в базу.</p>
+
+
+    <figure>
+      <div class="fig-frame">
+        <svg viewBox="0 0 900 250" role="img" aria-label="Пять проверок запроса перед отправкой в базу" style="color: var(--muted); max-width: 900px;">
+          <defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M 0 1 L 9 5 L 0 9 z" fill="currentColor" />
+  </marker>
+</defs>
+          <rect class="sv-box" x="20" y="90" width="150" height="56" rx="4" />
+          <text class="sv-t hd" x="95" y="114" text-anchor="middle">Запрос</text>
+          <text class="sv-t sm" x="95" y="131" text-anchor="middle">вкладка SQL, run_sql,</text>
+
+          <rect class="sv-warn" x="210" y="86" width="112" height="64" rx="4" />
+          <text class="sv-t sm" x="266" y="108" text-anchor="middle">исполняемые</text>
+          <text class="sv-t sm" x="266" y="123" text-anchor="middle">комментарии</text>
+          <text class="sv-t mono" x="266" y="140" text-anchor="middle">/*!  /*+</text>
+
+          <rect class="sv-warn" x="344" y="86" width="112" height="64" rx="4" />
+          <text class="sv-t sm" x="400" y="108" text-anchor="middle">одна</text>
+          <text class="sv-t sm" x="400" y="123" text-anchor="middle">инструкция</text>
+          <text class="sv-t mono" x="400" y="140" text-anchor="middle">; внутри</text>
+
+          <rect class="sv-warn" x="478" y="86" width="112" height="64" rx="4" />
+          <text class="sv-t sm" x="534" y="108" text-anchor="middle">первое слово</text>
+          <text class="sv-t sm" x="534" y="123" text-anchor="middle">из шести</text>
+          <text class="sv-t mono" x="534" y="140" text-anchor="middle">SELECT SHOW…</text>
+
+          <rect class="sv-warn" x="612" y="86" width="112" height="64" rx="4" />
+          <text class="sv-t sm" x="668" y="108" text-anchor="middle">чёрный список</text>
+          <text class="sv-t sm" x="668" y="123" text-anchor="middle">по границам</text>
+          <text class="sv-t mono" x="668" y="140" text-anchor="middle">28 слов</text>
+
+          <rect class="sv-ok" x="760" y="86" width="120" height="64" rx="4" />
+          <text class="sv-t hd" x="820" y="110" text-anchor="middle">В базу</text>
+          <text class="sv-t sm" x="820" y="127" text-anchor="middle">READ ONLY</text>
+          <text class="sv-t sm" x="820" y="143" text-anchor="middle">+ LIMIT</text>
+
+          <path class="sv-line" d="M 170 118 H 210" marker-end="url(#ah)" />
+          <path class="sv-line" d="M 322 118 H 344" marker-end="url(#ah)" />
+          <path class="sv-line" d="M 456 118 H 478" marker-end="url(#ah)" />
+          <path class="sv-line" d="M 590 118 H 612" marker-end="url(#ah)" />
+          <path class="sv-line" d="M 724 118 H 760" marker-end="url(#ah)" />
+
+          <rect class="sv-stop" x="330" y="196" width="340" height="40" rx="4" />
+          <text class="sv-t" x="500" y="221" text-anchor="middle">Отклонён — до отправки в базу, с названной причиной</text>
+          <path class="sv-line" d="M 266 150 V 196" marker-end="url(#ah)" style="color: var(--red);" />
+          <path class="sv-line" d="M 400 150 V 196" marker-end="url(#ah)" style="color: var(--red);" />
+          <path class="sv-line" d="M 534 150 V 196" marker-end="url(#ah)" style="color: var(--red);" />
+          <path class="sv-line" d="M 668 150 V 196" marker-end="url(#ah)" style="color: var(--red);" />
+
+          <text class="sv-t sm" x="20" y="40">Одна и та же ограда на трёх путях: вкладка SQL, инструмент run_sql и запрос,</text>
+          <text class="sv-t sm" x="20" y="58">выловленный из текста ответа модели. Порядок проверок — слева направо.</text>
+          <text class="sv-t sm" x="20" y="160">и запрос из ответа</text>
+        </svg>
+      </div>
+      <figcaption>Проверка стоит до отправки в базу, а не после ошибки сервера: <code>/*! DROP … */</code> MySQL исполняет, поэтому такие комментарии отклоняются целиком, а не вырезаются.</figcaption>
+    </figure>
+
+    <div class="two-col">
+      <div class="panel">
+        <div class="panel-head"><span class="name">Разрешено</span><span class="tag on">6 начал</span></div>
+        <pre>SELECT   SHOW   EXPLAIN
+DESCRIBE DESC   WITH</pre>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><span class="name">Отклоняется</span><span class="tag off">чёрный список</span></div>
+        <pre class="wrapped">INSERT UPDATE DELETE DROP TRUNCATE ALTER CREATE
+RENAME REPLACE GRANT REVOKE SET CALL LOCK UNLOCK
+LOAD HANDLER FLUSH KILL START COMMIT ROLLBACK
+SAVEPOINT PREPARE EXECUTE OUTFILE DUMPFILE</pre>
+      </div>
+    </div>
+
+    <div class="scroller">
+      <table>
+        <thead><tr><th>Правило</th><th>Зачем оно</th></tr></thead>
+        <tbody>
+          <tr><td>Одна инструкция: <code>;</code> внутри отклоняется</td><td>Чтобы к <code>SELECT 1</code> не подставили вторую команду.</td></tr>
+          <tr><td>Исполняемые комментарии <code>/*!</code> и <code>/*+</code> отклоняются целиком</td><td>MySQL <em>исполняет</em> их содержимое. Вырезать комментарии перед проверкой недостаточно — туда прячется что угодно.</td></tr>
+          <tr><td>Чёрный список по границам слова с обеих сторон</td><td>Без хвостовой границы <code>created</code> ловился как <code>CREATE</code>, и нормальные запросы отклонялись.</td></tr>
+          <tr><td><code>WITH</code> разрешён началом, но проверяется чёрным списком</td><td>В MySQL 8 <code>WITH … </code> может содержать изменяющие конструкции.</td></tr>
+          <tr><td>Сессия переводится в <code>READ ONLY</code></td><td>Страховка на стороне сервера, даже если валидатор что-то упустил.</td></tr>
+          <tr><td><code>LIMIT</code> дописывается, если его нет</td><td>Чтобы не вытащить миллион строк. Предел служебных запросов агента выше пользовательского.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="note stop">
+      <p><b>Проверено в тестах на попытки обхода:</b> <code>SELECT 1; DROP TABLE payments</code>, <code>/*! DROP TABLE x */</code>, <code>SELECT … INTO OUTFILE</code> — всё отклоняется. Запрос на изменение данных модель может только предложить человеку выполнить вручную.</p>
+    </div>
+  </section>
+
+  <!-- ═══ 10 ═══ -->
+  <section id="limits">
+    <h2><span class="h-num">10</span>Пределы и настройки</h2>
+    <p>Всё, что можно задать в <code>config.env</code>, откуда установщик собирает <code>/opt/ai-alert-agent/.env</code>. Значения по умолчанию рабочие.</p>
+
+    <div class="scroller">
+      <table>
+        <thead><tr><th>Переменная</th><th class="mono">По умолч.</th><th>Что меняет</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">LLM_TOOLS</td><td class="mono">auto</td><td>инструменты: проверить пробным запросом, включить принудительно, выключить</td></tr>
+          <tr><td class="mono">LLM_TOOL_ROUNDS</td><td class="mono">4</td><td>порция раундов, после которой агент спросит; 0 — без предела и без вопросов</td></tr>
+          <tr><td class="mono">LLM_TOOL_ASK_S</td><td class="mono">120</td><td>сколько ждать ответа на «продолжаем?»; 0 — не спрашивать</td></tr>
+          <tr><td class="mono">EMBED_MODE</td><td class="mono">auto</td><td>смысловой поиск: проверить, считать доступным, выключить</td></tr>
+          <tr><td class="mono">EMBED_MODEL</td><td class="mono">пусто</td><td>имя модели векторов; пусто — спросить у эндпоинта</td></tr>
+          <tr><td class="mono">LLM_MAX_TOKENS</td><td class="mono">2048</td><td>предел ответа модели</td></tr>
+          <tr><td class="mono">LLM_TIMEOUT</td><td class="mono">300</td><td>сколько ждать очередной порции ответа, а не ответ целиком</td></tr>
+          <tr><td class="mono">MAX_METRICS_HOURS</td><td class="mono">24</td><td>максимальное окно метрик в одном разборе</td></tr>
+          <tr><td class="mono">CHAT_CONTEXT_MESSAGES</td><td class="mono">10</td><td>сколько реплик разговора идёт дословно; остальное сжимается</td></tr>
+          <tr><td class="mono">SQL_MAX_ROWS</td><td class="mono">200</td><td>предел строк пользовательского запроса</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Пределы, заданные в коде</h3>
+    <div class="scroller">
+      <table>
+        <thead><tr><th>Константа</th><th class="mono">Знач.</th><th>Смысл</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">IDLE_ROUNDS</td><td class="num">2</td><td>раундов подряд без новых вызовов, после которых сбор заканчивается</td></tr>
+          <tr><td class="mono">INLINE_TOOL_ROUNDS</td><td class="num">2</td><td>раундов на вызовы, написанные текстом</td></tr>
+          <tr><td class="mono">MAX_ANSWER_SQL</td><td class="num">2</td><td>запросов, забираемых из одного ответа модели</td></tr>
+          <tr><td class="mono">PREAMBLE_MAX_CHARS</td><td class="num">400</td><td>ниже этой длины ответ, оборванный на двоеточии, считается вступлением</td></tr>
+          <tr><td class="mono">MIN_SCORE</td><td class="num">0.30</td><td>порог близости для смыслового поиска</td></tr>
+          <tr><td class="mono">STEM</td><td class="num">5</td><td>по скольким первым буквам слова считаются одним</td></tr>
+          <tr><td class="mono">BATCH</td><td class="num">64</td><td>текстов в одном запросе на векторизацию</td></tr>
+          <tr><td class="mono">MAX_RUN_S</td><td class="num">1800</td><td>предохранитель на время одной генерации</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ═══ 11 ═══ -->
+  <section id="unknown">
+    <h2><span class="h-num">11</span>Когда агент не знает</h2>
+    <p>Это отдельный раздел, потому что это отдельная работа. Правдоподобная выдумка хуже отказа: её невозможно отличить от ответа, и по ней примут решение.</p>
+
+    <div class="scroller">
+      <table>
+        <thead><tr><th>Ситуация</th><th>Что делает агент</th></tr></thead>
+        <tbody>
+          <tr><td>Схема не снята</td><td>Говорит об этом и предлагает кнопку «Снять схему» на вкладке кластера</td></tr>
+          <tr><td>Снимок снят старой версией</td><td>Различает «комментариев нет» и «комментарии не читались» — предлагает пересъёмку, а не утверждает, что их нет</td></tr>
+          <tr><td>Таблица не найдена ни одним из трёх путей</td><td>Называет, какого имени не хватает; список таблиц при этом приложен</td></tr>
+          <tr><td>Столбцов таблицы нет в снимке</td><td>«Столбцы в снимок не попали: таблица не вошла в число тех, для которых снимались подробности»</td></tr>
+          <tr><td>Часть диагностики не собралась</td><td>Блок «Чего собрать не удалось» — и правило 13 запрещает писать «проблем нет» про непроверенное</td></tr>
+          <tr><td>Человек возражает, а схема подтверждает ответ</td><td>Не отрекается: называет объект, его вид и дату снимка</td></tr>
+          <tr><td>Часть ответа — предположение</td><td>Разделяет явно: «по данным запроса …», «предполагаю, но проверить нечем …»</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="note">
+      <p><b>Почему это записано правилами, а не оставлено на усмотрение модели.</b> Каждое правило здесь появилось после конкретного случая: выдуманных столбцов, которых в таблице нет; ответа «проблем не обнаружено» по половине данных; извинения за верный ответ, когда человек усомнился. Правило — это след ошибки, а не общее пожелание.</p>
+    </div>
+  </section>
+
+  <footer>
+    <div>Где что лежит в коде:</div>
+    <div class="files">
+      <div>agent/services/analysis.py — системный промпт</div>
+      <div>agent/services/assistant.py — инструменты, контекст, цикл</div>
+      <div>agent/services/schema.py — снимок схемы, поиск, связи</div>
+      <div>agent/services/embed.py — векторы и близость</div>
+      <div>agent/services/mysql.py — ограда SQL и доступ к базе</div>
+      <div>agent/api/routes/chat.py — поток ответа, страховки</div>
+      <div>agent/services/jobs.py — задачи и вопрос человеку</div>
+      <div>agent/services/toolcalls.py — вызовы и рассуждения в тексте</div>
+    </div>
+    <div>Схемы для правки: <code>docs/architecture.drawio</code> — три страницы:
+      архитектура и потоки, путь вопроса, схема БД и поиск таблицы.
+      Этот документ лежит рядом: <code>docs/agent-inside.html</code>.</div>
+    <div>mysql_monit_ai · версия 2.22.3 · документ описывает поведение агента, а не желаемое поведение: каждое утверждение здесь закреплено проверкой в tests/</div>
+  </footer>
+
+  </main>
+</div>
+</div>

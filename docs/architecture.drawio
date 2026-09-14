@@ -193,4 +193,217 @@
       </root>
     </mxGraphModel>
   </diagram>
+  <diagram id="agent-flow" name="AI-агент: путь вопроса">
+    <mxGraphModel dx="1600" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1654" pageHeight="1169" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="p2-title" value="AI-агент: путь одного вопроса — от чата до ответа" style="text;html=1;fontSize=18;fontStyle=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="300" y="20" width="900" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-lane1" value="Браузер" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;fontStyle=1;fontSize=12;spacingTop=4;fillColor=#f5f5f5;strokeColor=#999999;" vertex="1" parent="1">
+          <mxGeometry x="40" y="80" width="260" height="720" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-lane2" value="Агент (FastAPI, сервер мониторинга)" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;fontStyle=1;fontSize=12;spacingTop=4;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="330" y="80" width="520" height="720" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-lane3" value="Внешние источники" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;fontStyle=1;fontSize=12;spacingTop=4;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="880" y="80" width="300" height="720" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-lane4" value="Модель (LLM)" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;fontStyle=1;fontSize=12;spacingTop=4;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="1210" y="80" width="300" height="720" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-q" value="Вопрос в чате&#10;«напиши запрос топ-5 договоров»" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;verticalAlign=middle;fontSize=11;fillColor=#f5f5f5;strokeColor=#999999;" vertex="1" parent="1">
+          <mxGeometry x="60" y="130" width="220" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-ws" value="WebSocket /ws&#10;вопрос сохраняется в историю ДО ответа" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;verticalAlign=middle;fontSize=11;fillColor=#f5f5f5;strokeColor=#999999;" vertex="1" parent="1">
+          <mxGeometry x="60" y="200" width="220" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-job" value="jobs.start()&#10;задача живёт в памяти агента:&#10;закрытая вкладка ответ не отменяет" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;verticalAlign=middle;fontSize=11;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="360" y="130" width="460" height="56" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-ctx" value="build_chat_context()&#10;кластер по городу, период по словам&#10;блоки: метрики, история, алерты, схема" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;verticalAlign=middle;fontSize=11;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="360" y="210" width="460" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-prom" value="Prometheus&#10;query / query_range" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;verticalAlign=middle;fontSize=11;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="900" y="210" width="260" height="46" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-snap" value="Снимок схемы&#10;из хранилища агента, не из базы" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;verticalAlign=middle;fontSize=11;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="900" y="270" width="260" height="46" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-msg" value="Сообщения для модели&#10;[system] промпт, 15 правил&#10;[history] последние реплики + выжимка&#10;[user] блоки контекста + ## Вопрос" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;verticalAlign=middle;fontSize=11;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="360" y="300" width="460" height="72" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-tools" value="llm_with_tools(): раунды инструментов&#10;порция 4, потом вопрос человеку&#10;повтор вызова не дёргает базу заново" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;verticalAlign=middle;fontSize=11;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="360" y="400" width="460" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-model1" value="Модель просит данные&#10;tool_calls: get_schema, run_sql …" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;verticalAlign=middle;fontSize=11;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="1230" y="400" width="260" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-db" value="MySQL кластера&#10;SELECT / SHOW / EXPLAIN&#10;сессия READ ONLY" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;verticalAlign=middle;fontSize=11;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="900" y="400" width="260" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-ask" value="Порция кончилась → вопрос человеку:&#10;«сделано N запросов, продолжаем?»&#10;ответ кнопкой или словом в чат" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;verticalAlign=middle;fontSize=11;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="360" y="480" width="460" height="56" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-stream" value="stream_answer(): стриминг токенов&#10;вырезаются &lt;think&gt; и &lt;tool_call&gt;&#10;вызовы штатным полем собираются из кусков" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;verticalAlign=middle;fontSize=11;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="360" y="560" width="460" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-model2" value="Модель пишет ответ&#10;SSE, по токену" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;verticalAlign=middle;fontSize=11;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="1230" y="560" width="260" height="46" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-guard" value="Страховки после ответа&#10;① в ответе SELECT вместо результата → выполнить и переспросить&#10;② ответ-вступление → попросить договорить, показанное стереть&#10;③ сохранить в историю" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;verticalAlign=middle;fontSize=11;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="360" y="650" width="460" height="72" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-out" value="Ответ в чате&#10;числа + запрос рядом для проверки" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;verticalAlign=middle;fontSize=11;fillColor=#f5f5f5;strokeColor=#999999;" vertex="1" parent="1">
+          <mxGeometry x="60" y="650" width="220" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-e1" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;endArrow=block;endFill=1;" edge="1" parent="1" source="p2-q" target="p2-ws">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-e2" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;endArrow=block;endFill=1;" edge="1" parent="1" source="p2-ws" target="p2-job">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-e3" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;endArrow=block;endFill=1;" edge="1" parent="1" source="p2-job" target="p2-ctx">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-e4" value="метрики" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;endArrow=block;endFill=1;" edge="1" parent="1" source="p2-ctx" target="p2-prom">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-e5" value="схема" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;endArrow=block;endFill=1;" edge="1" parent="1" source="p2-ctx" target="p2-snap">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-e6" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;endArrow=block;endFill=1;" edge="1" parent="1" source="p2-ctx" target="p2-msg">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-e7" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;endArrow=block;endFill=1;" edge="1" parent="1" source="p2-msg" target="p2-tools">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-e8" value="инструменты" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;endArrow=block;endFill=1;" edge="1" parent="1" source="p2-tools" target="p2-model1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-e9" value="tool_calls" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;endArrow=block;endFill=1;" edge="1" parent="1" source="p2-model1" target="p2-tools">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-e10" value="run_sql" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;endArrow=block;endFill=1;" edge="1" parent="1" source="p2-tools" target="p2-db">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-e11" value="порция исчерпана" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;endArrow=block;endFill=1;" edge="1" parent="1" source="p2-tools" target="p2-ask">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-e12" value="«нет» / молчание" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;endArrow=block;endFill=1;" edge="1" parent="1" source="p2-ask" target="p2-stream">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-e13" value="«да»" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;endArrow=block;endFill=1;" edge="1" parent="1" source="p2-ask" target="p2-tools">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-e14" value="данные собраны" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;endArrow=block;endFill=1;" edge="1" parent="1" source="p2-tools" target="p2-stream">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-e15" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;endArrow=block;endFill=1;" edge="1" parent="1" source="p2-stream" target="p2-model2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-e16" value="токены" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;endArrow=block;endFill=1;" edge="1" parent="1" source="p2-model2" target="p2-stream">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-e17" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;endArrow=block;endFill=1;" edge="1" parent="1" source="p2-stream" target="p2-guard">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-e18" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;endArrow=block;endFill=1;" edge="1" parent="1" source="p2-guard" target="p2-out">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-note" value="Почему задача отдельно от сокета&#10;&#10;Раньше генерация шла прямо в обработчике: закрыл вкладку — и разбор,&#10;на который потрачена минута сбора метрик и чтения логов, пропадал.&#10;Теперь сокет только пересказывает задачу и может переключаться&#10;между разговорами, не обрывая ни один из них." style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;fontSize=10;verticalAlign=top;spacingTop=6;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="40" y="820" width="810" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-note2" value="Что НЕ может модель&#10;&#10;Ходить в базу, на серверы и в Prometheus напрямую.&#10;Она только просит агента — списком инструментов.&#10;Всё, что уходит в базу, проходит проверку агента:&#10;разрешены SELECT, SHOW, EXPLAIN, DESCRIBE, WITH." style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;fontSize=10;verticalAlign=top;spacingTop=6;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="880" y="820" width="630" height="110" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="agent-schema" name="Схема БД и поиск таблицы">
+    <mxGraphModel dx="1600" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1654" pageHeight="1169" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="p3-title" value="Схема базы: съёмка, хранение и три пути к нужной таблице" style="text;html=1;fontSize=18;fontStyle=1;align=center;" vertex="1" parent="1">
+          <mxGeometry x="300" y="20" width="900" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="p3-g1" value="СЪЁМКА — по кнопке, администратором, в фоне" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;fontStyle=1;fontSize=12;spacingTop=4;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="40" y="80" width="700" height="420" as="geometry" />
+        </mxCell>
+        <mxCell id="p3-src" value="information_schema&#10;&#10;TABLES — таблицы и представления&#10;COLUMNS — столбцы, типы, COMMENT&#10;STATISTICS — индексы, кардинальность&#10;KEY_COLUMN_USAGE — внешние ключи" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;verticalAlign=middle;fontSize=11;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="70" y="120" width="300" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="p3-fallback" value="Если COMMENT пуст:&#10;SHOW TABLE STATUS&#10;SHOW FULL COLUMNS&#10;&#10;не SHOW CREATE TABLE — данные те же,&#10;но без разбора DDL регулярками" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;verticalAlign=middle;fontSize=11;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="400" y="120" width="310" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="p3-guess" value="Внешних ключей нет (MyISAM и др.):&#10;связи предполагаются по именам столбцов&#10;и помечаются «по имени столбца»&#10;имена вроде id исключены" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;verticalAlign=middle;fontSize=11;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="400" y="250" width="310" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="p3-snapshot" value="Снимок схемы (JSON у агента)&#10;&#10;20 баз · 80 таблиц на базу · 40 представлений&#10;300 таблиц с подробностями · 120 столбцов" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;verticalAlign=middle;fontSize=11;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="70" y="250" width="300" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="p3-index" value="Смысловой индекс&#10;по вектору на таблицу, отдельной строкой&#10;документ = имя + комментарий + столбцы" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;verticalAlign=middle;fontSize=11;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="70" y="360" width="640" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="p3-e1" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;endArrow=block;endFill=1;" edge="1" parent="1" source="p3-src" target="p3-snapshot">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p3-e2" value="пусто" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;endArrow=block;endFill=1;" edge="1" parent="1" source="p3-src" target="p3-fallback">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p3-e3" value="комментарии" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;endArrow=block;endFill=1;" edge="1" parent="1" source="p3-fallback" target="p3-snapshot">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p3-e4" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;endArrow=block;endFill=1;" edge="1" parent="1" source="p3-guess" target="p3-snapshot">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p3-e5" value="векторизация при съёмке" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;endArrow=block;endFill=1;" edge="1" parent="1" source="p3-snapshot" target="p3-index">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p3-g2" value="ПОИСК — на каждый вопрос, от дешёвого к дорогому" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;fontStyle=1;fontSize=12;spacingTop=4;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="780" y="80" width="730" height="420" as="geometry" />
+        </mxCell>
+        <mxCell id="p3-q" value="Вопрос: «покажи учётные записи»" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;verticalAlign=middle;fontSize=11;fillColor=#f5f5f5;strokeColor=#999999;" vertex="1" parent="1">
+          <mxGeometry x="810" y="120" width="670" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="p3-w1" value="1 · По буквам&#10;полное имя база.таблица → имя отдельным словом →&#10;по комментарию, сравнение по основе в 5 букв&#10;цена: 0 запросов" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;verticalAlign=middle;fontSize=11;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="810" y="180" width="670" height="74" as="geometry" />
+        </mxCell>
+        <mxCell id="p3-w2" value="2 · По смыслу, векторами&#10;векторизуется только вопрос; близость — скалярное произведение&#10;нормированных векторов, порог 0.30, до 3 таблиц&#10;цена: 1 короткий запрос к /embeddings" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;verticalAlign=middle;fontSize=11;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="810" y="268" width="670" height="74" as="geometry" />
+        </mxCell>
+        <mxCell id="p3-w3" value="3 · Выбором генеративной модели&#10;список таблиц с комментариями + вопрос → имена&#10;ответ проверяется по снимку: чего нет — отбрасывается&#10;цена: 1 короткий диалог" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;verticalAlign=middle;fontSize=11;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="810" y="356" width="670" height="74" as="geometry" />
+        </mxCell>
+        <mxCell id="p3-e6" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;endArrow=block;endFill=1;" edge="1" parent="1" source="p3-q" target="p3-w1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p3-e7" value="не нашлось" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;endArrow=block;endFill=1;" edge="1" parent="1" source="p3-w1" target="p3-w2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p3-e8" value="векторов нет" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;endArrow=block;endFill=1;" edge="1" parent="1" source="p3-w2" target="p3-w3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p3-out" value="Блоки, которые уходят в подсказку модели&#10;&#10;## Что есть в базе — имена и комментарии всех таблиц&#10;## база.таблица — столбцы, типы, ключи, связи, индексы&#10;&#10;Столбцы существуют ТОЛЬКО здесь: правило промпта запрещает перечислять&#10;их по общему списку и достраивать имена по смыслу." style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;verticalAlign=middle;fontSize=11;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="40" y="530" width="700" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="p3-sql" value="Ограда SQL — одна на все пути&#10;&#10;разрешены SELECT SHOW EXPLAIN DESCRIBE DESC WITH&#10;одна инструкция, ; внутри отклоняется&#10;/*! и /*+ отклоняются целиком — MySQL их исполняет&#10;чёрный список: INSERT UPDATE DELETE DROP ALTER GRANT …&#10;сессия READ ONLY, LIMIT дописывается" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;verticalAlign=middle;fontSize=11;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="780" y="530" width="730" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="p3-e9" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;endArrow=block;endFill=1;" edge="1" parent="1" source="p3-index" target="p3-out">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p3-e10" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;endArrow=block;endFill=1;" edge="1" parent="1" source="p3-w3" target="p3-out">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p3-e11" value="запрос модели" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=10;endArrow=block;endFill=1;" edge="1" parent="1" source="p3-out" target="p3-sql">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
 </mxfile>
