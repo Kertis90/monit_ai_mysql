@@ -27,6 +27,7 @@ import re
 from collections import Counter, defaultdict
 from typing import Optional
 
+from agent.core.words import plural
 from agent.services.logs import read_app_log
 from agent.services.registry import app_host
 from agent.services.ssh import remote_time
@@ -130,16 +131,6 @@ CLASSES = (
         "do": "беда не в базе: проверять сеть и сам смежный сервис",
     },
 )
-
-
-def plural(count: int, one: str, few: str, many: str) -> str:
-    """«1 строка», «3 строки», «12 строк». Отчёт читают люди."""
-    count = abs(int(count))
-    if count % 10 == 1 and count % 100 != 11:
-        return one
-    if 2 <= count % 10 <= 4 and not 12 <= count % 100 <= 14:
-        return few
-    return many
 
 
 def template(text: str) -> str:

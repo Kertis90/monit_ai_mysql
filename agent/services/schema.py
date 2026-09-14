@@ -25,6 +25,7 @@ import re
 from typing import Optional
 
 from agent.core.jsonsafe import name_of, sanitize
+from agent.core.words import count_of, plural
 from agent.db.base import session_scope
 from agent.db.models import SchemaSnapshot, to_iso
 from agent.services.mysql import cluster_db_creds, sql_execute
@@ -72,6 +73,20 @@ def _rows(result: dict) -> list:
     """
     cols = result.get("columns") or []
     return [sanitize(dict(zip(cols, row))) for row in (result.get("rows") or [])]
+
+
+# MySQL 5.6 и старше дописывают в TABLE_COMMENT служебную приписку вроде
+# «InnoDB free: 1024 kB», иногда вместо комментария целиком. В отчёте она
+# выглядит как комментарий разработчика, которым не является.
+JUNK_COMMENT = re.compile(
+    r"\s*;?\s*(?:InnoDB\s+free\s*:\s*\d+\s*\w*|partitioned|VIEW)\s*;?\s*",
+    re.I)
+
+
+def clean_comment(value) -> str:
+    """Комментарий без служебных приписок MySQL. Пусто — его и не было."""
+    text = JUNK_COMMENT.sub(" ", str(value or ""))
+    return " ".join(text.split())[:400]
 
 
 def _num(value):
@@ -156,9 +171,14 @@ async def collect(cluster: dict, host: Optional[str] = None) -> dict:
             for row in _rows(cols):
                 bucket = columns.setdefault(row["tbl"], [])
                 if len(bucket) < MAX_COLUMNS:
-                    bucket.append({k: row[k] for k in
-                                   ("col", "type", "nullable", "ckey",
-                                    "extra", "note") if k in row})
+                    item = {k: row[k] for k in
+                            ("col", "type", "nullable", "ckey", "extra")
+                            if k in row}
+                    # Комментарий столбца — то, ради чего схему и снимают:
+                    # «balance» ни о чём не говорит, «остаток на счёте» —
+                    # говорит всё
+                    item["note"] = clean_comment(row.get("note"))
+                    bucket.append(item)
 
             idx = await sql_execute(cluster, """
                 SELECT TABLE_NAME AS tbl, INDEX_NAME AS idx,
@@ -181,10 +201,15 @@ async def collect(cluster: dict, host: Optional[str] = None) -> dict:
                 "db": name, "table": t.get("tbl"),
                 "engine": t.get("engine"), "rows_est": _num(t.get("rows_est")),
                 "size_mb": _num(t.get("size_mb")), "idx_mb": _num(t.get("idx_mb")),
-                "note": (t.get("note") or "")[:200],
+                "note": clean_comment(t.get("note")),
                 "columns": columns.get(t.get("tbl"), []),
                 "indexes": indexes.get(t.get("tbl"), []),
             }
+
+    with_note = sum(1 for t in snapshot["tables"].values() if t.get("note"))
+    cols_with_note = sum(1 for t in snapshot["tables"].values()
+                         for c in (t.get("columns") or []) if c.get("note"))
+    snapshot["comments"] = {"tables": with_note, "columns": cols_with_note}
 
     if detailed >= MAX_DETAIL_TABLES:
         snapshot["cut"].append(
@@ -275,15 +300,34 @@ def find(snapshot: dict, needle: str) -> dict:
 
     matches = []
     for key, table in (snapshot.get("tables") or {}).items():
+        table_note = str(table.get("note") or "")
+        # Совпадение по комментарию ценнее совпадения по имени: имена
+        # английские, а спрашивают по-русски — «где про договоры»
         if text in str(table.get("table", "")).lower():
             matches.append({"db": table["db"], "tbl": table["table"],
-                            "col": "", "type": "таблица целиком"})
+                            "col": "", "type": "таблица", "note": table_note,
+                            "by": "имени"})
+        elif text in table_note.lower():
+            matches.append({"db": table["db"], "tbl": table["table"],
+                            "col": "", "type": "таблица", "note": table_note,
+                            "by": "комментарию"})
+
         for col in table.get("columns") or []:
+            col_note = str(col.get("note") or "")
             if text in str(col.get("col", "")).lower():
                 matches.append({"db": table["db"], "tbl": table["table"],
-                                "col": col.get("col"), "type": col.get("type")})
+                                "col": col.get("col"), "type": col.get("type"),
+                                "note": col_note, "by": "имени"})
+            elif text in col_note.lower():
+                matches.append({"db": table["db"], "tbl": table["table"],
+                                "col": col.get("col"), "type": col.get("type"),
+                                "note": col_note, "by": "комментарию"})
         if len(matches) >= MAX_MATCHES:
             break
+
+    # Найденное по комментарию — вперёд: если спрашивали по-русски, имя
+    # совпало случайно, а комментарий — по смыслу
+    matches.sort(key=lambda m: 0 if m.get("by") == "комментарию" else 1)
     return {"needle": text, "matches": matches[:MAX_MATCHES]}
 
 
@@ -303,17 +347,32 @@ def fmt_snapshot(snapshot: dict, label: str) -> str:
              "  Снято: %s. Числа строк — оценка InnoDB, не точный счёт."
              % str(snapshot.get("taken_at", ""))[:16].replace("T", " "), ""]
     for db in snapshot.get("databases") or []:
-        lines.append("  %-24s таблиц %-6s %s МБ, строк ~%s"
-                     % (db.get("db"), db.get("tables"),
+        lines.append("  %-24s %-14s %s МБ, строк ~%s"
+                     % (db.get("db"),
+                        count_of(db.get("tables"), "таблица", "таблицы",
+                                 "таблиц"),
                         db.get("size_mb"), db.get("rows_est")))
 
     tables = snapshot.get("tables") or {}
+    comments = snapshot.get("comments") or {}
     if tables:
+        # Прямо говорим, нашлись ли комментарии: иначе по отчёту не понять,
+        # то ли их не читали, то ли их нет в базе
+        if comments.get("tables") or comments.get("columns"):
+            lines += ["", "  Комментарии из базы прочитаны: у %s и %s."
+                      % (count_of(comments.get("tables", 0), "таблицы",
+                                  "таблиц", "таблиц"),
+                         count_of(comments.get("columns", 0), "столбца",
+                                  "столбцов", "столбцов"))]
+        else:
+            lines += ["", "  Комментариев (COMMENT) в базе не нашлось — ни у "
+                          "таблиц, ни у столбцов."]
+
         biggest = sorted(tables.values(),
                          key=lambda t: -(t.get("size_mb") or 0))[:20]
         lines += ["", "  Самые крупные таблицы:"]
         for t in biggest:
-            note = (" — " + t["note"]) if t.get("note") else ""
+            note = (" — " + t["note"][:120]) if t.get("note") else ""
             lines.append("    %-36s строк ~%-10s %s МБ%s"
                          % ("%s.%s" % (t["db"], t["table"]),
                             t.get("rows_est"), t.get("size_mb"), note))
@@ -328,7 +387,10 @@ def fmt_describe(data: dict) -> str:
         return "## Таблица\n\n  %s" % data["error"]
     lines = ["## %s.%s — строк ~%s, %s МБ"
              % (data["db"], data["table"], data.get("rows_est"),
-                data.get("size_mb")), "", "  Столбцы:"]
+                data.get("size_mb"))]
+    if data.get("note"):
+        lines.append("  " + data["note"])
+    lines += ["", "  Столбцы:"]
     for c in data.get("columns") or []:
         marks = []
         key = str(c.get("ckey") or "")
@@ -342,10 +404,11 @@ def fmt_describe(data: dict) -> str:
             marks.append("NOT NULL")
         if c.get("extra"):
             marks.append(str(c["extra"]))
-        if c.get("note"):
-            marks.append(str(c["note"])[:60])
-        lines.append("    %-28s %-22s %s"
-                     % (c.get("col"), c.get("type"), ", ".join(marks)))
+        # Комментарий отдельным столбцом, а не в общем ряду пометок: он
+        # объясняет смысл поля, а остальное — его устройство
+        lines.append("    %-26s %-20s %-26s %s"
+                     % (c.get("col"), c.get("type"), ", ".join(marks),
+                        str(c.get("note") or "")[:120]))
     if not data.get("columns"):
         lines.append("    Столбцы в снимок не попали: таблица не вошла в число "
                      "тех, для которых снимались подробности.")
@@ -370,9 +433,10 @@ def fmt_find(data: dict) -> str:
         return "\n".join(lines)
     for m in matches:
         where = "%s.%s" % (m.get("db"), m.get("tbl"))
-        lines.append("  %s%s — %s" % (where,
-                                      ("." + m["col"]) if m.get("col") else "",
-                                      m.get("type")))
+        if m.get("col"):
+            where += "." + m["col"]
+        note = (" — " + m["note"][:110]) if m.get("note") else ""
+        lines.append("  %s (%s)%s" % (where, m.get("type"), note))
     if len(matches) >= MAX_MATCHES:
         lines.append("  (показаны первые %d)" % MAX_MATCHES)
     return "\n".join(lines)
@@ -390,16 +454,28 @@ def fmt_brief(snapshot: dict) -> str:
     lines = ["## Что есть в базе", "",
              "  Имена ниже — настоящие, из снимка схемы. Подробности по "
              "столбцам и индексам запрашивай инструментом get_schema, "
-             "не угадывай."]
+             "не угадывай.",
+             "  Рядом с именем — комментарий из базы: по нему и понимай, что "
+             "в таблице лежит.",
+             "  Ищешь таблицу по смыслу («про договоры», «про платежи») — "
+             "get_schema с search ищет и по комментариям."]
     tables = snapshot.get("tables") or {}
     for db in (snapshot["databases"])[:6]:
         name = db.get("db")
-        names = [t["table"] for t in sorted(
-            (t for t in tables.values() if t.get("db") == name),
-            key=lambda t: -(t.get("size_mb") or 0))][:25]
+        picked = sorted((t for t in tables.values() if t.get("db") == name),
+                        key=lambda t: -(t.get("size_mb") or 0))[:25]
         lines.append("")
-        lines.append("  %s (%s таблиц, %s МБ):"
-                     % (name, db.get("tables"), db.get("size_mb")))
-        if names:
-            lines.append("    " + ", ".join(names))
+        lines.append("  %s (%s, %s МБ):"
+                     % (name, count_of(db.get("tables"), "таблица", "таблицы",
+                                       "таблиц"), db.get("size_mb")))
+        # С комментарием — отдельной строкой: это главное, что объясняет
+        # назначение таблицы. Без него — списком, чтобы не раздувать подсказку
+        plain = []
+        for t in picked:
+            if t.get("note"):
+                lines.append("    %-30s — %s" % (t["table"], t["note"][:90]))
+            else:
+                plain.append(t["table"])
+        if plain:
+            lines.append("    без комментария: " + ", ".join(plain))
     return "\n".join(lines)

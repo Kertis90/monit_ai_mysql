@@ -301,6 +301,8 @@ def application() -> None:
         select_only()
         mysql_types(c)
         schema_decimal()
+        schema_comments()
+        schema_comments_collected()
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -2580,6 +2582,154 @@ def schema_decimal() -> None:
 
         text = schema.fmt_snapshot(back, "Кемерово")
         check("и в отчёте читается", "4096" in text, True)
+    finally:
+        schema.sql_execute = original
+
+
+SCHEMA_WITH_COMMENTS = {
+    "taken_at": "2026-09-14T10:00:00",
+    "databases": [{"db": "billing", "tables": 2, "size_mb": 4096,
+                   "rows_est": 88000000}],
+    "comments": {"tables": 1, "columns": 2},
+    "tables": {
+        "billing.agreements": {
+            "db": "billing", "table": "agreements", "engine": "InnoDB",
+            "rows_est": 4200000, "size_mb": 3100, "idx_mb": 900,
+            "note": "Договоры абонентов",
+            "columns": [
+                {"col": "uid", "type": "int(11)", "nullable": "NO",
+                 "ckey": "PRI", "extra": "", "note": "Идентификатор абонента"},
+                {"col": "balance", "type": "decimal(10,2)", "nullable": "YES",
+                 "ckey": "", "extra": "", "note": "Остаток на счёте"}],
+            "indexes": [{"idx": "PRIMARY", "cols": "uid", "non_unique": 0,
+                         "cardinality": 4200000}]},
+        "billing.log_tmp": {
+            "db": "billing", "table": "log_tmp", "engine": "InnoDB",
+            "rows_est": 10, "size_mb": 1, "idx_mb": 0, "note": "",
+            "columns": [], "indexes": []}},
+    "cut": [],
+}
+
+
+def schema_comments() -> None:
+    """Комментарии из базы — главное, что упрощает разговор.
+
+    Имя `balance` не говорит ничего, «Остаток на счёте» говорит всё. Имена
+    в базе английские, а спрашивают по-русски — значит искать надо и по
+    комментариям тоже.
+    """
+    from agent.services import schema
+
+    snapshot = SCHEMA_WITH_COMMENTS
+
+    # Справка для чата: имя рядом с комментарием
+    brief = schema.fmt_brief(snapshot)
+    check("комментарий таблицы в справке для модели",
+          "agreements" in brief and "Договоры абонентов" in brief, True)
+    check("таблицы без комментария не занимают по строке",
+          "без комментария: log_tmp" in brief, True)
+    check("модели сказано про поиск по смыслу",
+          "ищет и по комментариям" in brief, True)
+
+    # Описание таблицы
+    one = schema.fmt_describe(schema.describe(snapshot, "agreements"))
+    check("комментарий таблицы виден", "Договоры абонентов" in one, True)
+    check("комментарии столбцов видны",
+          "Остаток на счёте" in one and "Идентификатор абонента" in one, True)
+
+    # Поиск по русскому слову находит английскую таблицу
+    found = schema.find(snapshot, "договор")
+    check("таблица нашлась по комментарию",
+          found["matches"][0]["tbl"], "agreements")
+    check("и сказано, что именно совпало",
+          found["matches"][0]["by"], "комментарию")
+
+    col = schema.find(snapshot, "счёт")
+    check("столбец нашёлся по комментарию",
+          col["matches"][0]["col"], "balance")
+    check("в выводе поиска комментарий приведён",
+          "Остаток на счёте" in schema.fmt_find(col), True)
+
+    # Найденное по смыслу идёт раньше случайного совпадения по имени
+    mixed = schema.find(dict(snapshot, tables={
+        "billing.dogovor_log": {"db": "billing", "table": "dogovor_log",
+                                "note": "", "columns": []},
+        "billing.agreements": snapshot["tables"]["billing.agreements"]}),
+        "договор")
+    check("совпадение по смыслу идёт первым",
+          mixed["matches"][0]["by"], "комментарию")
+
+    # В отчёте видно, прочитались ли комментарии вообще
+    text = schema.fmt_snapshot(snapshot, "Кемерово")
+    check("сказано, сколько комментариев прочитано",
+          "Комментарии из базы прочитаны" in text, True)
+    check("и со склонением", "1 таблицы и 2 столбцов" in text, True)
+
+    silent = schema.fmt_snapshot(dict(snapshot, comments={"tables": 0,
+                                                          "columns": 0}),
+                                 "Кемерово")
+    check("их отсутствие тоже названо прямо",
+          "Комментариев (COMMENT) в базе не нашлось" in silent, True)
+
+    # Приписка MySQL 5.6 — не комментарий разработчика
+    check("служебная приписка вычищена",
+          schema.clean_comment("InnoDB free: 1024 kB"), "")
+    check("настоящий комментарий цел",
+          schema.clean_comment("Платежи абонентов"), "Платежи абонентов")
+    check("комментарий с припиской остаётся читаемым",
+          schema.clean_comment("Договоры; InnoDB free: 8192 kB"),
+          "Договоры")
+
+    from agent.core.words import count_of
+    check("склонения человеческие",
+          [count_of(n, "таблица", "таблицы", "таблиц") for n in (1, 2, 5, 11, 21)],
+          ["1 таблица", "2 таблицы", "5 таблиц", "11 таблиц", "21 таблица"])
+
+
+def schema_comments_collected() -> None:
+    """Комментарии забираются при съёмке, а не теряются по дороге."""
+    from agent.services import schema
+
+    async def fake_sql(cluster, sql, host=None, max_rows=0):
+        low = sql.lower()
+        if "group by table_schema" in low:
+            return {"host": "10.1.0.1",
+                    "columns": ["db", "tables", "size_mb", "rows_est"],
+                    "rows": [["billing", 1, 10, 100]]}
+        if "from information_schema.tables" in low:
+            return {"columns": ["tbl", "engine", "rows_est", "size_mb",
+                                "idx_mb", "note"],
+                    "rows": [["agreements", "InnoDB", 100, 10, 2,
+                              "Договоры абонентов; InnoDB free: 1024 kB"]]}
+        if "from information_schema.columns" in low:
+            return {"columns": ["tbl", "col", "type", "nullable", "ckey",
+                                "extra", "note"],
+                    "rows": [["agreements", "balance", "decimal(10,2)", "YES",
+                              "", "", "Остаток на счёте"]]}
+        if "from information_schema.statistics" in low:
+            return {"columns": ["tbl", "idx", "cols", "non_unique",
+                                "cardinality"], "rows": []}
+        return {"columns": [], "rows": []}
+
+    # Комментарии обязаны быть в самих запросах, иначе их неоткуда взять
+    import inspect
+    src = inspect.getsource(schema.collect)
+    check("комментарий таблицы запрашивается", "TABLE_COMMENT" in src, True)
+    check("комментарий столбца тоже", "COLUMN_COMMENT" in src, True)
+
+    original = schema.sql_execute
+    schema.sql_execute = fake_sql
+    try:
+        snapshot = asyncio.run(schema.collect(
+            {"name": "k", "label": "K", "primary_ip": "1.1.1.1",
+             "db_user": "u", "db_password": "p"}))
+        table = snapshot["tables"]["billing.agreements"]
+        check("комментарий таблицы дошёл до снимка",
+              table["note"], "Договоры абонентов")
+        check("комментарий столбца тоже",
+              table["columns"][0]["note"], "Остаток на счёте")
+        check("и посчитан", snapshot["comments"],
+              {"tables": 1, "columns": 1})
     finally:
         schema.sql_execute = original
 
