@@ -299,6 +299,8 @@ def application() -> None:
         lanbilling_wired(c)
         schema_background(c)
         select_only()
+        mysql_types(c)
+        schema_decimal()
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -2470,6 +2472,116 @@ def select_only() -> None:
           "ВОПРОСЫ ПРО ДАННЫЕ" in prompt, True)
     check("а не текстом запроса вместо ответа",
           "не показывай текст запроса вместо ответа" in prompt, True)
+
+
+def mysql_types(client) -> None:
+    """Типы MySQL, которых не знает JSON, не должны ронять ответ.
+
+    Съёмка схемы падала на последнем шаге: «Object of type Decimal is not
+    JSON serializable». Данные собраны, обход боевого сервера сделан — и
+    всё потеряно из-за столбца, который вернул SUM. То же самое ждало
+    любой ответ с сырыми строками из базы.
+    """
+    import datetime as dt
+    import decimal
+    import json as jsonlib
+
+    from agent.api.responses import SafeJSONResponse, sanitize
+
+    # DECIMAL приходит от любого SUM, ROUND, AVG
+    check("целое DECIMAL остаётся целым",
+          sanitize(decimal.Decimal("4200000")), 4200000)
+    check("дробное становится числом",
+          sanitize(decimal.Decimal("12.50")), 12.5)
+    check("не-число не роняет разбор",
+          sanitize(decimal.Decimal("NaN")) is None, True)
+
+    check("дата становится строкой",
+          sanitize(dt.date(2026, 9, 14)), "2026-09-14")
+    check("дата со временем тоже",
+          sanitize(dt.datetime(2026, 9, 14, 10, 30)), "2026-09-14T10:30:00")
+    check("интервал — в секундах",
+          sanitize(dt.timedelta(minutes=2)), 120.0)
+    check("читаемые двоичные данные разбираются",
+          sanitize(b"\xd0\xb4\xd0\xb0"), "да")
+    check("нечитаемые названы, а не потеряны",
+          "двоичные данные" in sanitize(b"\x00\x01\xff"), True)
+    check("логическое не превращается в число",
+          sanitize(True) is True, True)
+
+    # Вложенность: беда пряталась именно там
+    deep = {"rows": [[decimal.Decimal("1.5"), dt.date(2026, 1, 1)]],
+            "set": {decimal.Decimal("2")}}
+    back = jsonlib.loads(SafeJSONResponse(content=deep).render(deep))
+    check("вложенные значения приведены",
+          back["rows"][0], [1.5, "2026-01-01"])
+    check("множество стало списком", back["set"], [2])
+
+    # Даже неизвестный тип не должен терять весь ответ
+    class Странный:
+        pass
+
+    raw = SafeJSONResponse(content={"x": Странный()}).render({"x": Странный()})
+    check("неизвестный тип назван, а ответ цел",
+          jsonlib.loads(raw)["x"], "<Странный>")
+
+
+def schema_decimal() -> None:
+    """Снимок схемы сохраняется, даже если база вернула DECIMAL."""
+    import decimal
+
+    from agent.services import schema
+
+    async def fake_sql(cluster, sql, host=None, max_rows=0):
+        low = sql.lower()
+        if "group by table_schema" in low:
+            # Ровно то, что отдаёт MySQL: SUM и ROUND возвращают DECIMAL
+            return {"host": "10.1.0.1",
+                    "columns": ["db", "tables", "size_mb", "rows_est"],
+                    "rows": [["billing", 120, decimal.Decimal("4096"),
+                              decimal.Decimal("88000000")]]}
+        if "from information_schema.tables" in low:
+            return {"columns": ["tbl", "engine", "rows_est", "size_mb",
+                                "idx_mb", "note"],
+                    "rows": [["agreements", "InnoDB", decimal.Decimal("4200000"),
+                              decimal.Decimal("3100"), decimal.Decimal("900"),
+                              ""]]}
+        if "from information_schema.columns" in low:
+            return {"columns": ["tbl", "col", "type", "nullable", "ckey",
+                                "extra", "note"],
+                    "rows": [["agreements", "uid", "int(11)", "NO", "PRI",
+                              "", ""]]}
+        if "from information_schema.statistics" in low:
+            return {"columns": ["tbl", "idx", "cols", "non_unique",
+                                "cardinality"],
+                    "rows": [["agreements", "PRIMARY", "uid", 0,
+                              decimal.Decimal("4200000")]]}
+        return {"columns": [], "rows": []}
+
+    original = schema.sql_execute
+    schema.sql_execute = fake_sql
+    try:
+        cluster = {"name": "kemerovo", "label": "Кемерово",
+                   "primary_ip": "10.1.0.1", "db_user": "ai_agent",
+                   "db_password": "x"}
+        snapshot = asyncio.run(schema.collect(cluster))
+        check("съёмка прошла", len(snapshot["tables"]), 1)
+        check("DECIMAL приведён уже в снимке",
+              isinstance(snapshot["databases"][0]["size_mb"], int), True)
+
+        # Тот самый шаг, на котором всё терялось
+        asyncio.run(schema.save("kemerovo-decimal", snapshot))
+        back = asyncio.run(schema.load("kemerovo-decimal"))
+        check("снимок сохранился и прочитался",
+              back["databases"][0]["rows_est"], 88000000)
+        check("кардинальность индекса тоже цела",
+              back["tables"]["billing.agreements"]["indexes"][0]["cardinality"],
+              4200000)
+
+        text = schema.fmt_snapshot(back, "Кемерово")
+        check("и в отчёте читается", "4096" in text, True)
+    finally:
+        schema.sql_execute = original
 
 
 def websocket(client) -> None:

@@ -11,38 +11,30 @@ NaN или Infinity в любом углу структуры — и весь з
 значения превращаются в null: в интерфейсе это «—», а остальные данные
 доходят целыми.
 
-Заодно чинятся одиночные суррогаты: они приезжают из логов и вывода MySQL
-с битой кодировкой и роняют кодировщик уже на уровне UTF-8.
+То же и с типами самой MySQL — DECIMAL, DATE, bytes: их стандартный
+кодировщик не знает. Приведение живёт в agent.core.jsonsafe, потому что
+нужно не только здесь: снимок схемы хранится строкой JSON в базе агента и
+падал на том же самом.
 """
 from __future__ import annotations
 
 import json
-import math
 from typing import Any
 
 from fastapi.responses import JSONResponse
 
+from agent.core.jsonsafe import name_of, sanitize
 
-def sanitize(value: Any) -> Any:
-    """Заменить всё, что не переживёт JSON, на безопасные значения."""
-    if isinstance(value, float):
-        return value if math.isfinite(value) else None
-    if isinstance(value, str):
-        # Суррогаты появляются при декодировании битых байтов с errors=replace
-        # только в одну сторону; обратно в UTF-8 они не кодируются
-        return value.encode("utf-8", "replace").decode("utf-8", "replace")
-    if isinstance(value, dict):
-        return {k: sanitize(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [sanitize(v) for v in value]
-    return value
+__all__ = ["SafeJSONResponse", "sanitize"]
 
 
 class SafeJSONResponse(JSONResponse):
-    """Ответ, который не разваливается из-за одного плохого числа."""
+    """Ответ, который не разваливается из-за одного плохого значения."""
 
     def render(self, content: Any) -> bytes:
         return json.dumps(
             sanitize(content), ensure_ascii=False, allow_nan=False,
             separators=(",", ":"),
+            # Подстраховка на случай типа, о котором мы не подумали
+            default=name_of,
         ).encode("utf-8")

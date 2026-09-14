@@ -24,6 +24,7 @@ import logging
 import re
 from typing import Optional
 
+from agent.core.jsonsafe import name_of, sanitize
 from agent.db.base import session_scope
 from agent.db.models import SchemaSnapshot, to_iso
 from agent.services.mysql import cluster_db_creds, sql_execute
@@ -62,8 +63,15 @@ def split_table(name: str) -> tuple:
 
 
 def _rows(result: dict) -> list:
+    """Строки словарями, уже приведённые к тому, что переживёт JSON.
+
+    MySQL возвращает DECIMAL у всякого SUM и ROUND. Снимок хранится
+    строкой JSON, и один такой столбец ронял всю съёмку: «Object of type
+    Decimal is not JSON serializable» — при том что данные собраны и до
+    сохранения оставался шаг.
+    """
     cols = result.get("columns") or []
-    return [dict(zip(cols, row)) for row in (result.get("rows") or [])]
+    return [sanitize(dict(zip(cols, row))) for row in (result.get("rows") or [])]
 
 
 def _num(value):
@@ -190,7 +198,11 @@ async def collect(cluster: dict, host: Optional[str] = None) -> dict:
 
 async def save(cluster_name: str, snapshot: dict) -> None:
     """Положить снимок к себе. Один снимок на кластер — прежний заменяется."""
-    payload = json.dumps(snapshot, ensure_ascii=False)
+    # sanitize второй раз: строки уже приведены, но в снимке есть и то,
+    # что положили мимо _rows, — а терять съёмку на сохранении обиднее
+    # всего, она уже состоялась
+    payload = json.dumps(sanitize(snapshot), ensure_ascii=False,
+                         default=name_of)
     async with session_scope() as session:
         row = (await session.execute(
             select(SchemaSnapshot).where(
