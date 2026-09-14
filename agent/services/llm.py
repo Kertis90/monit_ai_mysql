@@ -30,6 +30,7 @@ LLM_MAX_TOKENS  = settings.llm.max_tokens
 LLM_TEMPERATURE = settings.llm.temperature
 LLM_TOOLS       = settings.llm.tools
 LLM_TOOL_ROUNDS = settings.llm.tool_rounds
+LLM_TOOL_ASK_S = settings.llm.tool_ask_s
 LLM_TIMEOUT     = settings.llm.timeout
 
 # Заголовок собираем один раз: ключ задают и с "Bearer", и без него

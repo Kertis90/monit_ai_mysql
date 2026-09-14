@@ -313,6 +313,8 @@ def application() -> None:
         native_tool_calls()
         preamble_is_not_an_answer()
         rounds_end_with_answer()
+        tool_budget_is_a_question()
+        job_asks_and_waits()
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -3204,7 +3206,7 @@ def rounds_end_with_answer() -> None:
                 "role": "assistant", "content": "Сейчас посмотрю:",
                 "tool_calls": [{"id": "c%d" % rounds["n"], "function": {
                     "name": "get_schema",
-                    "arguments": '{"cluster": "kemerovo"}'}}]}}]}
+                    "arguments": '{"cluster": "c%d"}' % rounds["n"]}}]}}]}
 
     class FakeClient:
         def __init__(self, *a, **kw):
@@ -3285,6 +3287,169 @@ def chat_finishes_thought(client) -> None:
     finally:
         (chat_routes.build_chat_context, chat_routes.llm_stream,
          chat_routes.llm_probe_tools) = original
+
+
+def tool_budget_is_a_question() -> None:
+    """Предел инструментов — порция, а не потолок.
+
+    Сбор данных идёт не бесплатно: это запросы к боевой базе и чтение
+    логов по SSH. Сколько на это потратить, решает человек, а не число в
+    настройках, — поэтому по исчерпании порции агент спрашивает.
+    """
+    from agent.services import assistant
+
+    rounds = {"n": 0}
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            rounds["n"] += 1
+            # Каждый раунд просим НОВЫЙ инструмент, иначе сработает
+            # защита от хождения по кругу
+            return {"choices": [{"message": {
+                "role": "assistant", "content": "",
+                "tool_calls": [{"id": "c%d" % rounds["n"], "function": {
+                    "name": "get_schema",
+                    "arguments": '{"cluster": "c%d"}' % rounds["n"]}}]}}]}
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, *a, **kw):
+            return FakeResponse()
+
+    async def fake_tool(name, args):
+        return "данные %s" % args.get("cluster")
+
+    originals = (assistant.httpx.AsyncClient, assistant.run_tool,
+                 assistant.LLM_TOOL_ROUNDS)
+    assistant.httpx.AsyncClient = FakeClient
+    assistant.run_tool = fake_tool
+    assistant.LLM_TOOL_ROUNDS = 2
+    try:
+        # Отказались продолжать — сбор кончается на первой порции
+        asked = []
+
+        async def say_no(done, done_rounds):
+            asked.append((done, done_rounds))
+            return False
+
+        rounds["n"] = 0
+        _convo, used = asyncio.run(assistant.llm_with_tools(
+            [{"role": "user", "content": "изучи базу"}], say_no))
+        check("спросили ровно один раз", len(asked), 1)
+        check("спросили после порции", asked[0][1], 2)
+        check("и сказали, сколько уже сделано", asked[0][0], 2)
+        check("после отказа сбор окончен", len(used), 2)
+
+        # Согласились один раз — порция выдаётся заново
+        answers = iter([True, False])
+
+        async def say_once(done, done_rounds):
+            return next(answers, False)
+
+        rounds["n"] = 0
+        _convo, used = asyncio.run(assistant.llm_with_tools(
+            [{"role": "user", "content": "изучи базу"}], say_once))
+        check("после согласия собрано вдвое больше", len(used), 4)
+
+        # Без вопроса порция работает как прежний потолок
+        rounds["n"] = 0
+        _convo, used = asyncio.run(assistant.llm_with_tools(
+            [{"role": "user", "content": "изучи базу"}]))
+        check("без спрашивающего порция — это потолок", len(used), 2)
+
+        # Предел выключен: агент ходит, пока модель просит
+        assistant.LLM_TOOL_ROUNDS = 0
+        rounds["n"] = 0
+        never = {"asked": False}
+
+        async def never_ask(done, done_rounds):
+            never["asked"] = True
+            return True
+
+        # Модель просит инструменты вечно — остановит только предохранитель,
+        # поэтому здесь она повторяется после пятого раза
+        class LoopingResponse(FakeResponse):
+            def json(self):
+                rounds["n"] += 1
+                number = min(rounds["n"], 5)
+                return {"choices": [{"message": {
+                    "role": "assistant", "content": "",
+                    "tool_calls": [{"id": "x", "function": {
+                        "name": "get_schema",
+                        "arguments": '{"cluster": "c%d"}' % number}}]}}]}
+
+        class LoopingClient(FakeClient):
+            async def post(self, *a, **kw):
+                return LoopingResponse()
+
+        assistant.httpx.AsyncClient = LoopingClient
+        _convo, used = asyncio.run(assistant.llm_with_tools(
+            [{"role": "user", "content": "изучи базу"}], never_ask))
+        check("без предела не спрашиваем", never["asked"], False)
+        check("хождение по кругу остановлено предохранителем", len(used), 5)
+    finally:
+        (assistant.httpx.AsyncClient, assistant.run_tool,
+         assistant.LLM_TOOL_ROUNDS) = originals
+
+
+def job_asks_and_waits() -> None:
+    """Задача умеет спросить человека и дождаться ответа."""
+    from agent.services import jobs
+
+    async def answered() -> tuple:
+        job = jobs.Job("t-1", "вопрос")
+
+        async def reply_soon():
+            await asyncio.sleep(0.05)
+            job.reply("yes")
+
+        asyncio.create_task(reply_soon())
+        return await job.ask("Продолжаем?", [{"value": "yes", "label": "Да"}],
+                             5), job
+
+    value, job = asyncio.run(answered())
+    check("ответ человека дошёл", value, "yes")
+    kinds = [e["type"] for e in job.events]
+    check("вопрос и закрытие попали в ленту событий",
+          kinds, ["ask", "asked"])
+    check("вернувшийся клиент увидит, чем кончилось",
+          job.events[-1]["value"], "yes")
+
+    async def ignored() -> str:
+        job = jobs.Job("t-2", "вопрос")
+        return await job.ask("Продолжаем?", [], 0.1)
+
+    check("не дождались — пусто, а не зависание", asyncio.run(ignored()), "")
+
+    async def interrupted() -> str:
+        job = jobs.Job("t-3", "вопрос")
+
+        async def press_stop():
+            await asyncio.sleep(0.05)
+            job.stop_event.set()
+
+        asyncio.create_task(press_stop())
+        return await job.ask("Продолжаем?", [], 5)
+
+    check("«Остановить» снимает вопрос", asyncio.run(interrupted()), "")
+
+    # Ответ на несуществующий вопрос ничего не ломает
+    check("ответ без вопроса отклонён", jobs.Job("t-4", "в").reply("yes"), False)
+    check("ответ неизвестному разговору отклонён",
+          jobs.reply("нет-такого", "yes"), False)
 
 
 def websocket(client) -> None:

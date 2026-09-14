@@ -315,6 +315,49 @@ const App = (() => {
     document.querySelectorAll('.steps').forEach(el => el.remove());
   }
 
+  // Агент спрашивает, продолжать ли сбор. Вопрос живёт в ленте, а не в
+  // окне браузера: генерация идёт в фоне, и модальное окно на чужой
+  // вкладке никто бы не увидел.
+  function showAsk(msg) {
+    // Убираем молча: это не ответ человека, а замена вопроса
+    const stale = $('ask-box');
+    if (stale) stale.remove();
+    const box = document.createElement('div');
+    box.className = 'ask-box';
+    box.id = 'ask-box';
+
+    const opts = (msg.options || []).map((o, i) =>
+      '<button class="ask-btn' + (i === 0 ? ' ask-primary' : '') +
+      '" type="button" data-v="' + esc(o.value) + '">' +
+      esc(o.label) + '</button>').join('');
+    box.innerHTML = '<div class="ask-q">' + esc(msg.question || '') + '</div>' +
+                    '<div class="ask-row">' + opts + '</div>';
+
+    box.addEventListener('click', (e) => {
+      const b = e.target.closest('.ask-btn');
+      if (!b) return;
+      // Кнопки гасим сразу: ответ уже ушёл, второй клик ничего не изменит
+      box.querySelectorAll('.ask-btn').forEach(x => { x.disabled = true; });
+      if (state.wsReady) {
+        state.ws.send(JSON.stringify({ type: 'answer',
+                                       thread_id: state.threadId,
+                                       value: b.dataset.v }));
+      }
+    });
+
+    $('messages').appendChild(box);
+    scrollToBottom();
+  }
+
+  function closeAsk(value) {
+    const box = $('ask-box');
+    if (!box) return;
+    box.remove();
+    if (value === 'yes')      inlineNote('Продолжаем сбор данных');
+    else if (value === 'no')  inlineNote('Отвечаем по собранному');
+    else if (value === '')    inlineNote('Ответа не дождались — отвечаем по собранному');
+  }
+
   function inlineNote(text) {
     const div = document.createElement('div');
     div.className = 'muted';
@@ -585,7 +628,7 @@ const App = (() => {
   // счёт — он приходит и от молчащего сервера.
   const REPLY_SILENCE_MS = 300000;
   const ALIVE = ['token', 'step', 'context', 'tools', 'charts', 'resume',
-                 'reset',
+                 'reset', 'ask', 'asked',
                  'error', 'done'];
 
   function armWatchdog() {
@@ -679,6 +722,16 @@ const App = (() => {
         }
         break;
       }
+
+      case 'ask':
+        // Порция инструментов кончилась — агент спрашивает, продолжать ли
+        showAsk(msg);
+        break;
+
+      case 'asked':
+        // Вопрос закрыт: ответили, передумали или не дождались
+        closeAsk(msg.value);
+        break;
 
       case 'reset':
         // Модель писала рассуждение, и поняли мы это только по

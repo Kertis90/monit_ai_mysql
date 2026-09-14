@@ -27,7 +27,9 @@ from agent.services.assistant import (UNFINISHED_NOTE, build_chat_context,
                                       run_tool, sql_from_answer)
 from agent.services.toolcalls import StreamFilter
 from agent.services.intents import detect_chart_intent, detect_export_intent
-from agent.services.llm import llm_complete, llm_probe_tools, llm_stream
+from agent.core.words import count_of
+from agent.services.llm import (LLM_TOOL_ASK_S, llm_complete, llm_probe_tools,
+                                llm_stream)
 from agent.services.prometheus import build_charts
 
 logger = logging.getLogger("agent.api.chat")
@@ -239,8 +241,32 @@ async def generate(owner: str, thread_id: str, thread_title: str, text: str,
     # остаётся: он покрывает типовые вопросы без лишних раундов к модели.
     if await llm_probe_tools():
         await say("Спрашиваю модель, каких данных не хватает")
+
+        async def ask_more(done: int, rounds: int) -> bool:
+            """Порция инструментов кончилась — спросить, продолжать ли.
+
+            Сбор данных идёт не бесплатно: это запросы к боевой базе и
+            чтение логов по SSH. Решать, тратить ли ещё, должен человек, а
+            не предел в настройках. Не ответил — заканчиваем тем, что
+            собрано: это безопасный исход, ответ всё равно будет.
+            """
+            if not LLM_TOOL_ASK_S:
+                return False
+            answer = await job.ask(
+                "Агент сделал %s и пока не закончил сбор. Продолжаем?"
+                % count_of(done, "запрос", "запроса", "запросов"),
+                [{"value": "yes", "label": "Продолжить сбор"},
+                 {"value": "no", "label": "Ответить по тому, что есть"}],
+                LLM_TOOL_ASK_S)
+            if answer == "yes":
+                await say("Продолжаю сбор")
+                return True
+            logger.info("Сбор остановлен: ответ человека «%s»",
+                        answer or "не дождались")
+            return False
+
         try:
-            messages, used = await llm_with_tools(messages)
+            messages, used = await llm_with_tools(messages, ask_more)
             if used:
                 await job.emit({"type": "tools", "used": used})
         except Exception as exc:
@@ -378,7 +404,11 @@ async def websocket_chat(ws: WebSocket):
       Сервер → {"type": "done"}                                     — конец ответа
       Сервер → {"type": "error",    "text": "..."}
       Клиент → {"type": "ping"} / Сервер → {"type": "pong"}
+      Сервер → {"type": "ask",      "question": "...", "options": [...]}
+                                                                    — вопрос человеку
+      Сервер → {"type": "asked",    "value": "..."}                  — вопрос закрыт
       Клиент → {"type": "stop"}  — прервать генерацию текущего ответа
+      Клиент → {"type": "answer", "value": "yes"}  — ответ на вопрос агента
     """
     await ws.accept()
 
@@ -426,6 +456,10 @@ async def websocket_chat(ws: WebSocket):
                 await ws.send_json({"type": "pong"})
             elif kind == "stop":
                 jobs.stop(str(m.get("thread_id") or "").strip()[:128])
+            elif kind == "answer":
+                # Ответ на «продолжаем сбор?»
+                jobs.reply(str(m.get("thread_id") or "").strip()[:128],
+                           str(m.get("value") or ""))
             elif kind in ("message", "attach"):
                 await inbox.put(m)
 

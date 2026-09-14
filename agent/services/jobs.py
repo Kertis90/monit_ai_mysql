@@ -47,6 +47,8 @@ class Job:
         self.subscribers: set[asyncio.Queue] = set()
         self.task: Optional[asyncio.Task] = None
         self.stop_event = asyncio.Event()
+        # Незакрытый вопрос к человеку: пока он висит, генерация ждёт
+        self.pending: Optional[asyncio.Future] = None
 
     @property
     def done(self) -> bool:
@@ -65,6 +67,47 @@ class Job:
                 queue.put_nowait(event)
             except Exception:
                 self.subscribers.discard(queue)
+
+    async def ask(self, question: str, options: list,
+                  timeout: float) -> str:
+        """Спросить человека и дождаться ответа.
+
+        Возвращает выбранное значение или пусто, если не дождались. Пусто —
+        это не ошибка: человек мог закрыть вкладку, и тогда правильное
+        поведение — закончить тем, что уже собрано, а не ждать вечно.
+        """
+        loop = asyncio.get_running_loop()
+        self.pending = loop.create_future()
+        await self.emit({"type": "ask", "question": question,
+                         "options": options, "timeout": int(timeout)})
+
+        stop = asyncio.ensure_future(self.stop_event.wait())
+        try:
+            done, _ = await asyncio.wait({self.pending, stop},
+                                         timeout=timeout,
+                                         return_when=asyncio.FIRST_COMPLETED)
+            value = (self.pending.result()
+                     if self.pending in done and not self.pending.cancelled()
+                     else "")
+        except Exception as exc:
+            logger.info("Вопрос к человеку не дождался ответа: %s", exc)
+            value = ""
+        finally:
+            stop.cancel()
+            self.pending = None
+
+        # Вернувшийся клиент проигрывает события подряд: без этого он
+        # показал бы кнопки от уже отвеченного вопроса
+        await self.emit({"type": "asked", "value": value})
+        return value
+
+    def reply(self, value: str) -> bool:
+        """Ответ человека на висящий вопрос."""
+        pending = self.pending
+        if pending is None or pending.done():
+            return False
+        pending.set_result(str(value or "")[:64])
+        return True
 
     def subscribe(self) -> asyncio.Queue:
         queue: asyncio.Queue = asyncio.Queue()
@@ -138,6 +181,12 @@ async def start(thread_id: str, question: str,
 
     job.task = asyncio.create_task(guard())
     return job
+
+
+def reply(thread_id: str, value: str) -> bool:
+    """Передать ответ человека в идущую генерацию."""
+    job = running(thread_id)
+    return job.reply(value) if job else False
 
 
 def stop(thread_id: str) -> bool:

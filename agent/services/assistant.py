@@ -449,14 +449,34 @@ async def run_tool(name: str, args: dict) -> str:
         return f"Инструмент {name} завершился ошибкой: {e}"
 
 
-async def llm_with_tools(messages: list) -> tuple:
+async def llm_with_tools(messages: list, ask=None) -> tuple:
     """Диалог с инструментами. Возвращает (сообщения для финального ответа,
-    список выполненных инструментов)."""
+    список выполненных инструментов).
+
+    LLM_TOOL_ROUNDS — не потолок, а порция: после неё агент спрашивает
+    человека, продолжать ли сбор. Ноль означает «без предела»: агент ходит
+    инструментами, пока модель их просит. Совсем без страховки нельзя —
+    модель, зациклившаяся на одном вызове, повторяла бы его бесконечно,
+    поэтому повтор того же вызова с теми же аргументами не выполняется
+    заново, а раунд из одних повторов заканчивает сбор.
+
+    ask — чем спросить человека: async (сделано вызовов, раундов) -> bool.
+    Без него порция работает как прежний потолок.
+    """
     headers = {"Content-Type": "application/json", "Authorization": AUTH_HEADER}
     used = []
     convo = list(messages)
+    seen: dict = {}
+    rounds = 0
 
-    for _ in range(LLM_TOOL_ROUNDS):
+    while True:
+        if LLM_TOOL_ROUNDS and rounds >= LLM_TOOL_ROUNDS:
+            if ask is None:
+                break
+            if not await ask(len(used), rounds):
+                break
+            rounds = 0          # человек разрешил ещё столько же
+        rounds += 1
         payload = {"model": LLM_MODEL, "max_tokens": LLM_MAX_TOKENS,
                    "temperature": LLM_TEMPERATURE, "messages": convo,
                    "tools": tool_specs(), "tool_choice": "auto"}
@@ -476,6 +496,7 @@ async def llm_with_tools(messages: list) -> tuple:
             break                      # модель готова отвечать
 
         convo.append(msg)
+        fresh = 0
         for call in calls:
             fn = call.get("function", {})
             name = fn.get("name", "")
@@ -483,13 +504,32 @@ async def llm_with_tools(messages: list) -> tuple:
                 args = json.loads(fn.get("arguments") or "{}")
             except json.JSONDecodeError:
                 args = {}
-            logger.info(f"Инструмент: {name} {args}")
-            result = await run_tool(name, args)
-            used.append(name)
+
+            # Тот же вызов с теми же аргументами второй раз — модель
+            # ходит по кругу. Дёргать базу ещё раз незачем: отдаём то же
+            # самое и говорим прямо, что это повтор
+            mark = "%s|%s" % (name, json.dumps(args, sort_keys=True,
+                                               ensure_ascii=False))
+            if mark in seen:
+                logger.info("Повторный вызов %s — отдаю прежний результат", name)
+                result = ("Этот вызов уже делался выше, данные те же:\n\n"
+                          + seen[mark])
+            else:
+                logger.info(f"Инструмент: {name} {args}")
+                result = await run_tool(name, args)
+                seen[mark] = result
+                used.append(name)
+                fresh += 1
+
             convo.append({"role": "tool", "tool_call_id": call.get("id", ""),
                           "name": name, "content": result[:20000]})
 
-    # Раунды могли кончиться посреди сбора. Без прямого указания модель
+        if not fresh:
+            # Целый раунд из одних повторов: нового не будет, сколько ни жди
+            logger.info("Раунд без новых данных — заканчиваю сбор")
+            break
+
+    # Сбор мог оборваться посреди дела. Без прямого указания модель
     # продолжает в том же духе: пишет «сейчас посмотрю ещё вот это» и на
     # том заканчивает, а человек получает вступление вместо ответа.
     if used:

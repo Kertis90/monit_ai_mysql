@@ -34,7 +34,12 @@ class LLMSettings(BaseModel):
     temperature: float = 0.3
     # auto — проверить поддержку инструментов пробным запросом
     tools:       str   = "auto"
+    # Сколько раундов инструментов подряд агент делает без вопросов.
+    # 0 — без предела: агент ходит инструментами, пока модель их просит.
     tool_rounds: int   = 4
+    # Сколько ждать ответа человека на «продолжаем?». 0 — не спрашивать
+    # вовсе: по исчерпании порции агент сразу отвечает по собранному.
+    tool_ask_s:  float = 120.0
     # Сколько ждать ОЧЕРЕДНОЙ порции ответа, а не весь ответ целиком.
     # Локальная модель может думать над первым словом дольше облачной,
     # а длинный разбор идёт минутами — ограничивать его сверху нельзя.
@@ -192,7 +197,8 @@ def load_settings() -> Settings:
             max_tokens  = int(_env("LLM_MAX_TOKENS", "2048")),
             temperature = float(_env("LLM_TEMPERATURE", "0.3")),
             tools       = _env("LLM_TOOLS", "auto").strip().lower(),
-            tool_rounds = int(_env("LLM_TOOL_ROUNDS", "4")),
+            tool_rounds = max(0, int(_env("LLM_TOOL_ROUNDS", "4"))),
+            tool_ask_s  = max(0.0, float(_env("LLM_TOOL_ASK_S", "120"))),
             timeout     = float(_env("LLM_TIMEOUT", "300")),
         ),
         prometheus=PrometheusSettings(
