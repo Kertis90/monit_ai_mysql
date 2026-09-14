@@ -23,7 +23,7 @@ from agent.schemas.api import ChatRequest, FeedbackRequest
 from agent.services import access, jobs
 from agent.services.analysis import system_prompt
 from agent.services.assistant import (build_chat_context, llm_with_tools,
-                                      run_tool)
+                                      run_tool, sql_from_answer)
 from agent.services.toolcalls import StreamFilter
 from agent.services.intents import detect_chart_intent, detect_export_intent
 from agent.services.llm import llm_complete, llm_probe_tools, llm_stream
@@ -151,10 +151,16 @@ async def stream_answer(messages: list, job) -> tuple:
     async for token in llm_stream(messages):
         if job.stop_event.is_set():
             break
-        visible = flt.feed(token)
+        visible, reset = flt.feed(token)
+        # Рассуждение шло без открывающего тега и опозналось только по
+        # закрывающему: стираем показанное, иначе оно повиснет над ответом
+        if reset:
+            await job.emit({"type": "reset"})
         if visible:
             await job.emit({"type": "token", "text": visible})
-    tail = flt.finish()
+    tail, reset = flt.finish()
+    if reset:
+        await job.emit({"type": "reset"})
     if tail:
         await job.emit({"type": "token", "text": tail})
     return flt.clean, flt.calls
@@ -241,6 +247,13 @@ async def generate(owner: str, thread_id: str, thread_title: str, text: str,
     # Модель могла попросить инструменты текстом, а не штатным полем: часть
     # моделей обучена писать <tool_call> прямо в ответ. Разметку пользователь
     # уже не увидел — осталось выполнить и дать модели дописать по данным.
+    # А могла и вовсе ответить планом: «выполните вот такой SELECT». План —
+    # не ответ: человек просил число, и доступ к базе есть у агента, а не у
+    # него. Тогда запрос из ответа выполняем сами.
+    planned = not calls
+    if planned:
+        calls = sql_from_answer(answer, cluster)
+
     rounds = 0
     while calls and rounds < INLINE_TOOL_ROUNDS and not job.stop_event.is_set():
         rounds += 1
@@ -256,18 +269,32 @@ async def generate(owner: str, thread_id: str, thread_title: str, text: str,
             results.append("## %s\n\n%s" % (call["name"], str(out)[:20000]))
         await job.emit({"type": "tools", "used": names})
 
+        if planned:
+            # Инструкция уже показана человеку. Оставлять её над ответом
+            # незачем: он просил результат, а не указание, что ему сделать
+            ask = ("Ты написал запрос вместо ответа — агент его выполнил. "
+                   "Вот что вернула база:\n\n%s\n\nТеперь ответь на вопрос "
+                   "по этим данным: назови числа. Запрос приведи рядом, чтобы "
+                   "результат можно было проверить. Инструменты больше не "
+                   "вызывай.")
+            await job.emit({"type": "reset"})
+            answer = ""
+        else:
+            ask = ("Данные, которые ты запросил:\n\n%s\n\nТеперь ответь на "
+                   "вопрос по этим данным. Инструменты больше не вызывай.")
+
         messages = messages + [
             {"role": "assistant", "content": answer or "(запрос данных)"},
-            {"role": "user",
-             "content": "Данные, которые ты запросил:\n\n"
-                        + "\n\n".join(results)
-                        + "\n\nТеперь ответь на вопрос по этим данным. "
-                          "Инструменты больше не вызывай."}]
+            {"role": "user", "content": ask % "\n\n".join(results)}]
         if answer.strip():
             await job.emit({"type": "token", "text": "\n\n"})
             answer += "\n\n"
         more, calls = await stream_answer(messages, job)
         answer += more
+        # Второй заход тоже мог кончиться планом вместо ответа
+        if not calls:
+            calls = sql_from_answer(more, cluster)
+            planned = bool(calls)
     if job.stop_event.is_set():
         # Прерванный ответ всё равно сохраняем: пользователь его видел и в
         # следующем вопросе может на него сослаться
@@ -322,6 +349,7 @@ async def websocket_chat(ws: WebSocket):
                 "client_id": "...", "fingerprint": "..."}
       Сервер → {"type": "context",  "cluster": "...", "hours": N}   — что определил агент
       Сервер → {"type": "token",    "text": "..."}                  — стриминг токенов
+      Сервер → {"type": "reset"}                                    — стереть показанное
       Сервер → {"type": "done"}                                     — конец ответа
       Сервер → {"type": "error",    "text": "..."}
       Клиент → {"type": "ping"} / Сервер → {"type": "pong"}

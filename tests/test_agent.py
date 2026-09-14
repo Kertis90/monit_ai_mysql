@@ -307,6 +307,8 @@ def application() -> None:
         schema_in_chat_context()
         schema_notes_via_show()
         sql_limit_over_ssh()
+        thinking_hidden()
+        answer_not_a_plan()
 
         c.post("/api/logout")
         check("после выхода доступ закрыт", c.get("/api/users").status_code, 401)
@@ -746,7 +748,7 @@ def tool_calls_in_text() -> None:
 
     # По одному символу: тег приходит кусками и не должен мелькать
     flt = StreamFilter()
-    shown = "".join(flt.feed(ch) for ch in sample) + flt.finish()
+    shown = "".join(flt.feed(ch)[0] for ch in sample) + flt.finish()[0]
     check("в потоке разметки нет", "<tool" not in shown, True)
     check("текст до вызова сохранён", shown.strip(), "Сейчас посмотрю.")
     check("вызовы видны вызывающему", len(flt.calls), 1)
@@ -760,7 +762,7 @@ def tool_calls_in_text() -> None:
 
     plain = "Обычный текст, где встречается < и слово tool"
     f2 = StreamFilter()
-    out = "".join(f2.feed(t + " ") for t in plain.split(" ")) + f2.finish()
+    out = "".join(f2.feed(t + " ")[0] for t in plain.split(" ")) + f2.finish()[0]
     check("обычный текст не пострадал", out.strip(), plain)
 
 
@@ -2987,6 +2989,127 @@ def schema_notes_via_show() -> None:
           any(q.lower().startswith("show") for q in asked), False)
     check("и источник записан правильно",
           full["comments"]["source"], "information_schema")
+
+
+def thinking_hidden() -> None:
+    """Ход мысли модели в чат не попадает.
+
+    Рассуждающие модели пишут его прямо в ответ. Человек спрашивал про
+    платежи, а видел протокол размышлений — и в нём ещё и мелькал тег
+    <think>.
+    """
+    from agent.services.toolcalls import StreamFilter, strip_thinking
+
+    check("парный блок вырезан",
+          strip_thinking("<think>прикину так</think>Платежей 12"),
+          "Платежей 12")
+    check("тег с атрибутами тоже",
+          strip_thinking('<thinking step="1">ага</thinking>Готово'), "Готово")
+    check("оборванная мысль не показывается",
+          strip_thinking("<think>начал думать и прервали"), "")
+    check("обычный текст не трогаем",
+          strip_thinking("Платежей по договору 7 — двенадцать"),
+          "Платежей по договору 7 — двенадцать")
+    check("угловые скобки в тексте не ломают ответ",
+          strip_thinking("Условие: a < b и c > d"), "Условие: a < b и c > d")
+
+    # Закрывающий тег без открывающего: часть провайдеров отдаёт именно так
+    check("рассуждение до закрывающего тега отброшено",
+          strip_thinking("долго рассуждаю</think>Платежей 12"), "Платежей 12")
+
+    # В потоке: показанное рассуждение придётся стереть
+    flt = StreamFilter()
+    shown, resets = "", 0
+    for token in ("Сна", "чала ", "прикину", "</think>", "Платежей ", "12"):
+        out, reset = flt.feed(token)
+        if reset:
+            shown, resets = "", resets + 1
+        shown += out
+    out, reset = flt.finish()
+    shown = (out if reset else shown + out)
+    check("клиенту сказано стереть показанное", resets, 1)
+    check("в итоге виден только ответ", shown, "Платежей 12")
+    check("и в сохранённом ответе тоже", flt.clean, "Платежей 12")
+
+    # Тег приходит кусками и не должен мелькать ни одним символом
+    flt2 = StreamFilter()
+    seen = ""
+    for ch in "<think>тайна</think>Ответ: 42":
+        out, reset = flt2.feed(ch)
+        if reset:
+            seen = ""
+        seen += out
+    out, reset = flt2.finish()
+    seen = out if reset else seen + out
+    check("по символу разметка не просочилась",
+          "think" not in seen and "<" not in seen, True)
+    check("ответ дошёл целым", seen, "Ответ: 42")
+
+
+def answer_not_a_plan() -> None:
+    """Запрос, написанный вместо ответа, агент выполняет сам.
+
+    Человек просил посмотреть платежи по договору. Модель ответила
+    инструкцией «выполните такой SELECT» — но доступа к базе у человека в
+    чате нет, он есть у агента. План — не ответ.
+    """
+    from agent.services import assistant
+
+    cluster = {"name": "kemerovo", "label": "Кемерово"}
+    fence = chr(96) * 3
+
+    plan = ("Чтобы посмотреть платежи, выполните запрос:" + chr(10) +
+            fence + "sql" + chr(10) +
+            "SELECT id, amount FROM payments WHERE agrm_id = 7;" + chr(10) +
+            fence)
+    calls = assistant.sql_from_answer(plan, cluster)
+    check("запрос из ответа забран", len(calls), 1)
+    check("выполнять будем тем же инструментом", calls[0]["name"], "run_sql")
+    check("кластер подставлен", calls[0]["args"]["cluster"], "kemerovo")
+    check("запрос собран в одну строку",
+          calls[0]["args"]["sql"],
+          "SELECT id, amount FROM payments WHERE agrm_id = 7;")
+
+    bare = ("Нужно выполнить:" + chr(10) +
+            "SELECT COUNT(*) FROM payments WHERE uid = 5;" + chr(10) +
+            "и посмотреть, что вернётся")
+    check("запрос без ограды тоже найден",
+          assistant.sql_from_answer(bare, cluster)[0]["args"]["sql"],
+          "SELECT COUNT(*) FROM payments WHERE uid = 5;")
+
+    # Пишущий запрос не выполняем ни при какой подаче: та же проверка,
+    # что и у штатного инструмента
+    harm = (fence + "sql" + chr(10) +
+            "DELETE FROM payments WHERE id = 1;" + chr(10) + fence)
+    check("пишущий запрос из ответа не выполняется",
+          assistant.sql_from_answer(harm, cluster), [])
+    sneaky = (fence + chr(10) + "SELECT 1; DROP TABLE payments;" + chr(10)
+              + fence)
+    check("две инструкции тоже отклонены",
+          assistant.sql_from_answer(sneaky, cluster), [])
+
+    # Готовый ответ переделывать не надо
+    check("ответ по данным ничего не запускает",
+          assistant.sql_from_answer(
+              "Платежей по договору 7 — двенадцать на 4500 руб.", cluster), [])
+    check("без кластера выполнять негде",
+          assistant.sql_from_answer(plan, None), [])
+
+    # Больше двух запросов из одного ответа не берём
+    many = "".join(fence + "sql" + chr(10) + "SELECT %d;" % n + chr(10) + fence
+                   + chr(10) for n in range(5))
+    check("запросов берём не больше предела",
+          len(assistant.sql_from_answer(many, cluster)),
+          assistant.MAX_ANSWER_SQL)
+
+    # Правила в подсказке
+    from agent.services import analysis
+    prompt = analysis.system_prompt()
+    check("модели сказано не выводить рассуждения",
+          "<think>" in prompt and "не выводи" in prompt, True)
+    check("и что план не является ответом", "ПЛАН — НЕ ОТВЕТ" in prompt, True)
+    check("и что агент выполнит написанный запрос сам",
+          "агент выполнит его сам" in prompt, True)
 
 
 def websocket(client) -> None:

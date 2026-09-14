@@ -33,6 +33,22 @@ OPEN_TAG = "<tool_call>"
 
 BLOCK_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.S | re.I)
 
+# Рассуждающие модели пишут ход мысли прямо в ответ. Человек просил
+# результат, а не протокол размышлений, — в чат это попадать не должно.
+THINK_TAGS = ("think", "thinking", "reasoning", "reflection", "scratchpad",
+              "analysis")
+_TAGS = "|".join(THINK_TAGS)
+THINK_RE = re.compile(r"<(%s)\b[^>]*>.*?</\1\s*>" % _TAGS, re.S | re.I)
+THINK_OPEN_RE = re.compile(r"<(?:%s)\b[^>]*>" % _TAGS, re.I)
+# Закрывающий тег без открывающего — не поломка, а частый случай: ряд
+# провайдеров отдаёт рассуждение без открывающего тега. Тогда рассуждение
+# — всё, что было до закрывающего.
+THINK_CLOSE_RE = re.compile(r"</(?:%s)\s*>" % _TAGS, re.I)
+
+# Хвост, который ещё может оказаться началом любого тега. Держим его, пока
+# не станет ясно: «<th» — это и начало <think>, и начало обычного текста.
+TAG_START_RE = re.compile(r"<[/A-Za-z_]*$")
+
 # <function=run_sql> либо <function name="run_sql"> либо <name>run_sql</name>
 NAME_RES = (
     re.compile(r"<function\s*=\s*([A-Za-z_][\w]*)", re.I),
@@ -121,8 +137,30 @@ def find_calls(text: str) -> list:
     return calls
 
 
+def strip_thinking(text: str) -> str:
+    """Убрать рассуждения модели.
+
+    Три случая, и все встречаются. Парный блок вырезаем целиком.
+    Закрывающий тег без открывающего означает, что рассуждением было всё
+    до него. Открывающий без закрывающего — генерацию прервали посреди
+    мысли, показывать её половину незачем.
+    """
+    text = THINK_RE.sub("", text or "")
+
+    last = None
+    for found in THINK_CLOSE_RE.finditer(text):
+        last = found
+    if last:
+        text = text[last.end():].lstrip()
+
+    open_tag = THINK_OPEN_RE.search(text)
+    if open_tag:
+        text = text[:open_tag.start()]
+    return text
+
+
 def strip_calls(text: str) -> str:
-    """Убрать разметку вызовов из текста.
+    """Убрать из текста всё, что предназначалось не человеку.
 
     Незакрытый тег отрезается вместе с хвостом: генерацию могли прервать
     посреди вызова, и показывать половину разметки тем более незачем.
@@ -131,7 +169,7 @@ def strip_calls(text: str) -> str:
     cut = text.lower().find(OPEN_TAG)
     if cut >= 0:
         text = text[:cut]
-    return text
+    return strip_thinking(text)
 
 
 class StreamFilter:
@@ -145,32 +183,44 @@ class StreamFilter:
 
     def __init__(self) -> None:
         self.raw = ""
-        self._shown = 0
+        # Ровно то, что уже ушло человеку: по нему видно, совпадает ли
+        # новое начало с показанным или показанное придётся стереть
+        self._sent = ""
 
     def _visible(self, hold: bool) -> str:
         text = strip_calls(self.raw)
         if not hold:
             return text
-        # Хвост, который ещё может оказаться началом <tool_call>
-        for size in range(min(len(OPEN_TAG) - 1, len(text)), 0, -1):
-            if OPEN_TAG.startswith(text[-size:].lower()):
-                return text[:-size]
-        return text
+        # Незакрытый тег придерживаем: «</th» станет ясно через пару токенов
+        found = TAG_START_RE.search(text)
+        return text[:found.start()] if found else text
 
-    def feed(self, token: str) -> str:
-        """Добавить токен, вернуть то, что можно показать сейчас."""
+    def feed(self, token: str) -> tuple:
+        """Добавить токен. Вернуть (что показать, стереть ли показанное).
+
+        Стереть приходится в одном случае: пришёл закрывающий тег
+        рассуждения, а открывающего не было. Тогда всё показанное было
+        рассуждением, и честнее убрать его, чем оставить висеть над
+        ответом.
+        """
         self.raw += token
         text = self._visible(hold=True)
-        out = text[self._shown:]
-        self._shown = len(text)
-        return out
+        if text.startswith(self._sent):
+            out = text[len(self._sent):]
+            self._sent = text
+            return out, False
+        self._sent = text
+        return text, True
 
-    def finish(self) -> str:
+    def finish(self) -> tuple:
         """Остаток после конца потока."""
         text = self._visible(hold=False)
-        out = text[self._shown:]
-        self._shown = len(text)
-        return out
+        if text.startswith(self._sent):
+            out = text[len(self._sent):]
+            self._sent = text
+            return out, False
+        self._sent = text
+        return text, True
 
     @property
     def calls(self) -> list:

@@ -585,6 +585,7 @@ const App = (() => {
   // счёт — он приходит и от молчащего сервера.
   const REPLY_SILENCE_MS = 300000;
   const ALIVE = ['token', 'step', 'context', 'tools', 'charts', 'resume',
+                 'reset',
                  'error', 'done'];
 
   function armWatchdog() {
@@ -678,6 +679,15 @@ const App = (() => {
         }
         break;
       }
+
+      case 'reset':
+        // Модель писала рассуждение, и поняли мы это только по
+        // закрывающему тегу. Показанное — не ответ, убираем.
+        if (state.streamingEl) {
+          state.streamBuf = '';
+          state.streamingEl.textContent = '';
+        }
+        break;
 
       case 'token': {
         if (!state.streamingEl) break;

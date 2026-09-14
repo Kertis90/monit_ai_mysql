@@ -12,6 +12,7 @@ import asyncio
 import datetime
 import json
 import logging
+import re
 from typing import Optional
 
 import httpx
@@ -35,7 +36,8 @@ from agent.services.llm import (AUTH_HEADER, LLM_BASE_URL, LLM_MAX_TOKENS,
                                 LLM_MODEL, LLM_TEMPERATURE, LLM_TOOL_ROUNDS,
                                 llm_complete)
 from agent.services.logs import detect_log_intent, read_app_log, read_slow_log
-from agent.services.mysql import (cluster_db_creds, fmt_sql_result, sql_execute)
+from agent.services.mysql import (cluster_db_creds, fmt_sql_result,
+                                  sql_execute, sql_validate)
 from agent.services.prometheus import (build_charts, collect_current,
                                        collect_history)
 from agent.db.repositories.notes import NoteRepository
@@ -226,6 +228,48 @@ def tool_specs() -> list:
                 "cluster": cl, "hours": hrs},
                 "required": []}}},
     ]
+
+
+# Сколько запросов из одного ответа выполняем. Модель иногда пишет их
+# подряд «на выбор» — брать все незачем, а один часто и есть ответ.
+MAX_ANSWER_SQL = 2
+
+# Запрос, написанный моделью вместо ответа. Ловим и в ограде из кавычек,
+# и просто абзацем: разметку модели ставят по-разному.
+FENCED_SQL_RE = re.compile(r"```[a-z]*\s*(.+?)```", re.S | re.I)
+BARE_SQL_RE = re.compile(
+    r"(?:^|\n)\s*((?:SELECT|SHOW|DESCRIBE|DESC|EXPLAIN)\b.+?;)", re.S | re.I)
+
+
+def sql_from_answer(text: str, cluster: Optional[dict]) -> list:
+    """Запросы, которые модель написала вместо того, чтобы их выполнить.
+
+    Человек просил не инструкцию, а число. Модель же нередко отвечает
+    планом: «выполните вот такой SELECT». План — не ответ: выполнить его
+    всё равно придётся, и доступ к базе есть у агента, а не у человека,
+    который сидит в чате.
+
+    Поэтому запрос забираем из ответа и выполняем сами — тем же путём и с
+    той же проверкой, что и штатный инструмент: читающие запросы
+    разрешены, всё остальное отклоняется до отправки в базу.
+    """
+    if not cluster or not str(text or "").strip():
+        return []
+
+    inline = [m.group(1) for m in BARE_SQL_RE.finditer(
+        FENCED_SQL_RE.sub(" ", text))]
+    found, seen = [], set()
+    for chunk in FENCED_SQL_RE.findall(text) + inline:
+        sql = " ".join(str(chunk).split())
+        ok, _why = sql_validate(sql) if sql else (False, "")
+        if not ok or sql.lower() in seen:
+            continue          # не читающий запрос — выполнять нечего
+        seen.add(sql.lower())
+        found.append({"name": "run_sql",
+                      "args": {"cluster": cluster["name"], "sql": sql}})
+        if len(found) >= MAX_ANSWER_SQL:
+            break
+    return found
 
 
 async def run_tool(name: str, args: dict) -> str:
