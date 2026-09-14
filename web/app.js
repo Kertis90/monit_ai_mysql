@@ -428,10 +428,14 @@ const App = (() => {
   // и говорим прямо, вместо того чтобы оставлять человека гадать.
   async function checkVersion() {
     let mine = '';
-    const tag = document.querySelector('script[src*="app.js"]');
+    const tag = document.querySelector('script[src*="app"]');
     if (tag) {
-      const found = /[?&]v=([^&]+)/.exec(tag.getAttribute('src') || '');
-      mine = found ? decodeURIComponent(found[1]) : '';
+      const src = tag.getAttribute('src') || '';
+      // Версия бывает в имени (app.2.22.0.js) и в строке запроса (?v=…) —
+      // понимаем оба, чтобы сверка работала и на старых страницах
+      const byName = /app\.(\d+\.\d+\.\d+)\.js/.exec(src);
+      const byQuery = /[?&]v=([^&]+)/.exec(src);
+      mine = byName ? byName[1] : (byQuery ? decodeURIComponent(byQuery[1]) : '');
     }
 
     let server = '';

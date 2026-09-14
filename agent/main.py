@@ -19,6 +19,8 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
+import re
+
 from fastapi.staticfiles import StaticFiles
 
 from agent.api.responses import SafeJSONResponse
@@ -123,6 +125,14 @@ async def lifespan(app: FastAPI):
     logger.info("Агент остановлен")
 
 
+# app.2.22.0.js -> app.js. Версия в ИМЕНИ, а не в «?v=»: запрос с другим
+# именем браузер не может взять из кэша, потому что такого имени он раньше
+# не видел. Строка запроса тут не годится — её вырезают кэширующие прокси,
+# и тогда версия до сервера не доезжает, а старый файл доезжает до человека.
+VERSIONED_ASSET = re.compile(r"^(?P<stem>.+)\.(?P<ver>[0-9]+\.[0-9]+\.[0-9]+)"
+                             r"\.(?P<ext>js|css)$")
+
+
 class FreshStatic(StaticFiles):
     """Статика, которую браузер обязан перепроверять.
 
@@ -135,9 +145,16 @@ class FreshStatic(StaticFiles):
     no-cache не запрещает кэш, а требует спросить сервер: не изменилось —
     придёт 304 в несколько байт. Для внутреннего инструмента это дёшево, а
     расхождения между версиями исключает.
+
+    Плюс имя с версией: app.js на диске один, а отдаётся он и как app.js,
+    и как app.2.22.0.js. Страница просит второе — и получает именно тот
+    файл, который стоит на сервере, минуя любой кэш по пути.
     """
 
     async def get_response(self, path: str, scope):
+        found = VERSIONED_ASSET.match(path)
+        if found:
+            path = "%s.%s" % (found.group("stem"), found.group("ext"))
         response = await super().get_response(path, scope)
         response.headers["Cache-Control"] = "no-cache, must-revalidate"
         return response

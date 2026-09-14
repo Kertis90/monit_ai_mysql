@@ -16,6 +16,8 @@ import hashlib
 import json
 import os
 import secrets
+import shutil
+import subprocess
 import sqlite3
 import sys
 import tempfile
@@ -3874,14 +3876,32 @@ def page_is_never_stale(client) -> None:
           bool(r.headers.get("x-agent-version")), True)
 
     body = r.text
-    check("в адресе скрипта стоит версия", "static/app.js?v=" in body, True)
-    check("и в адресе стилей тоже", "static/style.css?v=" in body, True)
+    from agent.core.config import settings as cfg
+    # Версия в ИМЕНИ файла: строку запроса вырезают некоторые прокси, и
+    # тогда браузер берёт вчерашний скрипт при сегодняшнем агенте
+    check("в имени скрипта стоит версия",
+          "static/app.%s.js" % cfg.version in body, True)
+    check("и в имени стилей тоже",
+          "static/style.%s.css" % cfg.version in body, True)
+
+    # Файл с версией в имени отдаётся — иначе страница осталась бы без
+    # скрипта вообще
+    versioned = client.get("/static/app.%s.js" % cfg.version)
+    check("скрипт с версией в имени отдаётся", versioned.status_code, 200)
+    check("и это тот же самый файл",
+          "function showAsk" in versioned.text, True)
+    check("кнопки продолжения в нём есть",
+          "Продолжить сбор" in versioned.text, True)
+    # Версия в имени — это ключ кэша, а не выбор содержимого: любая ведёт
+    # к тому же файлу на диске. Так и задумано, файл один
+    check("любая версия в имени ведёт к тому же файлу",
+          client.get("/static/app.9.9.9.js").status_code, 200)
     check("версия показана человеку в интерфейсе",
           "side-version" in body, True)
     check("плейсхолдер заменён", "{{VERSION}}" not in body, True)
 
     js = client.get("/static/app.js")
-    check("скрипт отдаётся", js.status_code, 200)
+    check("скрипт отдаётся и под обычным именем", js.status_code, 200)
     check("и его велено перепроверять",
           "no-cache" in js.headers.get("cache-control", ""), True)
 
@@ -3902,6 +3922,23 @@ def ask_has_a_way_out() -> None:
           "продолж" in js and "type: 'answer'" in js, True)
     check("сказано, что будет без ответа",
           "агент закончит сам" in js, True)
+
+    # Поиск по файлу доказывает только наличие строк. Что кнопки
+    # ПОЯВЯТСЯ — доказывает запуск: настоящий showAsk прогоняется на
+    # заглушке DOM и должен сделать две кнопки в любом случае
+    node = shutil.which("node")
+    if node:
+        # Кодировку задаём явно: на Windows вывод иначе декодируется
+        # системной кодовой страницей, и русский текст не совпадёт ни с чем
+        run = subprocess.run([node, str(ROOT / "tests" / "prove_ask.js")],
+                             capture_output=True, text=True, cwd=str(ROOT),
+                             encoding="utf-8", errors="replace")
+        check("кнопки появляются при запуске, а не только в тексте файла",
+              run.returncode, 0)
+        check("и их ровно две",
+              "Во всех случаях кнопок по две" in run.stdout, True)
+    else:
+        print("  [ном] node не найден — прогон разметки пропущен")
 
     css = (ROOT / "web" / "style.css").read_text(encoding="utf-8")
     check("подсказка под вопросом оформлена", ".ask-hint" in css, True)

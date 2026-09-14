@@ -200,14 +200,15 @@ def _page(name: str, request: Request,
     prefix = (request.scope.get("root_path") or settings.prefix).rstrip("/")
     html = path.read_text(encoding="utf-8")
     html = html.replace('<base href="/">', f'<base href="{prefix}/">', 1)
-    # Версия в адресе скрипта и стилей: после обновления агента браузер
-    # обязан взять новые файлы, а не те, что лежат у него с прошлой недели.
-    # Заголовок no-cache это уже обеспечивает, но версия делает расхождение
-    # невозможным даже через кэш прокси, который заголовок проигнорировал
+    # Версия в ИМЕНИ файла, а не в «?v=». Строку запроса вырезают некоторые
+    # кэширующие прокси, и тогда браузер получает вчерашний скрипт при
+    # сегодняшнем агенте — а выглядит это как поломка интерфейса: кнопки не
+    # появляются, разделы не работают, в логе агента чисто. Имя, которого
+    # браузер раньше не видел, взять из кэша нельзя.
     html = html.replace('href="static/style.css"',
-                        'href="static/style.css?v=%s"' % settings.version)
+                        'href="static/style.%s.css"' % settings.version)
     html = html.replace('src="static/app.js"',
-                        'src="static/app.js?v=%s"' % settings.version)
+                        'src="static/app.%s.js"' % settings.version)
     for key, value in (values or {}).items():
         html = html.replace("{{%s}}" % key, value)
 
